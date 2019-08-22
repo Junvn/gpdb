@@ -3,16 +3,17 @@
  * ts_locale.c
  *		locale compatibility layer for tsearch
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tsearch/ts_locale.c,v 1.11 2008/11/10 15:18:40 tgl Exp $
+ *	  src/backend/tsearch/ts_locale.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "catalog/pg_collation.h"
 #include "storage/fd.h"
 #include "tsearch/ts_locale.h"
 #include "tsearch/ts_public.h"
@@ -22,16 +23,29 @@ static void tsearch_readline_callback(void *arg);
 
 #ifdef USE_WIDE_UPPER_LOWER
 
+/*
+ * The reason these functions use a 3-wchar_t output buffer, not 2 as you
+ * might expect, is that on Windows "wchar_t" is 16 bits and what we'll be
+ * getting from char2wchar() is UTF16 not UTF32.  A single input character
+ * may therefore produce a surrogate pair rather than just one wchar_t;
+ * we also need room for a trailing null.  When we do get a surrogate pair,
+ * we pass just the first code to iswdigit() etc, so that these functions will
+ * always return false for characters outside the Basic Multilingual Plane.
+ */
+#define WC_BUF_LEN  3
+
 int
 t_isdigit(const char *ptr)
 {
 	int			clen = pg_mblen(ptr);
-	wchar_t		character[2];
+	wchar_t		character[WC_BUF_LEN];
+	Oid			collation = DEFAULT_COLLATION_OID;		/* TODO */
+	pg_locale_t mylocale = 0;	/* TODO */
 
-	if (clen == 1 || lc_ctype_is_c())
+	if (clen == 1 || lc_ctype_is_c(collation))
 		return isdigit(TOUCHAR(ptr));
 
-	char2wchar(character, 2, ptr, clen);
+	char2wchar(character, WC_BUF_LEN, ptr, clen, mylocale);
 
 	return iswdigit((wint_t) character[0]);
 }
@@ -40,12 +54,14 @@ int
 t_isspace(const char *ptr)
 {
 	int			clen = pg_mblen(ptr);
-	wchar_t		character[2];
+	wchar_t		character[WC_BUF_LEN];
+	Oid			collation = DEFAULT_COLLATION_OID;		/* TODO */
+	pg_locale_t mylocale = 0;	/* TODO */
 
-	if (clen == 1 || lc_ctype_is_c())
+	if (clen == 1 || lc_ctype_is_c(collation))
 		return isspace(TOUCHAR(ptr));
 
-	char2wchar(character, 2, ptr, clen);
+	char2wchar(character, WC_BUF_LEN, ptr, clen, mylocale);
 
 	return iswspace((wint_t) character[0]);
 }
@@ -54,12 +70,14 @@ int
 t_isalpha(const char *ptr)
 {
 	int			clen = pg_mblen(ptr);
-	wchar_t		character[2];
+	wchar_t		character[WC_BUF_LEN];
+	Oid			collation = DEFAULT_COLLATION_OID;		/* TODO */
+	pg_locale_t mylocale = 0;	/* TODO */
 
-	if (clen == 1 || lc_ctype_is_c())
+	if (clen == 1 || lc_ctype_is_c(collation))
 		return isalpha(TOUCHAR(ptr));
 
-	char2wchar(character, 2, ptr, clen);
+	char2wchar(character, WC_BUF_LEN, ptr, clen, mylocale);
 
 	return iswalpha((wint_t) character[0]);
 }
@@ -68,12 +86,14 @@ int
 t_isprint(const char *ptr)
 {
 	int			clen = pg_mblen(ptr);
-	wchar_t		character[2];
+	wchar_t		character[WC_BUF_LEN];
+	Oid			collation = DEFAULT_COLLATION_OID;		/* TODO */
+	pg_locale_t mylocale = 0;	/* TODO */
 
-	if (clen == 1 || lc_ctype_is_c())
+	if (clen == 1 || lc_ctype_is_c(collation))
 		return isprint(TOUCHAR(ptr));
 
-	char2wchar(character, 2, ptr, clen);
+	char2wchar(character, WC_BUF_LEN, ptr, clen, mylocale);
 
 	return iswprint((wint_t) character[0]);
 }
@@ -159,10 +179,10 @@ tsearch_readline_callback(void *arg)
 
 	/*
 	 * We can't include the text of the config line for errors that occur
-	 * during t_readline() itself.  This is only partly a consequence of
-	 * our arms-length use of that routine: the major cause of such
-	 * errors is encoding violations, and we daren't try to print error
-	 * messages containing badly-encoded data.
+	 * during t_readline() itself.  This is only partly a consequence of our
+	 * arms-length use of that routine: the major cause of such errors is
+	 * encoding violations, and we daren't try to print error messages
+	 * containing badly-encoded data.
 	 */
 	if (stp->curline)
 		errcontext("line %d of configuration file \"%s\": \"%s\"",
@@ -200,10 +220,7 @@ t_readline(FILE *fp)
 	(void) pg_verify_mbstr(PG_UTF8, buf, len, false);
 
 	/* And convert */
-	recoded = (char *) pg_do_encoding_conversion((unsigned char *) buf,
-												 len,
-												 PG_UTF8,
-												 GetDatabaseEncoding());
+	recoded = pg_any_to_server(buf, len, PG_UTF8);
 	if (recoded == buf)
 	{
 		/*
@@ -239,6 +256,11 @@ lowerstr_with_len(const char *str, int len)
 {
 	char	   *out;
 
+#ifdef USE_WIDE_UPPER_LOWER
+	Oid			collation = DEFAULT_COLLATION_OID;		/* TODO */
+	pg_locale_t mylocale = 0;	/* TODO */
+#endif
+
 	if (len == 0)
 		return pstrdup("");
 
@@ -250,7 +272,7 @@ lowerstr_with_len(const char *str, int len)
 	 * Also, for a C locale there is no need to process as multibyte. From
 	 * backend/utils/adt/oracle_compat.c Teodor
 	 */
-	if (pg_database_encoding_max_length() > 1 && !lc_ctype_is_c())
+	if (pg_database_encoding_max_length() > 1 && !lc_ctype_is_c(collation))
 	{
 		wchar_t    *wstr,
 				   *wptr;
@@ -263,7 +285,7 @@ lowerstr_with_len(const char *str, int len)
 		 */
 		wptr = wstr = (wchar_t *) palloc(sizeof(wchar_t) * (len + 1));
 
-		wlen = char2wchar(wstr, len + 1, str, len);
+		wlen = char2wchar(wstr, len + 1, str, len, mylocale);
 		Assert(wlen <= len);
 
 		while (*wptr)
@@ -278,14 +300,14 @@ lowerstr_with_len(const char *str, int len)
 		len = pg_database_encoding_max_length() * wlen + 1;
 		out = (char *) palloc(len);
 
-		wlen = wchar2char(out, wstr, len);
+		wlen = wchar2char(out, wstr, len, mylocale);
 
 		pfree(wstr);
 
 		if (wlen < 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
-					 errmsg("conversion from wchar_t to server encoding failed: %m")));
+			errmsg("conversion from wchar_t to server encoding failed: %m")));
 		Assert(wlen < len);
 	}
 	else

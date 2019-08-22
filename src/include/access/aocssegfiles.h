@@ -30,31 +30,6 @@
 #define Anum_pg_aocs_state 7
 
 
-/*
- * pg_aocsseg_nnnnnn table values for FormData_pg_attribute.
- *
- * [Similar examples are Schema_pg_type, Schema_pg_proc, Schema_pg_attribute, etc, in
- *  pg_attribute.h]
- */
-#define Schema_pg_aocsseg \
-{ -1, {"segno"}, 				23, -1, 4, 1, 0, -1, -1, true, 'p', 'i', false, false, false, true, 0 }, \
-{ -1, {"tupcount"},				20, -1, 8, 2, 0, -1, -1, true, 'p', 'd', false, false, false, true, 0 }, \
-{ -1, {"varblockcount"},		20, -1, 8, 3, 0, -1, -1, true, 'p', 'd', false, false, false, true, 0 }, \
-{ -1, {"vpinfo"},				17, -1, -1, 4, 0, -1, -1, false, 'x', 'i', false, false, false, true, 0 }, \
-{ -1, {"modcount"},				20, -1, 8, 5, 0, -1, -1, true, 'p', 'i', false, false, false, true, 0 }, \
-{ -1, {"formatversion"},		21, -1, 2, 6, 0, -1, -1, true, 'p', 's', false, false, false, true, 0 }, \
-{ -1, {"state"}, 				 21, -1, 2, 7, 0, -1, -1, true, 'p', 's', false, false, false, true, 0 }
-
-/*
- * pg_aoseg_nnnnnn table values for FormData_pg_class.
- */
-#define Class_pg_aocsseg \
-  {"pg_appendonly"}, PG_CATALOG_NAMESPACE, -1, BOOTSTRAP_SUPERUSERID, 0, \
-               -1, DEFAULTTABLESPACE_OID, \
-               25, 10000, 0, 0, false, false, RELKIND_RELATION, RELSTORAGE_HEAP, Natts_pg_aocsseg, \
-               0, false, false, false, false, false, FirstNormalTransactionId, {0}, {{{'\0','\0','\0','\0'},{'\0'}}}
-
-
 typedef struct AOCSVPInfoEntry
 {
 	int64		eof;
@@ -167,13 +142,6 @@ extern AOCSFileSegInfo **GetAllAOCSFileSegInfo(Relation prel,
 					  Snapshot appendOnlyMetaDataSnapshot,
 					  int *totalseg);
 
-extern AOCSFileSegInfo **GetAllAOCSFileSegInfo_pg_aocsseg_rel(
-									 int numOfColumsn,
-									 char *relationName,
-									 Relation pg_aocsseg_rel,
-									 Snapshot appendOnlyMetaDataSnapshot,
-									 int32 *totalseg);
-
 extern void FreeAllAOCSSegFileInfo(AOCSFileSegInfo **allAOCSSegInfo, int totalSegFiles);
 
 extern int64 GetAOCSTotalBytes(
@@ -183,7 +151,7 @@ extern int64 GetAOCSTotalBytes(
 extern FileSegTotals *GetAOCSSSegFilesTotals(Relation parentrel,
 					   Snapshot appendOnlyMetaDataSnapshot);
 
-extern AOCSFileSegInfo *NewAOCSFileSegInfo(int4 segno, int4 nvp);
+extern AOCSFileSegInfo *NewAOCSFileSegInfo(int32 segno, int32 nvp);
 extern void InsertInitialAOCSFileSegInfo(Relation prel, int32 segno, int32 nvp);
 extern void UpdateAOCSFileSegInfo(struct AOCSInsertDescData *desc);
 extern void AOCSFileSegInfoAddVpe(
@@ -192,7 +160,7 @@ extern void AOCSFileSegInfoAddVpe(
 extern void AOCSFileSegInfoAddCount(Relation prel, int32 segno, int64 tupadded, int64 varblockadded, int64 modcount_added);
 extern void ClearAOCSFileSegInfo(Relation prel, int segno, FileSegInfoState newState);
 extern void SetAOCSFileSegInfoState(Relation parentrel, int segno, FileSegInfoState newState);
-extern Datum gp_update_aocol_master_stats_internal(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot);
-extern Datum aocol_compression_ratio_internal(Relation parentrel);
+extern int64 gp_update_aocol_master_stats_internal(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot);
+extern float8 aocol_compression_ratio_internal(Relation parentrel);
 
 #endif

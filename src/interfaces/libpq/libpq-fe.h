@@ -5,7 +5,7 @@
  *	  externs for functions used by frontend postgres applications.
  *
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/libpq-fe.h
@@ -32,10 +32,10 @@ extern		"C"
 /*
  * Option flags for PQcopyResult
  */
-#define PG_COPYRES_ATTRS          0x01
-#define PG_COPYRES_TUPLES         0x02		/* Implies PG_COPYRES_ATTRS */
-#define PG_COPYRES_EVENTS         0x04
-#define PG_COPYRES_NOTICEHOOKS    0x08
+#define PG_COPYRES_ATTRS		  0x01
+#define PG_COPYRES_TUPLES		  0x02	/* Implies PG_COPYRES_ATTRS */
+#define PG_COPYRES_EVENTS		  0x04
+#define PG_COPYRES_NOTICEHOOKS	  0x08
 
 /* Application-visible enum types */
 
@@ -56,9 +56,9 @@ typedef enum
 	 * be used for user feedback or similar purposes.
 	 */
 	CONNECTION_STARTED,			/* Waiting for connection to be made.  */
-	CONNECTION_MADE,			/* Connection OK; waiting to send.	   */
+	CONNECTION_MADE,			/* Connection OK; waiting to send.     */
 	CONNECTION_AWAITING_RESPONSE,		/* Waiting for a response from the
-										 * postmaster.		  */
+										 * postmaster.        */
 	CONNECTION_AUTH_OK,			/* Received authentication; waiting for
 								 * backend startup. */
 	CONNECTION_SETENV,			/* Negotiating environment. */
@@ -111,13 +111,26 @@ typedef enum
 	PQERRORS_VERBOSE			/* all the facts, ma'am */
 } PGVerbosity;
 
+/*
+ * PGPing - The ordering of this enum should not be altered because the
+ * values are exposed externally via pg_isready.
+ */
+
 typedef enum
 {
 	PQPING_OK,					/* server is accepting connections */
 	PQPING_REJECT,				/* server is alive but rejecting connections */
 	PQPING_NO_RESPONSE,			/* could not establish connection */
 	PQPING_NO_ATTEMPT,			/* connection not attempted (bad params) */
-	PQPING_MIRROR_OR_QUIESCENT	/* server is in mirror or quiescent */
+
+	/*
+	 * GPDB-specific additions, starting at 64 to avoid collisions with
+	 * upstream. (This is only somewhat arbitrary; values above 255 would
+	 * increase the size of the PGPing type, but values above 125 would also
+	 * conflict with Bash-specific signal codes. We take roughly half of what's
+	 * left.)
+	 */
+	PQPING_MIRROR_READY = 64,	/* mirror completed startup sequence */
 } PGPing;
 
 /* PGconn encapsulates a connection to the backend.
@@ -512,9 +525,9 @@ extern void PQfreemem(void *ptr);
 /* Create and manipulate PGresults */
 extern PGresult *PQmakeEmptyPGresult(PGconn *conn, ExecStatusType status);
 extern PGresult *PQcopyResult(const PGresult *src, int flags);
-extern int PQsetResultAttrs(PGresult *res, int numAttributes, PGresAttDesc *attDescs);
+extern int	PQsetResultAttrs(PGresult *res, int numAttributes, PGresAttDesc *attDescs);
 extern void *PQresultAlloc(PGresult *res, size_t nBytes);
-extern int PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len);
+extern int	PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len);
 
 /* Quoting strings before inclusion in queries. */
 extern size_t PQescapeStringConn(PGconn *conn,
@@ -537,24 +550,21 @@ extern unsigned char *PQescapeBytea(const unsigned char *from, size_t from_lengt
 
 /* === in fe-print.c === */
 
-extern void
-PQprint(FILE *fout,				/* output stream */
+extern void PQprint(FILE *fout,				/* output stream */
 		const PGresult *res,
 		const PQprintOpt *ps);	/* option structure */
 
 /*
  * really old printing routines
  */
-extern void
-PQdisplayTuples(const PGresult *res,
+extern void PQdisplayTuples(const PGresult *res,
 				FILE *fp,		/* where to send the output */
 				int fillAlign,	/* pad the fields with spaces */
 				const char *fieldSep,	/* field separator */
 				int printHeader,	/* display headers? */
 				int quiet);
 
-extern void
-PQprintTuples(const PGresult *res,
+extern void PQprintTuples(const PGresult *res,
 			  FILE *fout,		/* output stream */
 			  int printAttName, /* print attribute names */
 			  int terseOutput,	/* delimiter bars */
@@ -569,10 +579,13 @@ extern int	lo_close(PGconn *conn, int fd);
 extern int	lo_read(PGconn *conn, int fd, char *buf, size_t len);
 extern int	lo_write(PGconn *conn, int fd, const char *buf, size_t len);
 extern int	lo_lseek(PGconn *conn, int fd, int offset, int whence);
+extern pg_int64 lo_lseek64(PGconn *conn, int fd, pg_int64 offset, int whence);
 extern Oid	lo_creat(PGconn *conn, int mode);
 extern Oid	lo_create(PGconn *conn, Oid lobjId);
 extern int	lo_tell(PGconn *conn, int fd);
+extern pg_int64 lo_tell64(PGconn *conn, int fd);
 extern int	lo_truncate(PGconn *conn, int fd, size_t len);
+extern int	lo_truncate64(PGconn *conn, int fd, pg_int64 len);
 extern int	lo_unlink(PGconn *conn, Oid lobjId);
 extern Oid	lo_import(PGconn *conn, const char *filename);
 extern Oid	lo_import_with_oid(PGconn *conn, const char *filename, Oid lobjId);

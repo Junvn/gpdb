@@ -2,19 +2,21 @@
 #
 # Makefile for src/interfaces/ecpg/preproc
 #
-# Copyright (c) 1998-2009, PostgreSQL Global Development Group
+# Copyright (c) 1998-2014, PostgreSQL Global Development Group
 #
-# $PostgreSQL: pgsql/src/interfaces/ecpg/preproc/Makefile,v 1.132 2008/03/18 17:46:23 petere Exp $
+# src/interfaces/ecpg/preproc/Makefile
 #
 #-------------------------------------------------------------------------
 
 PGFILEDESC = "ecpg - embedded SQL precompiler for C"
+PGAPPICON=win32
+
 subdir = src/interfaces/ecpg/preproc
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 MAJOR_VERSION= 4
-MINOR_VERSION= 5
+MINOR_VERSION= 10
 PATCHLEVEL=0
 
 # The frontend doesn't need everything that's in LIBS, some are backend only
@@ -23,7 +25,7 @@ LIBS := $(filter-out -lresolv -lbz2, $(LIBS))
 LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses -lcurl -lssl -lcrypto -lz, $(LIBS))
 
 override CPPFLAGS := -I../include -I$(top_srcdir)/src/interfaces/ecpg/include \
-	-I$(srcdir) -DMAJOR_VERSION=$(MAJOR_VERSION) \
+	-I. -I$(srcdir) -DMAJOR_VERSION=$(MAJOR_VERSION) \
 	-DMINOR_VERSION=$(MINOR_VERSION) -DPATCHLEVEL=$(PATCHLEVEL) \
 	 $(CPPFLAGS)
 
@@ -32,43 +34,40 @@ override CFLAGS +=  $(PTHREAD_CFLAGS) -DECPG_COMPILE -Wno-unused-label -Wno-erro
 endif
 override CFLAGS += $(PTHREAD_CFLAGS) -DECPG_COMPILE
 
-OBJS=	preproc.o type.o ecpg.o output.o parser.o \
+OBJS=	preproc.o pgc.o type.o ecpg.o output.o parser.o \
 	keywords.o c_keywords.o ecpg_keywords.o kwlookup.o ../ecpglib/typename.o descriptor.o variable.o \
 	$(WIN32RES)
 
-all: submake-libpgport ecpg
-
-ecpg: $(OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LIBS) $(PTHREAD_LIBS) -o $@$(X)
-
-# pgc is compiled as part of preproc
-preproc.o: $(srcdir)/pgc.c
-
-$(srcdir)/preproc.h: $(srcdir)/preproc.c ;
-
-$(srcdir)/preproc.c: $(srcdir)/preproc.y
-ifdef BISON
-	$(BISON) -d $(BISONFLAGS) -o $@ $<
-else
-	@$(missing) bison $< $@
+# Suppress parallel build to avoid a bug in GNU make 3.82
+# (see comments in ../Makefile)
+ifeq ($(MAKE_VERSION),3.82)
+.NOTPARALLEL:
 endif
 
-$(srcdir)/pgc.c: $(srcdir)/pgc.l
-ifdef FLEX
-	$(FLEX) $(FLEXFLAGS) -o'$@' $<
-else
-	@$(missing) flex $< $@
-endif
+all: ecpg
 
-$(srcdir)/preproc.y: $(top_srcdir)/src/backend/parser/gram.y parse.pl ecpg.addons ecpg.header ecpg.tokens ecpg.trailer ecpg.type
-	$(PERL) $(srcdir)/parse.pl $(srcdir) < $< > $@ 
+ecpg: $(OBJS) | submake-libpgport
+	$(CC) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) $^ $(LIBS) $(PTHREAD_LIBS) -o $@$(X)
 
-ecpg_keywords.o c_keywords.o keywords.o preproc.o parser.o: preproc.h
+../ecpglib/typename.o: ../ecpglib/typename.c
+	$(MAKE) -C $(dir $@) $(notdir $@)
+
+# See notes in src/backend/parser/Makefile about the following two rules
+preproc.h: preproc.c
+	touch $@
+
+preproc.c: BISONFLAGS += -d
+
+preproc.y: ../../../backend/parser/gram.y parse.pl ecpg.addons ecpg.header ecpg.tokens ecpg.trailer ecpg.type
+	$(PERL) $(srcdir)/parse.pl $(srcdir) < $< > $@
+	$(PERL) $(srcdir)/check_rules.pl $(srcdir) $<
+
+ecpg_keywords.o c_keywords.o keywords.o preproc.o pgc.o parser.o: preproc.h
 
 kwlookup.c: % : $(top_srcdir)/src/backend/parser/%
 	rm -f $@ && $(LN_S) $< .
 
-distprep: $(srcdir)/preproc.y $(srcdir)/preproc.c $(srcdir)/preproc.h $(srcdir)/pgc.c
+distprep: preproc.y preproc.c preproc.h pgc.c
 
 install: all installdirs
 	$(INSTALL_PROGRAM) ecpg$(X) '$(DESTDIR)$(bindir)'
@@ -90,4 +89,4 @@ clean distclean:
 # since we want to ship those files in the distribution for people with
 # inadequate tools.  Instead, `make maintainer-clean' will remove them.
 maintainer-clean: distclean
-	rm -f $(srcdir)/preproc.y $(srcdir)/preproc.c $(srcdir)/preproc.h $(srcdir)/pgc.c
+	rm -f preproc.y preproc.c preproc.h pgc.c

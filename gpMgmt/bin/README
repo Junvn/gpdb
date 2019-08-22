@@ -27,14 +27,8 @@ Where Things Go
 * If you are adding a GP module, please add it to the gppylib dir.
 * If you are adding a 3rd party module, please add it to the ext dir.
 
-List of Management Scripts Written in Perl
-------------------------------------------
-bin/run_operator_tests.pl -
-
 List of Management Scripts Written in Bash
 ------------------------------------------
-bin/gpcrondump          -  Dumps a database 
-bin/gpdbrestore         -  Restores a database dumped from gpcrondump
 bin/gpinitsystem        -  Creates a new Greenplum Database
 bin/gpload              -  Sets env variables and calls gpload.py
 
@@ -58,23 +52,18 @@ bin/gpssh-exkeys        -  Exchange ssh keys between many hosts
 List of Management Scripts Written in Python (gppylib - current libraries)
 --------------------------------------------------------------------------
 bin/gpactivatestandby   -  Activates the Standby Master
-bin/gpaddconfig         -  Edits postgresql.conf file for all segments
+bin/gpconfig_helper     -  Edits postgresql.conf file for all segments
 bin/gpdeletesystem      -  Deletes a Greenplum Database
 bin/gpexpand            -  Adds additional segments to a Greenplum Database
-bin/gpfilespace         -  Adds a filespace to a Greenplum Database (partial use of libraries)
 bin/gpinitstandby       -  Initializes standby master
 bin/gplogfilter         -  Filters log files
 bin/gpstart             -  Start a Greenplum Database
 bin/gpstop              -  Stop a Greenplum Database
 
-bin/gpfaultinjector     -  Cause a host or segment to fail
-
-sbin/gpaddconfig.py     -  Helper script for gpaddconfig
-sbin/gpfaultinjector.py -  Helper script for gpfaultinjector
+sbin/gpconfig_helper.py -  Helper script for gpconfig
 sbin/gpsegcopy          -  Helper script for gpexpand
 sbin/gpsegstart.py      -  Helper script for gpstart
 sbin/gpsegstop.py       -  Helper script for gpstop
-sbin/gpsegtoprimaryormirror.py  - Helper script for failover
 
 
 Overview of gppylib
@@ -84,18 +73,18 @@ dattimeutils.py  -  Several utility functions for dealing with date/time data
 
 gparray.py
    |
-   +-  GpDB      - Configuration information for a single dbid
+   +-  Segment      - Configuration information for a single dbid
    |
-   +-  GpSegment - Configuration information for a single content id
-   |     \-  Contains multiple GpDB objects
+   +-  SegmentPair - Configuration information for a single content id
+   |     \-  Contains multiple Segment objects
    |
    +-  GpArray   - Configuration information for a Greenplum Database
-         \-  Contains multiple GpSegment objects
+         \-  Contains multiple SegmentPair objects
 
 gphostcache.py   
   |
   +- GpHost      - Information about a single Host
-  |    \- Contains all the GpDB objects on the host
+  |    \- Contains all the Segment objects on the host
   |
   +- GpHostCache - Helps resolve interface->hostname lookups
        \- Contains all the GpHosts referenced in a Greenplum Database
@@ -144,9 +133,6 @@ commands/base.py  - Core of commands submodule  (could use some work)
   +- Command       - abstract class for executing (shell level) commands
   |
   +- SQLCommand    - abstract class for executing SQL commands
-
-commands/clsInjectFault - binary for filerep fault injection
-        \- doesn't belong as a part of commands submodule
 
 commands/gp.py     - Implements lots of subclasses of Command for various tasks
 commands/pg.py     - Like gp.py, not clear what the separation is, if any.

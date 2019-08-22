@@ -4,22 +4,22 @@
  *	  Interface to hba.c
  *
  *
- * $PostgreSQL: pgsql/src/include/libpq/hba.h,v 1.53 2008/11/20 11:48:26 mha Exp $
+ * src/include/libpq/hba.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef HBA_H
 #define HBA_H
 
+#include "libpq/pqcomm.h"	/* pgrminclude ignore */	/* needed for NetBSD */
 #include "nodes/pg_list.h"
-#include "libpq/pqcomm.h"
+#include "regex/regex.h"
 
 
 typedef enum UserAuth
 {
 	uaReject,
 	uaImplicitReject,
-	uaKrb5,
 	uaTrust,
 	uaIdent,
 	uaPassword,
@@ -29,14 +29,16 @@ typedef enum UserAuth
 	uaPAM,
 	uaLDAP,
 	uaCert,
-	uaRADIUS
+	uaRADIUS,
+	uaPeer
 } UserAuth;
 
 typedef enum IPCompareMethod
 {
 	ipCmpMask,
 	ipCmpSameHost,
-	ipCmpSameNet
+	ipCmpSameNet,
+	ipCmpAll
 } IPCompareMethod;
 
 typedef enum ConnType
@@ -47,15 +49,17 @@ typedef enum ConnType
 	ctHostNoSSL
 } ConnType;
 
-typedef struct
+typedef struct HbaLine
 {
 	int			linenumber;
+	char	   *rawline;
 	ConnType	conntype;
-	char	   *database;
-	char	   *role;
+	List	   *databases;
+	List	   *roles;
 	struct sockaddr_storage addr;
 	struct sockaddr_storage mask;
 	IPCompareMethod ip_cmp_method;
+	char	   *hostname;
 	UserAuth	auth_method;
 
 	char	   *usermap;
@@ -67,10 +71,10 @@ typedef struct
 	char	   *ldapbindpasswd;
 	char	   *ldapsearchattribute;
 	char	   *ldapbasedn;
+	int			ldapscope;
 	char	   *ldapprefix;
 	char	   *ldapsuffix;
 	bool		clientcert;
-	char	   *krb_server_hostname;
 	char	   *krb_realm;
 	bool		include_realm;
 	char	   *radiusserver;
@@ -79,19 +83,22 @@ typedef struct
 	int			radiusport;
 } HbaLine;
 
+typedef struct IdentLine
+{
+	int			linenumber;
+
+	char	   *usermap;
+	char	   *ident_user;
+	char	   *pg_role;
+	regex_t		re;
+} IdentLine;
+
 /* kluge to avoid including libpq/libpq-be.h here */
 typedef struct Port hbaPort;
 
-extern List **get_role_line(const char *role);
-extern List *get_role_intervals(const char *role);
 extern bool load_hba(void);
-extern void load_ident(void);
-extern void load_role(void);
-extern void load_role_interval(void);
-extern void force_load_role(void);
-extern int	hba_getauthmethod(hbaPort *port);
-extern bool read_pg_database_line(FILE *fp, char *dbname, Oid *dboid,
-					  Oid *dbtablespace, TransactionId *dbfrozenxid);
+extern bool load_ident(void);
+extern void hba_getauthmethod(hbaPort *port);
 extern int check_usermap(const char *usermap_name,
 			  const char *pg_role, const char *auth_user,
 			  bool case_sensitive);

@@ -2,15 +2,7 @@
 --  Test citext datatype
 --
 
---
--- first, define the datatype.  Turn off echoing so that expected file
--- does not depend on contents of citext.sql.
---
-SET client_min_messages = warning;
-\set ECHO none
-\i citext.sql
-RESET client_min_messages;
-\set ECHO all
+CREATE EXTENSION citext;
 
 -- Test the operators and indexing functions
 
@@ -80,7 +72,7 @@ SELECT 'B'::citext <= 'a'::varchar AS t;  -- varchar wins.
 SELECT 'a'::citext >  'B'::varchar AS t;  -- varchar wins.
 SELECT 'a'::citext >= 'B'::varchar AS t;  -- varchar wins.
 
--- A couple of longer examlpes to ensure that we don't get any issues with bad
+-- A couple of longer examples to ensure that we don't get any issues with bad
 -- conversions to char[] in the c code. Yes, I did do this.
 
 SELECT 'aardvark'::citext = 'aardvark'::citext AS t;
@@ -90,18 +82,16 @@ SELECT 'aardvark'::citext = 'aardVark'::citext AS t;
 SELECT citext_cmp('aardvark'::citext, 'aardvark'::citext) AS zero;
 SELECT citext_cmp('aardvark'::citext, 'aardVark'::citext) AS zero;
 SELECT citext_cmp('AARDVARK'::citext, 'AARDVARK'::citext) AS zero;
-SELECT citext_cmp('B'::citext, 'a'::citext) AS one;
+SELECT citext_cmp('B'::citext, 'a'::citext) > 0 AS true;
 
 -- Do some tests using a table and index.
 
 CREATE TEMP TABLE try (
-   a text,
-   name citext,
-   UNIQUE (a, name)
-) DISTRIBUTED BY (a);
+   name citext PRIMARY KEY
+);
 
-INSERT INTO try (a, name)
-VALUES ('a', 'a'), ('a','ab'), ('â','â'), ('aba','aba'), ('b','b'), ('ba','ba'), ('bab','bab'), ('AZ','AZ');
+INSERT INTO try (name)
+VALUES ('a'), ('ab'), ('â'), ('aba'), ('b'), ('ba'), ('bab'), ('AZ');
 
 SELECT name, 'a' = name AS eq_a   FROM try WHERE name <> 'â';
 SELECT name, 'a' = name AS t      FROM try where name = 'a';
@@ -110,18 +100,18 @@ SELECT name, 'A' = name AS t      FROM try where name = 'A';
 SELECT name, 'A' = name AS t      FROM try where name = 'A';
 
 -- expected failures on duplicate key
-INSERT INTO try (a,name) VALUES ('a','a');
-INSERT INTO try (a,name) VALUES ('a','A');
-INSERT INTO try (a,name) VALUES ('a','aB');
+INSERT INTO try (name) VALUES ('a');
+INSERT INTO try (name) VALUES ('A');
+INSERT INTO try (name) VALUES ('aB');
 
--- Make sure that citext_smaller() and citext_lager() work properly.
-SELECT citext_smaller( 'aa'::citext, 'ab'::citext ) = 'aa' AS t;
-SELECT citext_smaller( 'AAAA'::citext, 'bbbb'::citext ) = 'AAAA' AS t;
+-- Make sure that citext_smaller() and citext_larger() work properly.
+SELECT citext_smaller( 'ab'::citext, 'ac'::citext ) = 'ab' AS t;
+SELECT citext_smaller( 'ABC'::citext, 'bbbb'::citext ) = 'ABC' AS t;
 SELECT citext_smaller( 'aardvark'::citext, 'Aaba'::citext ) = 'Aaba' AS t;
 SELECT citext_smaller( 'aardvark'::citext, 'AARDVARK'::citext ) = 'AARDVARK' AS t;
 
-SELECT citext_larger( 'aa'::citext, 'ab'::citext ) = 'ab' AS t;
-SELECT citext_larger( 'AAAA'::citext, 'bbbb'::citext ) = 'bbbb' AS t;
+SELECT citext_larger( 'ab'::citext, 'ac'::citext ) = 'ac' AS t;
+SELECT citext_larger( 'ABC'::citext, 'bbbb'::citext ) = 'bbbb' AS t;
 SELECT citext_larger( 'aardvark'::citext, 'Aaba'::citext ) = 'aardvark' AS t;
 
 -- Test aggregate functions and sort ordering
@@ -131,19 +121,20 @@ CREATE TEMP TABLE srt (
 );
 
 INSERT INTO srt (name)
-VALUES ('aardvark'),
-       ('AAA'),
-       ('aba'),
+VALUES ('abb'),
+       ('ABA'),
        ('ABC'),
        ('abd');
 
+CREATE INDEX srt_name ON srt (name);
+
 -- Check the min() and max() aggregates, with and without index.
 set enable_seqscan = off;
-SELECT MIN(name) AS "AAA" FROM srt;
+SELECT MIN(name) AS "ABA" FROM srt;
 SELECT MAX(name) AS abd FROM srt;
 reset enable_seqscan;
 set enable_indexscan = off;
-SELECT MIN(name) AS "AAA" FROM srt;
+SELECT MIN(name) AS "ABA" FROM srt;
 SELECT MAX(name) AS abd FROM srt;
 reset enable_indexscan;
 
@@ -156,11 +147,11 @@ SELECT name FROM srt ORDER BY name;
 reset enable_indexscan;
 
 -- Test assignment casts.
-SELECT LOWER(name) as aaa FROM srt WHERE name = 'AAA'::text;
-SELECT LOWER(name) as aaa FROM srt WHERE name = 'AAA'::varchar;
-SELECT LOWER(name) as aaa FROM srt WHERE name = 'AAA'::bpchar;
-SELECT LOWER(name) as aaa FROM srt WHERE name = 'AAA';
-SELECT LOWER(name) as aaa FROM srt WHERE name = 'AAA'::citext;
+SELECT LOWER(name) as aba FROM srt WHERE name = 'ABA'::text;
+SELECT LOWER(name) as aba FROM srt WHERE name = 'ABA'::varchar;
+SELECT LOWER(name) as aba FROM srt WHERE name = 'ABA'::bpchar;
+SELECT LOWER(name) as aba FROM srt WHERE name = 'ABA';
+SELECT LOWER(name) as aba FROM srt WHERE name = 'ABA'::citext;
 
 -- LIKE should be case-insensitive
 SELECT name FROM srt WHERE name     LIKE '%a%' ORDER BY name;
@@ -227,9 +218,6 @@ SELECT 'f'::citext::char = 'f'::char AS t;
 
 SELECT 'f'::"char"::citext = 'f' AS t;
 SELECT 'f'::citext::"char" = 'f'::"char" AS t;
-
-SELECT 'foo'::bytea::citext = 'foo' AS t;
-SELECT 'foo'::citext::bytea = 'foo'::bytea AS t;
 
 SELECT '100'::money::citext = '$100.00' AS t;
 SELECT '100'::citext::money = '100'::money AS t;
@@ -307,7 +295,7 @@ CREATE TABLE caster (
     bpchar      bpchar,
     char        char,
     chr         "char",
-    name        name,    
+    name        name,
     bytea       bytea,
     boolean     boolean,
     float4      float4,
@@ -316,7 +304,7 @@ CREATE TABLE caster (
     int8        int8,
     int4        int4,
     int2        int2,
-    cidr        cidr,   
+    cidr        cidr,
     inet        inet,
     macaddr     macaddr,
     money       money,
@@ -583,7 +571,7 @@ SELECT btrim('xyxtrimyyx'::citext,    'xy'::text  ) = 'trim' AS t;
 -- chr() takes an int and returns text.
 -- convert() and convert_from take bytea and return text.
 
-SELECT convert_to( name, 'ISO-8859-1' ) = convert_to( name::text, 'ISO-8859-1' ) AS t FROM srt;
+SELECT convert_from( name::bytea, 'SQL_ASCII' ) = convert_from( name::text::bytea, 'SQL_ASCII' ) AS t FROM srt;
 SELECT decode('MTIzAAE='::citext, 'base64') = decode('MTIzAAE='::text, 'base64') AS t;
 -- encode() takes bytea and returns text.
 SELECT initcap('hi THOMAS'::citext) = initcap('hi THOMAS'::text) AS t;
@@ -666,12 +654,12 @@ SELECT split_part('abcTdefTghi'::citext, 't', 2) = 'def' AS t;
 SELECT split_part('abcTdefTghi'::citext, 't'::citext, 2) = 'def' AS t;
 SELECT split_part('abcTdefTghi', 't'::citext, 2) = 'def' AS t;
 
-SELECT strpos('high'::citext, 'ig'        ) = 2 AS t;
-SELECT strpos('high',         'ig'::citext) = 2 AS t;
-SELECT strpos('high'::citext, 'ig'::citext) = 2 AS t;
-SELECT strpos('high'::citext, 'IG'        ) = 2 AS t;
-SELECT strpos('high',         'IG'::citext) = 2 AS t;
-SELECT strpos('high'::citext, 'IG'::citext) = 2 AS t;
+SELECT strpos('high'::citext, 'gh'        ) = 3 AS t;
+SELECT strpos('high',         'gh'::citext) = 3 AS t;
+SELECT strpos('high'::citext, 'gh'::citext) = 3 AS t;
+SELECT strpos('high'::citext, 'GH'        ) = 3 AS t;
+SELECT strpos('high',         'GH'::citext) = 3 AS t;
+SELECT strpos('high'::citext, 'GH'::citext) = 3 AS t;
 
 -- to_ascii() does not support UTF-8.
 -- to_hex() takes a numeric argument.
@@ -722,3 +710,28 @@ SELECT COUNT(*) = 19::bigint AS t FROM try;
 
 SELECT like_escape( name, '' ) = like_escape( name::text, '' ) AS t FROM srt;
 SELECT like_escape( name::text, ''::citext ) = like_escape( name::text, '' ) AS t FROM srt;
+
+-- start_ignore
+-- Ensure correct behavior for citext with materialized views.
+CREATE TABLE citext_table (
+  id serial primary key,
+  name citext
+);
+INSERT INTO citext_table (name)
+  VALUES ('one'), ('two'), ('three'), (NULL), (NULL);
+CREATE MATERIALIZED VIEW citext_matview AS
+  SELECT * FROM citext_table;
+CREATE UNIQUE INDEX citext_matview_id
+  ON citext_matview (id);
+SELECT *
+  FROM citext_matview m
+  FULL JOIN citext_table t ON (t.id = m.id AND t *= m)
+  WHERE t.id IS NULL OR m.id IS NULL;
+UPDATE citext_table SET name = 'Two' WHERE name = 'TWO';
+SELECT *
+  FROM citext_matview m
+  FULL JOIN citext_table t ON (t.id = m.id AND t *= m)
+  WHERE t.id IS NULL OR m.id IS NULL;
+REFRESH MATERIALIZED VIEW CONCURRENTLY citext_matview;
+SELECT * FROM citext_matview ORDER BY id;
+-- end_ignore

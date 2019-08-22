@@ -2,38 +2,34 @@
 #
 # Makefile for src/bin (client programs)
 #
-# Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
-# $PostgreSQL: pgsql/src/bin/Makefile,v 1.53 2008/03/27 17:24:16 momjian Exp $
+# src/bin/Makefile
 #
 #-------------------------------------------------------------------------
 
 subdir = src/bin
 top_builddir = ../..
-nbu_libdir = $(shell cd $(top_builddir)/gpAux/ext/$(BLD_ARCH)/Netbackup/nbu77/lib; pwd)
 include $(top_builddir)/src/Makefile.global
 
-ifneq ($(enable_coverage), yes)
-unittest-check:
-	$(MAKE) -e LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):$(nbu_libdir) -C pg_dump/cdb/test check
-	$(MAKE) -C pg_dump/test check
-else
 unittest-check:
 	$(MAKE) -C pg_dump/test check
-endif
 
-DIRS = initdb pg_basebackup pg_ctl pg_dump \
-	psql scripts pg_config pg_controldata pg_resetxlog \
-	gpmirrortransition
+SUBDIRS = initdb pg_ctl pg_dump \
+	psql scripts pg_config pg_controldata pg_resetxlog pg_basebackup pg_rewind
 
 ifeq ($(PORTNAME), win32)
-DIRS+=pgevent
+SUBDIRS += pgevent
+else
+ALWAYS_SUBDIRS += pgevent
 endif
-
 ifeq ($(enable_gpfdist), yes)
-DIRS+=gpfdist
+SUBDIRS+=gpfdist
 endif
 
-all install installdirs uninstall distprep clean distclean maintainer-clean:
-	@for dir in $(DIRS); do $(MAKE) -C $$dir $@ || exit; done
+# Greenplum additions
+SUBDIRS += gpnetbench
+
+$(recurse)
+$(recurse_always)

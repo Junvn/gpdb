@@ -49,20 +49,16 @@
 #include "cdb/cdbappendonlystorage.h"
 #include "cdb/cdbappendonlystorageformat.h"
 #include "cdb/cdbappendonlystoragelayer.h"
-#include "cdb/cdbpersistentfilesysobj.h"
 #include "cdb/cdbvars.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/datum.h"
 #include "utils/faultinjector.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-
-#define SCANNED_SEGNO  \
-	(&scan->aos_segfile_arr[ \
-		(scan->aos_segfiles_processed == 0 ? 0 : scan->aos_segfiles_processed - 1) \
-		])->segno
+#include "utils/snapmgr.h"
 
 /*
  * AppendOnlyDeleteDescData is used for delete data from append-only
@@ -177,7 +173,7 @@ SetNextFileSegForRead(AppendOnlyScanDesc scan)
 	Relation	reln = scan->aos_rd;
 	int			segno = -1;
 	int64		eof = 0;
-	int			formatversion = -1;
+	int			formatversion = -2; /* some invalid value */
 	bool		finished_all_files = true;	/* assume */
 	int32		fileSegNo;
 
@@ -264,7 +260,7 @@ SetNextFileSegForRead(AppendOnlyScanDesc scan)
 
 		/*
 		 * special case: we are the QD reading from an AO table in utility
-		 * mode (gp_dump). We see entries in the aoseg table but no files or
+		 * mode. We see entries in the aoseg table but no files or
 		 * data actually exist. If we try to open this file we'll get an
 		 * error, so we must skip to the next. For now, we can test if the
 		 * file exists by looking at the eof value - it's always 0 on the QD.
@@ -424,15 +420,16 @@ errdetail_appendonly_insert_block_header(AppendOnlyInsertDesc aoInsertDesc)
 static void
 SetCurrentFileSegForWrite(AppendOnlyInsertDesc aoInsertDesc)
 {
+	RelFileNodeBackend rnode;
+
 	FileSegInfo *fsinfo;
 	int64		eof;
 	int64		eof_uncompressed;
 	int64		varblockcount;
 	int32		fileSegNo;
-	ItemPointerData persistentTid;
-	int64		persistentSerialNum;
-	int64		appendOnlyNewEof;
 
+	rnode.node = aoInsertDesc->aoi_rel->rd_node;
+	rnode.backend = aoInsertDesc->aoi_rel->rd_backend;
 
 	/* Make the 'segment' file name */
 	MakeAOSegmentFileName(aoInsertDesc->aoi_rel,
@@ -466,39 +463,14 @@ SetCurrentFileSegForWrite(AppendOnlyInsertDesc aoInsertDesc)
 
 	if (aoInsertDesc->fsInfo == NULL)
 	{
-		/*
-		 * If the entry is not found in the pg_aoseg table, then it better not
-		 * be in gp_relation_node table too. But, we avoid this check for
-		 * segment # 0 because it is typically used by operations similar to
-		 * CTAS etc and the order followed is to first add to
-		 * gp_persistent_relation_node (thus gp_relation_node) and later to
-		 * pg_aoseg table.
-		 */
-		if (gp_appendonly_verify_eof &&
-			aoInsertDesc->cur_segno > 0 &&
-			ReadGpRelationNode(aoInsertDesc->aoi_rel->rd_rel->reltablespace,
-							   aoInsertDesc->aoi_rel->rd_rel->relfilenode,
-							   aoInsertDesc->cur_segno,
-							   &persistentTid,
-							   &persistentSerialNum))
-		{
-			elog(ERROR, "Found gp_relation_node entry for relation name %s, "
-				 "relation Oid %u, relfilenode %u, segment file #%d "
-				 "at PTID: %s, PSN: " INT64_FORMAT " when not expected",
-				 aoInsertDesc->aoi_rel->rd_rel->relname.data,
-				 aoInsertDesc->aoi_rel->rd_id,
-				 aoInsertDesc->aoi_rel->rd_node.relNode,
-				 aoInsertDesc->cur_segno,
-				 ItemPointerToString(&persistentTid),
-				 persistentSerialNum);
-		}
-
 		InsertInitialSegnoEntry(aoInsertDesc->aoi_rel, aoInsertDesc->cur_segno);
 		aoInsertDesc->fsInfo = NewFileSegInfo(aoInsertDesc->cur_segno);
 	}
 
 	/* Never insert into a segment that is awaiting a drop */
-	Assert(aoInsertDesc->fsInfo->state != AOSEG_STATE_AWAITING_DROP);
+	elogif(aoInsertDesc->fsInfo->state == AOSEG_STATE_AWAITING_DROP,
+		   ERROR, "cannot insert into segno (%d) from AO relid %d that is in state AOSEG_STATE_AWAITING_DROP",
+		   aoInsertDesc->cur_segno, RelationGetRelid(aoInsertDesc->aoi_rel));
 
 	fsinfo = aoInsertDesc->fsInfo;
 	Assert(fsinfo);
@@ -515,59 +487,8 @@ SetCurrentFileSegForWrite(AppendOnlyInsertDesc aoInsertDesc)
 	if (aoInsertDesc->cur_segno > 0 && eof == 0)
 	{
 		AppendOnlyStorageWrite_TransactionCreateFile(&aoInsertDesc->storageWrite,
-													 aoInsertDesc->appendFilePathName,
-													 eof,
-													 &aoInsertDesc->aoi_rel->rd_node,
-													 aoInsertDesc->cur_segno,
-													 &persistentTid,
-													 &persistentSerialNum);
-	}
-	else
-	{
-		if (!ReadGpRelationNode(aoInsertDesc->aoi_rel->rd_rel->reltablespace,
-								aoInsertDesc->aoi_rel->rd_rel->relfilenode,
-								aoInsertDesc->cur_segno,
-								&persistentTid,
-								&persistentSerialNum))
-		{
-			elog(ERROR, "Did not find gp_relation_node entry for relation name"
-				 " %s, relation id %u, tablespace %u, relfilenode %u, segment file #%d,"
-				 " logical eof " INT64_FORMAT,
-				 aoInsertDesc->aoi_rel->rd_rel->relname.data,
-				 aoInsertDesc->aoi_rel->rd_id,
-				 aoInsertDesc->aoi_rel->rd_rel->reltablespace,
-				 aoInsertDesc->aoi_rel->rd_rel->relfilenode,
-				 aoInsertDesc->cur_segno,
-				 eof);
-		}
-	}
-
-	if (gp_appendonly_verify_eof)
-	{
-		/* Get EOF from gp_persistent_relation_node */
-		appendOnlyNewEof = PersistentFileSysObj_ReadEof(PersistentFsObjType_RelationFile,
-														&persistentTid);
-
-		/*
-		 * Verify if EOF from gp_persistent_relation_node < EOF from pg_aoseg
-		 *
-		 * Note:- EOF from gp_persistent_relation_node has to be less than the
-		 * EOF from pg_aoseg because inside a transaction the actual EOF where
-		 * the data is inserted has to be greater than or equal to Persistent
-		 * Table (PT) stored EOF as persistent table EOF value is updated at
-		 * the end of the transaction.
-		 */
-		if (eof < appendOnlyNewEof)
-		{
-			elog(ERROR, "Unexpected EOF for relation name %s, relfilenode %u, "
-				 "segment file %d. EOF from gp_persistent_relation_node "
-				 INT64_FORMAT " greater than current EOF " INT64_FORMAT,
-				 aoInsertDesc->aoi_rel->rd_rel->relname.data,
-				 aoInsertDesc->aoi_rel->rd_node.relNode,
-				 aoInsertDesc->cur_segno,
-				 appendOnlyNewEof,
-				 eof);
-		}
+													 &rnode,
+													 aoInsertDesc->cur_segno);
 	}
 
 	/*
@@ -578,10 +499,8 @@ SetCurrentFileSegForWrite(AppendOnlyInsertDesc aoInsertDesc)
 									aoInsertDesc->fsInfo->formatversion,
 									eof,
 									eof_uncompressed,
-									&aoInsertDesc->aoi_rel->rd_node,
-									aoInsertDesc->cur_segno,
-									&persistentTid,
-									persistentSerialNum);
+									&rnode,
+									aoInsertDesc->cur_segno);
 
 	/* reset counts */
 	aoInsertDesc->insertCount = 0;
@@ -635,7 +554,7 @@ CloseWritableFileSeg(AppendOnlyInsertDesc aoInsertDesc)
 
 	elogif(Debug_appendonly_print_insert, LOG,
 		   "Append-only scan closed write file segment #%d for table %s "
-		   "(file length " INT64_FORMAT ", insert count %f, VarBlock count %f",
+		   "(file length " INT64_FORMAT ", insert count " INT64_FORMAT ", VarBlock count " INT64_FORMAT,
 		   aoInsertDesc->cur_segno,
 		   NameStr(aoInsertDesc->aoi_rel->rd_rel->relname),
 		   fileLen,
@@ -774,9 +693,8 @@ AppendOnlyExecutorReadBlock_GetContents(AppendOnlyExecutorReadBlock *executorRea
 			varBlockCheckError = VarBlockIsValid(executorReadBlock->dataBuffer, executorReadBlock->dataLen);
 			if (varBlockCheckError != VarBlockCheckOk)
 				ereport(ERROR,
-						(errcode(ERRCODE_GP_INTERNAL_ERROR),
-						 errmsg("VarBlock  is not valid. "
-								"Valid block check error %d, detail '%s'",
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("VarBlock is not valid, valid block check error %d, detail '%s'",
 								varBlockCheckError,
 								VarBlockGetCheckErrorStr()),
 						 errdetail_appendonly_read_storage_content_header(executorReadBlock->storageRead),
@@ -796,8 +714,8 @@ AppendOnlyExecutorReadBlock_GetContents(AppendOnlyExecutorReadBlock *executorRea
 			if (executorReadBlock->rowCount != executorReadBlock->readerItemCount)
 			{
 				ereport(ERROR,
-						(errcode(ERRCODE_GP_INTERNAL_ERROR),
-						 errmsg("Row count %d in append-only storage header does not match VarBlock item count %d",
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("row count %d in append-only storage header does not match VarBlock item count %d",
 								executorReadBlock->rowCount,
 								executorReadBlock->readerItemCount),
 						 errdetail_appendonly_read_storage_content_header(executorReadBlock->storageRead),
@@ -805,7 +723,7 @@ AppendOnlyExecutorReadBlock_GetContents(AppendOnlyExecutorReadBlock *executorRea
 			}
 
 			elogif(Debug_appendonly_print_scan, LOG,
-				   "Append-only scan read VarBlock for table '%s' with %d items (block offset in file = " INT64_FORMAT ")",
+				   "append-only scan read VarBlock for table '%s' with %d items (block offset in file = " INT64_FORMAT ")",
 				   AppendOnlyStorageRead_RelationName(executorReadBlock->storageRead),
 				   executorReadBlock->readerItemCount,
 				   executorReadBlock->headerOffsetInFile);
@@ -815,8 +733,8 @@ AppendOnlyExecutorReadBlock_GetContents(AppendOnlyExecutorReadBlock *executorRea
 			if (executorReadBlock->rowCount != 1)
 			{
 				ereport(ERROR,
-						(errcode(ERRCODE_GP_INTERNAL_ERROR),
-						 errmsg("Row count %d in append-only storage header is not 1 for single row",
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("row count %d in append-only storage header is not 1 for single row",
 								executorReadBlock->rowCount),
 						 errdetail_appendonly_read_storage_content_header(executorReadBlock->storageRead),
 						 errcontext_appendonly_read_storage_block(executorReadBlock->storageRead)));
@@ -995,7 +913,7 @@ upgrade_tuple(AppendOnlyExecutorReadBlock *executorReadBlock,
 			executorReadBlock->numNumericAtts = n;
 		}
 
-		/* If there were any numeric columns, we need to conver them. */
+		/* If there were any numeric columns, we need to convert them. */
 		if (executorReadBlock->numNumericAtts > 0)
 			convert_numerics = true;
 	}
@@ -1015,7 +933,7 @@ upgrade_tuple(AppendOnlyExecutorReadBlock *executorReadBlock,
 		if (values)
 			pfree(values);
 		if (isnull)
-			pfree(values);
+			pfree(isnull);
 		values = (Datum *) MemoryContextAlloc(TopMemoryContext, natts * sizeof(Datum));
 		isnull = (bool *) MemoryContextAlloc(TopMemoryContext, natts * sizeof(bool));
 		nallocated = natts;
@@ -1093,9 +1011,7 @@ AppendOnlyExecutorReadBlock_ProcessTuple(AppendOnlyExecutorReadBlock *executorRe
 
 	AORelationVersion_CheckValid(formatVersion);
 
-	AOTupleIdInit_Init(aoTupleId);
-	AOTupleIdInit_segmentFileNum(aoTupleId, executorReadBlock->segmentFileNum);
-	AOTupleIdInit_rowNum(aoTupleId, rowNum);
+	AOTupleIdInit(aoTupleId, executorReadBlock->segmentFileNum, rowNum);
 
 	if (slot)
 	{
@@ -1126,7 +1042,7 @@ AppendOnlyExecutorReadBlock_ProcessTuple(AppendOnlyExecutorReadBlock *executorRe
 	return valid;
 }
 
-static MemTuple
+static bool
 AppendOnlyExecutorReadBlock_ScanNextTuple(AppendOnlyExecutorReadBlock *executorReadBlock,
 										  int nkeys,
 										  ScanKey key,
@@ -1158,7 +1074,7 @@ AppendOnlyExecutorReadBlock_ScanNextTuple(AppendOnlyExecutorReadBlock *executorR
 					/* no more items in the varblock, get new buffer */
 					AppendOnlyExecutionReadBlock_FinishedScanBlock(
 																   executorReadBlock);
-					return NULL;
+					return false;
 				}
 
 				executorReadBlock->currentItemCount++;
@@ -1180,7 +1096,7 @@ AppendOnlyExecutorReadBlock_ScanNextTuple(AppendOnlyExecutorReadBlock *executorR
 																 nkeys,
 																 key,
 																 slot))
-						return TupGetMemTuple(slot);
+						return true;
 				}
 
 			}
@@ -1201,7 +1117,7 @@ AppendOnlyExecutorReadBlock_ScanNextTuple(AppendOnlyExecutorReadBlock *executorR
 				{
 					AppendOnlyExecutionReadBlock_FinishedScanBlock(
 																   executorReadBlock);
-					return NULL;
+					return false;
 					/* Force fetching new block. */
 				}
 
@@ -1226,7 +1142,7 @@ AppendOnlyExecutorReadBlock_ScanNextTuple(AppendOnlyExecutorReadBlock *executorR
 															 nkeys,
 															 key,
 															 slot))
-					return TupGetMemTuple(slot);
+					return true;
 			}
 			break;
 
@@ -1238,7 +1154,7 @@ AppendOnlyExecutorReadBlock_ScanNextTuple(AppendOnlyExecutorReadBlock *executorR
 
 	AppendOnlyExecutionReadBlock_FinishedScanBlock(
 												   executorReadBlock);
-	return NULL;
+	return false;
 	/* No match. */
 }
 
@@ -1380,15 +1296,13 @@ getNextBlock(AppendOnlyScanDesc scan)
  * the scankeys.
  * ----------------
  */
-static MemTuple
+static bool
 appendonlygettup(AppendOnlyScanDesc scan,
 				 ScanDirection dir __attribute__((unused)),
 				 int nkeys,
 				 ScanKey key,
 				 TupleTableSlot *slot)
 {
-	MemTuple	tuple;
-
 	Assert(ScanDirectionIsForward(dir));
 	Assert(scan->usableBlockSize > 0);
 
@@ -1396,6 +1310,8 @@ appendonlygettup(AppendOnlyScanDesc scan,
 
 	for (;;)
 	{
+		bool		found;
+
 		if (scan->bufferDone)
 		{
 			/*
@@ -1407,18 +1323,17 @@ appendonlygettup(AppendOnlyScanDesc scan,
 			{
 				/* have we read all this relation's data. done! */
 				if (scan->aos_done_all_segfiles)
-					return NULL;
+					return false;
 			}
 
 			scan->bufferDone = false;
 		}
 
-		tuple = AppendOnlyExecutorReadBlock_ScanNextTuple(
-														  &scan->executorReadBlock,
+		found = AppendOnlyExecutorReadBlock_ScanNextTuple(&scan->executorReadBlock,
 														  nkeys,
 														  key,
 														  slot);
-		if (tuple != NULL)
+		if (found)
 		{
 
 			/*
@@ -1435,7 +1350,7 @@ appendonlygettup(AppendOnlyScanDesc scan,
 			else
 			{
 				/* The tuple is visible */
-				return tuple;
+				return true;
 			}
 		}
 		else
@@ -1443,9 +1358,7 @@ appendonlygettup(AppendOnlyScanDesc scan,
 			/* no more items in the varblock, get new buffer */
 			scan->bufferDone = true;
 		}
-
 	}
-
 }
 
 static void
@@ -1587,9 +1500,8 @@ finishWriteBlock(AppendOnlyInsertDesc aoInsertDesc)
 				varBlockCheckError = VarBlockIsValid(aoInsertDesc->uncompressedBuffer, dataLen);
 				if (varBlockCheckError != VarBlockCheckOk)
 					ereport(ERROR,
-							(errcode(ERRCODE_GP_INTERNAL_ERROR),
-							 errmsg("Verify block during write found VarBlock is not valid. "
-									"Valid block check error %d, detail '%s'",
+							(errcode(ERRCODE_INTERNAL_ERROR),
+							 errmsg("verify block during write found VarBlock is not valid, valid block check error %d, detail '%s'",
 									varBlockCheckError,
 									VarBlockGetCheckErrorStr()),
 							 errdetail_appendonly_insert_block_header(aoInsertDesc),
@@ -1668,7 +1580,7 @@ appendonly_beginrangescan_internal(Relation relation,
 	scan->aos_filenamepath_maxlen = AOSegmentFilePathNameLen(relation) + 1;
 	scan->aos_filenamepath = (char *) palloc(scan->aos_filenamepath_maxlen);
 	scan->aos_filenamepath[0] = '\0';
-	scan->usableBlockSize = AppendOnlyStorage_GetUsableBlockSize(relation->rd_appendonly->blocksize);
+	scan->usableBlockSize = relation->rd_appendonly->blocksize;
 	scan->aos_rd = relation;
 	scan->appendOnlyMetaDataSnapshot = appendOnlyMetaDataSnapshot;
 	scan->snapshot = snapshot;
@@ -1872,22 +1784,22 @@ appendonly_endscan(AppendOnlyScanDesc scan)
  *		appendonly_getnext	- retrieve next tuple in scan
  * ----------------
  */
-MemTuple
+bool
 appendonly_getnext(AppendOnlyScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 {
-	MemTuple	tup = appendonlygettup(scan, direction, scan->aos_nkeys, scan->aos_key, slot);
+	if (appendonlygettup(scan, direction, scan->aos_nkeys, scan->aos_key, slot))
+	{
+		pgstat_count_heap_getnext(scan->aos_rd);
 
-	if (tup == NULL)
+		return true;
+	}
+	else
 	{
 		if (slot)
 			ExecClearTuple(slot);
 
-		return NULL;
+		return false;
 	}
-
-	pgstat_count_heap_getnext(scan->aos_rd);
-
-	return tup;
 }
 
 static void
@@ -2227,9 +2139,7 @@ appendonly_fetch_init(Relation relation,
 	attr->compressLevel = relation->rd_appendonly->compresslevel;
 	attr->checksum = relation->rd_appendonly->checksum;
 	attr->safeFSWriteSize = relation->rd_appendonly->safefswritesize;
-
-	aoFetchDesc->usableBlockSize =
-		AppendOnlyStorage_GetUsableBlockSize(relation->rd_appendonly->blocksize);
+	aoFetchDesc->usableBlockSize = relation->rd_appendonly->blocksize;
 
 	/*
 	 * Get information about all the file segments we need to scan
@@ -2419,10 +2329,9 @@ appendonly_fetch(AppendOnlyFetchDesc aoFetchDesc,
 #ifdef USE_ASSERT_CHECKING
 		if (segmentFileNum < aoFetchDesc->currentSegmentFile.num)
 			ereport(WARNING,
-					(errmsg("Append-only fetch requires scan prior segment file: "
-							"segmentFileNum %d, rowNum " INT64_FORMAT
-							", currentSegmentFileNum %d",
-							segmentFileNum, rowNum, aoFetchDesc->currentSegmentFile.num)));
+					(errmsg("append-only fetch requires scan prior segment file: segmentFileNum %d, rowNum " INT64_FORMAT ", currentSegmentFileNum %d",
+							segmentFileNum, rowNum,
+							aoFetchDesc->currentSegmentFile.num)));
 #endif
 		closeFetchSegmentFile(aoFetchDesc);
 
@@ -2525,7 +2434,7 @@ AppendOnlyDeleteDesc
 appendonly_delete_init(Relation rel, Snapshot appendOnlyMetaDataSnapshot)
 {
 	Assert(RelationIsAoRows(rel));
-	Assert(!IsXactIsoLevelSerializable);
+	Assert(!IsolationUsesXactSnapshot());
 
 	AppendOnlyDeleteDesc aoDeleteDesc = palloc0(sizeof(AppendOnlyDeleteDescData));
 
@@ -2570,7 +2479,7 @@ appendonly_delete(AppendOnlyDeleteDesc aoDeleteDesc,
 
 #ifdef FAULT_INJECTOR
 	FaultInjector_InjectFaultIfSet(
-								   AppendOnlyDelete,
+								   "appendonly_delete",
 								   DDLNotSpecified,
 								   "", //databaseName
 								   RelationGetRelationName(aoDeleteDesc->aod_rel));
@@ -2591,7 +2500,7 @@ AppendOnlyUpdateDesc
 appendonly_update_init(Relation rel, Snapshot appendOnlyMetaDataSnapshot, int segno)
 {
 	Assert(RelationIsAoRows(rel));
-	Assert(!IsXactIsoLevelSerializable);
+	Assert(!IsolationUsesXactSnapshot());
 
 	/*
 	 * allocate and initialize the insert descriptor
@@ -2641,7 +2550,7 @@ appendonly_update(AppendOnlyUpdateDesc aoUpdateDesc,
 
 #ifdef FAULT_INJECTOR
 	FaultInjector_InjectFaultIfSet(
-								   AppendOnlyUpdate,
+								   "appendonly_update",
 								   DDLNotSpecified,
 								   "", //databaseName
 								   RelationGetRelationName(aoUpdateDesc->aoInsertDesc->aoi_rel));
@@ -2699,7 +2608,7 @@ appendonly_insert_init(Relation rel, int segno, bool update_mode)
 	 * Writers uses this since they have exclusive access to the lock acquired
 	 * with LockRelationAppendOnlySegmentFile for the segment-file.
 	 */
-	aoInsertDesc->appendOnlyMetaDataSnapshot = SnapshotNow;
+	aoInsertDesc->appendOnlyMetaDataSnapshot = RegisterSnapshot(GetCatalogSnapshot(InvalidOid));
 
 	aoInsertDesc->mt_bind = create_memtuple_binding(RelationGetDescr(rel));
 
@@ -2727,7 +2636,7 @@ appendonly_insert_init(Relation rel, int segno, bool update_mode)
 /* 	aoInsertDesc->useNoToast = aoentry->notoast; */
 	aoInsertDesc->useNoToast = Debug_appendonly_use_no_toast;
 
-	aoInsertDesc->usableBlockSize = AppendOnlyStorage_GetUsableBlockSize(rel->rd_appendonly->blocksize);
+	aoInsertDesc->usableBlockSize = rel->rd_appendonly->blocksize;
 
 	attr = &aoInsertDesc->storageAttributes;
 
@@ -2800,7 +2709,8 @@ appendonly_insert_init(Relation rel, int segno, bool update_mode)
 								aoInsertDesc->usableBlockSize,
 								RelationGetRelationName(aoInsertDesc->aoi_rel),
 								aoInsertDesc->title,
-								&aoInsertDesc->storageAttributes);
+								&aoInsertDesc->storageAttributes,
+                                RelationNeedsWAL(aoInsertDesc->aoi_rel));
 
 	aoInsertDesc->storageWrite.compression_functions = fns;
 	aoInsertDesc->storageWrite.compressionState = cs;
@@ -2911,14 +2821,14 @@ appendonly_insert(AppendOnlyInsertDesc aoInsertDesc,
 
 #ifdef FAULT_INJECTOR
 	FaultInjector_InjectFaultIfSet(
-								   AppendOnlyInsert,
+								   "appendonly_insert",
 								   DDLNotSpecified,
 								   "", //databaseName
 								   RelationGetRelationName(aoInsertDesc->aoi_rel));
 	/* tableName */
 #endif
 
-	Insist(RelationIsAoRows(relation));
+	Assert(RelationIsAoRows(relation));
 
 	if (aoInsertDesc->useNoToast)
 		need_toast = false;
@@ -3011,7 +2921,7 @@ appendonly_insert(AppendOnlyInsertDesc aoInsertDesc,
 				 */
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("Item too long (check #1): length %d, maxBufferLen %d",
+						 errmsg("item too long (check #1): length %d, maxBufferLen %d",
 								itemLen, aoInsertDesc->varBlockMaker.maxBufferLen),
 						 errcontext_appendonly_insert_block_user_limit(aoInsertDesc)));
 			}
@@ -3054,7 +2964,7 @@ appendonly_insert(AppendOnlyInsertDesc aoInsertDesc,
 					 */
 					ereport(ERROR,
 							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-							 errmsg("Item too long (check #2): length %d, maxBufferLen %d",
+							 errmsg("item too long (check #2): length %d, maxBufferLen %d",
 									itemLen, aoInsertDesc->varBlockMaker.maxBufferLen),
 							 errcontext_appendonly_insert_block_user_limit(aoInsertDesc)));
 				}
@@ -3105,7 +3015,7 @@ appendonly_insert(AppendOnlyInsertDesc aoInsertDesc,
 
 	aoInsertDesc->insertCount++;
 	if (!aoInsertDesc->update_mode)
-		pgstat_count_heap_insert(relation);
+		pgstat_count_heap_insert(relation, 1);
 	else
 		pgstat_count_heap_update(relation, false);
 	aoInsertDesc->lastSequence++;
@@ -3116,9 +3026,7 @@ appendonly_insert(AppendOnlyInsertDesc aoInsertDesc,
 
 	tupleOid = MemTupleGetOid(tup, aoInsertDesc->mt_bind);
 
-	AOTupleIdInit_Init(aoTupleId);
-	AOTupleIdInit_segmentFileNum(aoTupleId, aoInsertDesc->cur_segno);
-	AOTupleIdInit_rowNum(aoTupleId, aoInsertDesc->lastSequence);
+	AOTupleIdInit(aoTupleId, aoInsertDesc->cur_segno, aoInsertDesc->lastSequence);
 
 	/*
 	 * If the allocated fast sequence numbers are used up, we request for a
@@ -3173,6 +3081,8 @@ appendonly_insert_finish(AppendOnlyInsertDesc aoInsertDesc)
 
 	AppendOnlyStorageWrite_FinishSession(&aoInsertDesc->storageWrite);
 
+	UnregisterSnapshot(aoInsertDesc->appendOnlyMetaDataSnapshot);
+
 	pfree(aoInsertDesc->title);
 	pfree(aoInsertDesc);
 }
@@ -3191,5 +3101,5 @@ BlockNumber
 RelationGuessNumberOfBlocks(double totalbytes)
 {
 	/* for now it's very simple */
-	return (BlockNumber) (totalbytes / BLCKSZ) + 1;
+	return (BlockNumber) ceil(totalbytes / BLCKSZ);
 }

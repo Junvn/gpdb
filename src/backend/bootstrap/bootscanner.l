@@ -4,12 +4,12 @@
  * bootscanner.l
  *	  a lexical scanner for the bootstrap parser
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/bootstrap/bootscanner.l,v 1.47 2008/08/29 13:02:32 petere Exp $
+ *	  src/backend/bootstrap/bootscanner.l
  *
  *-------------------------------------------------------------------------
  */
@@ -82,6 +82,7 @@ static int	yyline = 1;			/* line number for error reporting */
 %option noinput
 %option nounput
 %option noyywrap
+%option warn
 %option prefix="boot_yy"
 
 
@@ -104,6 +105,7 @@ OID				{ return(OBJ_ID); }
 bootstrap		{ return(XBOOTSTRAP); }
 "shared_relation"	{ return(XSHARED_RELATION); }
 "without_oids"	{ return(XWITHOUT_OIDS); }
+"rowtype_oid"	{ return(XROWTYPE_OID); }
 _null_			{ return(NULLVAL); }
 
 insert			{ return(INSERT_TUPLE); }
@@ -130,21 +132,16 @@ insert			{ return(INSERT_TUPLE); }
 "toast"			{ return(XTOAST); }
 
 {arrayid}		{
-					yylval.ival = EnterString(MapArrayTypeName((char*)yytext));
+					yylval.str = MapArrayTypeName(yytext);
 					return(ID);
 				}
 {id}			{
-					char   *newid = scanstr((char*)yytext);
-					yylval.ival = EnterString(newid);
-					pfree(newid);
+					yylval.str = scanstr(yytext);
 					return(ID);
 				}
 {sid}			{
-					char   *newid;
 					yytext[strlen(yytext)-1] = '\0'; /* strip off quotes */
-					newid = scanstr((char*)yytext+1);
-					yylval.ival = EnterString(newid);
-					pfree(newid);
+					yylval.str = scanstr(yytext+1);
 					yytext[strlen(yytext)] = '"'; /* restore quotes */
 					return(ID);
 				}
@@ -152,7 +149,7 @@ insert			{ return(INSERT_TUPLE); }
 (-)?{D}+"."{D}*({Exp})? |
 (-)?{D}*"."{D}+({Exp})? |
 (-)?{D}+{Exp}			{
-							yylval.ival = EnterString((char*)yytext);
+							yylval.str = pstrdup(yytext);
 							return(CONST_P);
 						}
 

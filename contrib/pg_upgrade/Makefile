@@ -1,7 +1,4 @@
-#
-# Makefile for pg_upgrade
-#
-# $PostgreSQL: pgsql/contrib/pg_upgrade/Makefile,v 1.4 2010/07/03 14:23:13 momjian Exp $
+# contrib/pg_upgrade/Makefile
 
 top_builddir = ../..
 
@@ -10,13 +7,22 @@ PGAPPICON = win32
 
 PROGRAM  = pg_upgrade
 OBJS = check.o controldata.o dump.o exec.o file.o function.o info.o \
-       option.o page.o pg_upgrade.o relfilenode.o server.o \
+       option.o page.o parallel.o pg_upgrade.o relfilenode.o server.o \
        tablespace.o util.o version.o version_old_8_3.o $(WIN32RES)
 
-OBJS += aotable.o gpdb4_heap_convert.o version_old_gpdb4.o oid_dump.o
+# Source files specific to Greenplum
+OBJS += aotable.o gpdb4_heap_convert.o version_gp.o \
+        check_gp.o file_gp.o reporting.o aomd_filehandler.o
 
 PG_CPPFLAGS  = -DFRONTEND -DDLSUFFIX=\"$(DLSUFFIX)\" -I$(srcdir) -I$(libpq_srcdir)
 PG_LIBS = $(libpq_pgport)
+
+EXTRA_CLEAN = analyze_new_cluster.sh delete_old_cluster.sh log/ tmp_check/ \
+              pg_upgrade_dump_globals.sql \
+              pg_upgrade_dump_*.custom pg_upgrade_*.log
+
+EXTRA_CLEAN += clusterConfigPostgresAddonsFile clusterConfigFile gpdemo-env.sh \
+              hostfile regression.diffs aomd_filehandler.c
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
@@ -28,8 +34,14 @@ include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
 
+aomd_filehandler.c: % : $(top_srcdir)/src/backend/access/appendonly/%
+	rm -f $@ && $(LN_S) $< .
+
+check: test_gpdb.sh all
+	bash $< -C -r -s -o $(top_builddir)/gpAux/gpdemo/datadirs/ -b $(DESTDIR)$(bindir)
+
 installcheck: test_gpdb.sh all
 	bash $< -o $(top_builddir)/gpAux/gpdemo/datadirs/ -b $(DESTDIR)$(bindir)
 
-check: test_gpdb.sh all
-	bash $< -C -s -o $(top_builddir)/gpAux/gpdemo/datadirs/ -b $(DESTDIR)$(bindir)
+perfcheck: test_gpdb.sh all
+	bash $< -p -r -o $(top_builddir)/gpAux/gpdemo/datadirs/ -b $(DESTDIR)$(bindir)

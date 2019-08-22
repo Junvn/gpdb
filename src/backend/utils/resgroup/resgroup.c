@@ -57,24 +57,29 @@
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "utils/builtins.h"
-#include "utils/fmgroids.h"
 #include "utils/memutils.h"
 #include "utils/resgroup-ops.h"
 #include "utils/resgroup.h"
 #include "utils/resource_manager.h"
-#include "utils/resowner.h"
 #include "utils/session_state.h"
+#include "utils/tqual.h"
 #include "utils/vmem_tracker.h"
 
 #define InvalidSlotId	(-1)
-#define InvalidSessionId	(0)
 #define RESGROUP_MAX_SLOTS	(MaxConnections)
+
+/*
+ * A hard memory limit in by pass mode, in chunks
+ * More chunks are reserved on QD than on QE because planner and orca
+ * may need more memory to generate and optimize the plan.
+ */
+#define RESGROUP_BYPASS_MODE_MEMORY_LIMIT_ON_QD	30
+#define RESGROUP_BYPASS_MODE_MEMORY_LIMIT_ON_QE	10
 
 /*
  * GUC variables.
  */
-char                		*gp_resgroup_memory_policy_str = NULL;
-ResManagerMemoryPolicy     	gp_resgroup_memory_policy = RESMANAGER_MEMORY_POLICY_NONE;
+int							gp_resgroup_memory_policy = RESMANAGER_MEMORY_POLICY_NONE;
 bool						gp_log_resgroup_memory = false;
 int							gp_resgroup_memory_policy_auto_fixed_mem;
 bool						gp_resgroup_print_operator_memory_limits = false;
@@ -84,11 +89,25 @@ int							memory_spill_ratio=20;
  * Data structures
  */
 
+typedef struct ResGroupInfo				ResGroupInfo;
 typedef struct ResGroupHashEntry		ResGroupHashEntry;
 typedef struct ResGroupProcData			ResGroupProcData;
 typedef struct ResGroupSlotData			ResGroupSlotData;
 typedef struct ResGroupData				ResGroupData;
 typedef struct ResGroupControl			ResGroupControl;
+
+/*
+ * Resource group info.
+ *
+ * This records the group and groupId for a transaction.
+ * When group->groupId != groupId, it means the group
+ * has been dropped.
+ */
+struct ResGroupInfo
+{
+	ResGroupData	*group;
+	Oid				groupId;
+};
 
 struct ResGroupHashEntry
 {
@@ -105,13 +124,12 @@ struct ResGroupProcData
 {
 	Oid		groupId;
 
+	int32	memUsage;			/* memory usage of current proc */
+
 	ResGroupData		*group;
 	ResGroupSlotData	*slot;
 
 	ResGroupCaps	caps;
-
-	int32	memUsage;			/* memory usage of current proc */
-	bool	doMemCheck;			/* whether to do memory limit check */
 };
 
 /*
@@ -126,14 +144,29 @@ struct ResGroupSlotData
 {
 	Oid				groupId;
 
-	ResGroupCaps	caps;
-
 	int32			memQuota;	/* memory quota of current slot */
 	int32			memUsage;	/* total memory usage of procs belongs to this slot */
 	int				nProcs;		/* number of procs in this slot */
 
 	ResGroupSlotData	*next;
+
+	ResGroupCaps	caps;
 };
+
+/*
+ * Resource group operations for memory.
+ *
+ * Groups with different memory auditor will have different
+ * operations.
+ */
+typedef struct ResGroupMemOperations
+{
+	void (*group_mem_on_create) (Oid groupId, ResGroupData *group);
+	void (*group_mem_on_alter) (Oid groupId, ResGroupData *group);
+	void (*group_mem_on_drop) (Oid groupId, ResGroupData *group);
+	void (*group_mem_on_notify) (ResGroupData *group);
+	void (*group_mem_on_dump) (ResGroupData *group, StringInfo str);
+} ResGroupMemOperations;
 
 /*
  * Resource group information.
@@ -141,34 +174,61 @@ struct ResGroupSlotData
 struct ResGroupData
 {
 	Oid			groupId;		/* Id for this group */
-	ResGroupCaps	caps;		/* capabilities of this group */
-	int			nRunning;		/* number of running trans */
-	PROC_QUEUE	waitProcs;		/* list of PGPROC objects waiting on this group */
-	int			totalExecuted;	/* total number of executed trans */
-	int			totalQueued;	/* total number of queued trans	*/
-	Interval	totalQueuedTime;/* total queue time */
 
-	bool		lockedForDrop;  /* true if resource group is dropped but not committed yet */
+	/*
+	 * memGap is calculated as:
+	 * 	(memory limit (before alter) - memory expected (after alter))
+	 *
+	 * It stands for how many memory (in chunks) this group should
+	 * give back to MEM POOL.
+	 */
+	int32       memGap;
 
 	int32		memExpected;		/* expected memory chunks according to current caps */
 	int32		memQuotaGranted;	/* memory chunks for quota part */
 	int32		memSharedGranted;	/* memory chunks for shared part */
 
-	int32		memQuotaUsed;		/* memory chunks assigned to all the running slots */
+	volatile int32	memQuotaUsed;	/* memory chunks assigned to all the running slots */
 
 	/*
 	 * memory usage of this group, should always equal to the
 	 * sum of session memory(session_state->sessionVmem) that
 	 * belongs to this group
 	 */
-	int32		memUsage;
-	int32		memSharedUsage;
+	volatile int32	memUsage;
+	volatile int32	memSharedUsage;
+
+	volatile int			nRunning;		/* number of running trans */
+	volatile int	nRunningBypassed;		/* number of running trans in bypass mode */
+	int			totalExecuted;	/* total number of executed trans */
+	int			totalQueued;	/* total number of queued trans	*/
+	Interval	totalQueuedTime;/* total queue time */
+	PROC_QUEUE	waitProcs;		/* list of PGPROC objects waiting on this group */
+
+	/*
+	 * operation functions for resource group
+	 */
+	const ResGroupMemOperations *groupMemOps;
+
+	bool		lockedForDrop;  /* true if resource group is dropped but not committed yet */
+
+	ResGroupCaps	caps;		/* capabilities of this group */
 };
 
 struct ResGroupControl
 {
-	HTAB			*htbl;
+	int32			totalChunks;	/* total memory chunks on this segment */
+	pg_atomic_uint32 freeChunks;	/* memory chunks not allocated to any group,
+									will be used for the query which group share
+									memory is not enough*/
+
+	int32			chunkSizeInBits;
 	int 			segmentsOnMaster;
+
+	ResGroupSlotData	*slots;		/* slot pool shared by all resource groups */
+	ResGroupSlotData	*freeSlot;	/* head of the free list */
+
+	HTAB			*htbl;
 
 	/*
 	 * The hash table for resource groups in shared memory should only be populated
@@ -176,17 +236,13 @@ struct ResGroupControl
 	 */
 	bool			loaded;
 
-	int32			totalChunks;	/* total memory chunks on this segment */
-	int32			freeChunks;		/* memory chunks not allocated to any group */
-
-	int32			chunkSizeInBits;
-
-	ResGroupSlotData	*slots;		/* slot pool shared by all resource groups */
-	ResGroupSlotData	*freeSlot;	/* head of the free list */
-
 	int				nGroups;
 	ResGroupData	groups[1];
 };
+
+bool gp_resource_group_enable_cgroup_memory = false;
+bool gp_resource_group_enable_cgroup_swap = false;
+bool gp_resource_group_enable_cgroup_cpuset = false;
 
 /* hooks */
 resgroup_assign_hook_type resgroup_assign_hook = NULL;
@@ -201,7 +257,13 @@ static ResGroupProcData __self =
 };
 static ResGroupProcData *self = &__self;
 
-static bool localResWaiting = false;
+/* If we are waiting on a group, this points to the associated group */
+static ResGroupData *groupAwaited = NULL;
+
+/* the resource group self is running in bypass mode */
+static ResGroupData *bypassedGroup = NULL;
+/* a fake slot used in bypass mode */
+static ResGroupSlotData bypassedSlot;
 
 /* static functions */
 
@@ -220,14 +282,15 @@ static int32 slotGetMemQuotaExpected(const ResGroupCaps *caps);
 static int32 slotGetMemQuotaOnQE(const ResGroupCaps *caps, ResGroupData *group);
 static int32 slotGetMemSpill(const ResGroupCaps *caps);
 static void wakeupSlots(ResGroupData *group, bool grant);
-static void wakeupGroups(Oid skipGroupId);
+static void notifyGroupsOnMem(Oid skipGroupId);
 static int32 mempoolAutoRelease(ResGroupData *group);
 static int32 mempoolAutoReserve(ResGroupData *group, const ResGroupCaps *caps);
 static ResGroupData *groupHashNew(Oid groupId);
 static ResGroupData *groupHashFind(Oid groupId, bool raise);
-static void groupHashRemove(Oid groupId);
+static ResGroupData *groupHashRemove(Oid groupId);
 static void waitOnGroup(ResGroupData *group);
 static ResGroupData *createGroup(Oid groupId, const ResGroupCaps *caps);
+static void removeGroup(Oid groupId);
 static void AtProcExit_ResGroup(int code, Datum arg);
 static void groupWaitCancel(void);
 static int32 groupReserveMemQuota(ResGroupData *group);
@@ -235,31 +298,29 @@ static void groupReleaseMemQuota(ResGroupData *group, ResGroupSlotData *slot);
 static int32 groupIncMemUsage(ResGroupData *group,
 							  ResGroupSlotData *slot,
 							  int32 chunks);
-static void groupDecMemUsage(ResGroupData *group,
-							 ResGroupSlotData *slot,
-							 int32 chunks);
+static int32 groupDecMemUsage(ResGroupData *group,
+							  ResGroupSlotData *slot,
+							  int32 chunks);
 static void initSlot(ResGroupSlotData *slot, ResGroupData *group,
 					 int32 slotMemQuota);
-static void selfAttachToSlot(ResGroupData *group, ResGroupSlotData *slot);
-static void selfDetachSlot(ResGroupData *group, ResGroupSlotData *slot);
+static void selfAttachResGroup(ResGroupData *group, ResGroupSlotData *slot);
+static void selfDetachResGroup(ResGroupData *group, ResGroupSlotData *slot);
 static bool slotpoolInit(void);
 static ResGroupSlotData *slotpoolAllocSlot(void);
 static void slotpoolFreeSlot(ResGroupSlotData *slot);
 static ResGroupSlotData *groupGetSlot(ResGroupData *group);
 static void groupPutSlot(ResGroupData *group, ResGroupSlotData *slot);
 static Oid decideResGroupId(void);
-static ResGroupData *decideResGroup(void);
-static ResGroupSlotData *groupAcquireSlot(ResGroupData *group);
+static void decideResGroup(ResGroupInfo *pGroupInfo);
+static bool groupIncBypassedRef(ResGroupInfo *pGroupInfo);
+static void groupDecBypassedRef(ResGroupData *group);
+static ResGroupSlotData *groupAcquireSlot(ResGroupInfo *pGroupInfo);
 static void groupReleaseSlot(ResGroupData *group, ResGroupSlotData *slot);
 static void addTotalQueueDuration(ResGroupData *group);
 static void groupSetMemorySpillRatio(const ResGroupCaps *caps);
-static char* groupDumpMemUsage(ResGroupData *group);
+static char *groupDumpMemUsage(ResGroupData *group);
 static void selfValidateResGroupInfo(void);
-static bool selfIsAssignedDroppedGroup(void);
-static bool selfIsAssignedValidGroup(void);
-static bool selfIsUnassigned(void);
-static void selfUnassignDroppedGroup(void);
-static bool selfHasGroup(void);
+static bool selfIsAssigned(void);
 static void selfSetGroup(ResGroupData *group);
 static void selfUnsetGroup(void);
 static void selfSetSlot(ResGroupSlotData *slot);
@@ -269,12 +330,13 @@ static void procWakeup(PGPROC *proc);
 static int slotGetId(const ResGroupSlotData *slot);
 static void groupWaitQueueValidate(const ResGroupData *group);
 static void groupWaitQueuePush(ResGroupData *group, PGPROC *proc);
-static PGPROC * groupWaitQueuePop(ResGroupData *group);
+static PGPROC *groupWaitQueuePop(ResGroupData *group);
 static void groupWaitQueueErase(ResGroupData *group, PGPROC *proc);
 static bool groupWaitQueueIsEmpty(const ResGroupData *group);
-static bool shouldBypassQuery(const char* query_string);
+static bool shouldBypassQuery(const char *query_string);
 static void lockResGroupForDrop(ResGroupData *group);
 static void unlockResGroupForDrop(ResGroupData *group);
+static bool groupIsDropped(ResGroupInfo *pGroupInfo);
 
 static void resgroupDumpGroup(StringInfo str, ResGroupData *group);
 static void resgroupDumpWaitQueue(StringInfo str, PROC_QUEUE *queue);
@@ -286,8 +348,26 @@ static void sessionSetSlot(ResGroupSlotData *slot);
 static ResGroupSlotData *sessionGetSlot(void);
 static void sessionResetSlot(void);
 
+static void bindGroupOperation(ResGroupData *group);
+static void groupMemOnAlterForVmtracker(Oid groupId, ResGroupData *group);
+static void groupMemOnDropForVmtracker(Oid groupId, ResGroupData *group);
+static void groupMemOnNotifyForVmtracker(ResGroupData *group);
+static void groupMemOnDumpForVmtracker(ResGroupData *group, StringInfo str);
+
+static void groupMemOnAlterForCgroup(Oid groupId, ResGroupData *group);
+static void groupMemOnDropForCgroup(Oid groupId, ResGroupData *group);
+static void groupMemOnNotifyForCgroup(ResGroupData *group);
+static void groupMemOnDumpForCgroup(ResGroupData *group, StringInfo str);
+static void groupApplyCgroupMemInc(ResGroupData *group);
+static void groupApplyCgroupMemDec(ResGroupData *group);
+
+static void cpusetOperation(char *cpuset1,
+							const char *cpuset2,
+							int len,
+							bool sub);
+
 #ifdef USE_ASSERT_CHECKING
-static bool selfIsAssigned(void);
+static bool selfHasGroup(void);
 static bool selfHasSlot(void);
 static void slotValidate(const ResGroupSlotData *slot);
 static bool slotIsInFreelist(const ResGroupSlotData *slot);
@@ -295,6 +375,28 @@ static bool slotIsInUse(const ResGroupSlotData *slot);
 static bool groupIsNotDropped(const ResGroupData *group);
 static bool groupWaitQueueFind(ResGroupData *group, const PGPROC *proc);
 #endif /* USE_ASSERT_CHECKING */
+
+/*
+ * Operations of memory for resource groups with vmtracker memory auditor.
+ */
+static const ResGroupMemOperations resgroup_memory_operations_vmtracker = {
+	.group_mem_on_create	= NULL,
+	.group_mem_on_alter		= groupMemOnAlterForVmtracker,
+	.group_mem_on_drop		= groupMemOnDropForVmtracker,
+	.group_mem_on_notify	= groupMemOnNotifyForVmtracker,
+	.group_mem_on_dump		= groupMemOnDumpForVmtracker,
+};
+
+/*
+ * Operations of memory for resource groups with cgroup memory auditor.
+ */
+static const ResGroupMemOperations resgroup_memory_operations_cgroup = {
+	.group_mem_on_create	= NULL,
+	.group_mem_on_alter		= groupMemOnAlterForCgroup,
+	.group_mem_on_drop		= groupMemOnDropForCgroup,
+	.group_mem_on_notify	= groupMemOnNotifyForCgroup,
+	.group_mem_on_dump		= groupMemOnDumpForCgroup,
+};
 
 /*
  * Estimate size the resource group structures will need in
@@ -370,7 +472,7 @@ ResGroupControlInit(void)
     pResGroupControl->loaded = false;
     pResGroupControl->nGroups = MaxResourceGroups;
 	pResGroupControl->totalChunks = 0;
-	pResGroupControl->freeChunks = 0;
+	pg_atomic_init_u32(&pResGroupControl->freeChunks, 0);
 	pResGroupControl->chunkSizeInBits = BITS_IN_MB;
 
 	for (i = 0; i < MaxResourceGroups; i++)
@@ -414,11 +516,13 @@ InitResGroups(void)
 	HeapTuple	tuple;
 	SysScanDesc	sscan;
 	int			numGroups;
-	CdbComponentDatabases *cdbComponentDBs;
 	CdbComponentDatabaseInfo *qdinfo;
 	ResGroupCaps		caps;
 	Relation			relResGroup;
 	Relation			relResGroupCapability;
+	char		cpuset[MaxCpuSetLength] = {0};
+	int			defaultCore = -1;
+	Bitmapset	*bmsUnused = NULL;
 
 	on_shmem_exit(AtProcExit_ResGroup, 0);
 
@@ -427,18 +531,11 @@ InitResGroups(void)
 	 */
 	if (pResGroupControl->loaded)
 		return;
-	/*
-	 * Need a resource owner to keep the heapam code happy.
-	 */
-	Assert(CurrentResourceOwner == NULL);
-	ResourceOwner owner = ResourceOwnerCreate(NULL, "InitResGroups");
-	CurrentResourceOwner = owner;
 
 	if (Gp_role == GP_ROLE_DISPATCH && pResGroupControl->segmentsOnMaster == 0)
 	{
-		Assert(GpIdentity.segindex == MASTER_CONTENT_ID);
-		cdbComponentDBs = getCdbComponentDatabases();
-		qdinfo = &cdbComponentDBs->entry_db_info[0];
+		Assert(IS_QUERY_DISPATCHER());
+		qdinfo = cdbcomponent_getComponentInfo(MASTER_CONTENT_ID); 
 		pResGroupControl->segmentsOnMaster = qdinfo->hostSegs;
 		Assert(pResGroupControl->segmentsOnMaster > 0);
 	}
@@ -458,7 +555,7 @@ InitResGroups(void)
 
 	/* These initialization must be done before createGroup() */
 	decideTotalChunks(&pResGroupControl->totalChunks, &pResGroupControl->chunkSizeInBits);
-	pResGroupControl->freeChunks = pResGroupControl->totalChunks;
+	pg_atomic_write_u32(&pResGroupControl->freeChunks, pResGroupControl->totalChunks);
 	if (pResGroupControl->totalChunks == 0)
 		ereport(PANIC,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
@@ -467,8 +564,18 @@ InitResGroups(void)
 
 	ResGroupOps_Init();
 
+	if (gp_resource_group_enable_cgroup_cpuset)
+	{
+		/* Get cpuset from cpuset/gpdb, and transform it into bitset */
+		ResGroupOps_GetCpuSet(RESGROUP_ROOT_ID, cpuset, MaxCpuSetLength);
+		bmsUnused = CpusetToBitset(cpuset, MaxCpuSetLength);
+		/* get the minimum core number, in case of the zero core is not exist */
+		defaultCore = bms_next_member(bmsUnused, -1);
+		Assert(defaultCore >= 0);
+	}
+
 	numGroups = 0;
-	sscan = systable_beginscan(relResGroup, InvalidOid, false, SnapshotNow, 0, NULL);
+	sscan = systable_beginscan(relResGroup, InvalidOid, false, NULL, 0, NULL);
 	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
 	{
 		ResGroupData	*group;
@@ -482,13 +589,94 @@ InitResGroups(void)
 		Assert(group != NULL);
 
 		ResGroupOps_CreateGroup(groupId);
-		ResGroupOps_SetCpuRateLimit(groupId, cpuRateLimit);
+		ResGroupOps_SetMemoryLimit(groupId, caps.memLimit);
+		
+		if (caps.cpuRateLimit != CPU_RATE_LIMIT_DISABLED)
+		{
+			ResGroupOps_SetCpuRateLimit(groupId, caps.cpuRateLimit);
+		}
+		else
+		{
+			Bitmapset *bmsCurrent = CpusetToBitset(caps.cpuset,
+												   MaxCpuSetLength);
+			Bitmapset *bmsCommon = bms_intersect(bmsCurrent, bmsUnused);
+			Bitmapset *bmsMissing = bms_difference(bmsCurrent, bmsCommon);
+
+			/*
+			 * Do not call EnsureCpusetIsAvailable() here as resource group is
+			 * not activated yet
+			 */
+			if (!gp_resource_group_enable_cgroup_cpuset)
+			{
+				ereport(WARNING,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("cgroup is not properly configured to use the cpuset feature"),
+						 errhint("Extra cgroup configurations are required to enable this feature, "
+								 "please refer to the Greenplum Documentations for details")));
+			}
+
+			Assert(caps.cpuRateLimit == CPU_RATE_LIMIT_DISABLED);
+
+			if (bms_is_empty(bmsMissing))
+			{
+				/*
+				 * write cpus to corresponding file
+				 * if all the cores are available
+				 */
+				ResGroupOps_SetCpuSet(groupId, caps.cpuset);
+				bmsUnused = bms_del_members(bmsUnused, bmsCurrent);
+			}
+			else
+			{
+				char		cpusetMissing[MaxCpuSetLength] = {0};
+
+				/*
+				 * if some of the cores are unavailable, just set defaultCore
+				 * to this group and send a warning message, so the system
+				 * can startup, then DBA can fix it
+				 */
+				snprintf(cpuset, MaxCpuSetLength, "%d", defaultCore);
+				ResGroupOps_SetCpuSet(groupId, cpuset);
+				BitsetToCpuset(bmsMissing, cpusetMissing, MaxCpuSetLength);
+				ereport(WARNING,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("cpu cores %s are unavailable on the system "
+								"in resource group %s",
+								cpusetMissing, GetResGroupNameForId(groupId)),
+						 errhint("using core %d for this resource group, "
+								 "please adjust the settings and restart",
+								 defaultCore)));
+			}
+		}
 
 		numGroups++;
 		Assert(numGroups <= MaxResourceGroups);
 	}
 	systable_endscan(sscan);
 
+	if (gp_resource_group_enable_cgroup_cpuset)
+	{
+		/*
+		 * set default cpuset
+		 */
+
+		if (bms_is_empty(bmsUnused))
+		{
+			/* no unused core, assign default core to default group */
+			snprintf(cpuset, MaxCpuSetLength, "%d", defaultCore);
+		}
+		else
+		{
+			/* assign all unused cores to default group */
+			BitsetToCpuset(bmsUnused, cpuset, MaxCpuSetLength);
+		}
+
+		Assert(cpuset[0]);
+		Assert(!CpusetIsEmpty(cpuset));
+
+		ResGroupOps_SetCpuSet(DEFAULT_CPUSET_GROUP_ID, cpuset);
+	}
+	
 	pResGroupControl->loaded = true;
 	LOG_RESGROUP_DEBUG(LOG, "initialized %d resource groups", numGroups);
 
@@ -501,8 +689,6 @@ exit:
 	 */
 	heap_close(relResGroup, AccessShareLock);
 	heap_close(relResGroupCapability, AccessShareLock);
-	CurrentResourceOwner = NULL;
-	ResourceOwnerDelete(owner);
 }
 
 /*
@@ -523,9 +709,9 @@ ResGroupCheckForDrop(Oid groupId, char *name)
 
 	group = groupHashFind(groupId, true);
 
-	if (group->nRunning > 0)
+	if (group->nRunning + group->nRunningBypassed > 0)
 	{
-		int nQuery = group->nRunning + group->waitProcs.size;
+		int nQuery = group->nRunning + group->nRunningBypassed + group->waitProcs.size;
 
 		Assert(name != NULL);
 		ereport(ERROR,
@@ -551,7 +737,8 @@ ResGroupCheckForDrop(Oid groupId, char *name)
  * This function is called in the callback function of DROP RESOURCE GROUP.
  */
 void
-ResGroupDropFinish(Oid groupId, bool isCommit)
+ResGroupDropFinish(const ResourceGroupCallbackContext *callbackCtx,
+				   bool isCommit)
 {
 	ResGroupData	*group;
 	volatile int	savedInterruptHoldoffCount;
@@ -562,17 +749,36 @@ ResGroupDropFinish(Oid groupId, bool isCommit)
 	{
 		savedInterruptHoldoffCount = InterruptHoldoffCount;
 
+		group = groupHashFind(callbackCtx->groupid, true);
+
 		if (Gp_role == GP_ROLE_DISPATCH)
 		{
-			group = groupHashFind(groupId, true);
 			wakeupSlots(group, false);
 			unlockResGroupForDrop(group);
 		}
 
 		if (isCommit)
 		{
-			groupHashRemove(groupId);
-			ResGroupOps_DestroyGroup(groupId);
+			bool		migrate;
+
+			/* Only migrate processes out of vmtracker groups */
+			migrate = group->caps.memAuditor == RESGROUP_MEMORY_AUDITOR_VMTRACKER;
+
+			removeGroup(callbackCtx->groupid);
+			if (!CpusetIsEmpty(group->caps.cpuset))
+			{
+				if (gp_resource_group_enable_cgroup_cpuset)
+				{
+					/* reset default group, add cpu cores to it */
+					char cpuset[MaxCpuSetLength];
+					ResGroupOps_GetCpuSet(DEFAULT_CPUSET_GROUP_ID,
+										  cpuset, MaxCpuSetLength);
+					CpusetUnion(cpuset, group->caps.cpuset, MaxCpuSetLength);
+					ResGroupOps_SetCpuSet(DEFAULT_CPUSET_GROUP_ID, cpuset);
+				}
+			}
+
+			ResGroupOps_DestroyGroup(callbackCtx->groupid, migrate);
 		}
 	}
 	PG_CATCH();
@@ -600,7 +806,7 @@ ResGroupDropFinish(Oid groupId, bool isCommit)
  * This function is called in the callback function of CREATE RESOURCE GROUP.
  */
 void
-ResGroupCreateOnAbort(Oid groupId)
+ResGroupCreateOnAbort(const ResourceGroupCallbackContext *callbackCtx)
 {
 	volatile int savedInterruptHoldoffCount;
 
@@ -608,9 +814,23 @@ ResGroupCreateOnAbort(Oid groupId)
 	PG_TRY();
 	{
 		savedInterruptHoldoffCount = InterruptHoldoffCount;
-		groupHashRemove(groupId);
+		removeGroup(callbackCtx->groupid);
 		/* remove the os dependent part for this resource group */
-		ResGroupOps_DestroyGroup(groupId);
+		ResGroupOps_DestroyGroup(callbackCtx->groupid, true);
+
+		if (!CpusetIsEmpty(callbackCtx->caps.cpuset) &&
+			gp_resource_group_enable_cgroup_cpuset)
+		{
+			/* return cpu cores to default group */
+			char defaultGroupCpuset[MaxCpuSetLength];
+			ResGroupOps_GetCpuSet(DEFAULT_CPUSET_GROUP_ID,
+								  defaultGroupCpuset,
+								  MaxCpuSetLength);
+			CpusetUnion(defaultGroupCpuset,
+						callbackCtx->caps.cpuset,
+						MaxCpuSetLength);
+			ResGroupOps_SetCpuSet(DEFAULT_CPUSET_GROUP_ID, defaultGroupCpuset);
+		}
 	}
 	PG_CATCH();
 	{
@@ -633,36 +853,61 @@ ResGroupCreateOnAbort(Oid groupId)
  * Apply the new resgroup caps.
  */
 void
-ResGroupAlterOnCommit(Oid groupId,
-					  ResGroupLimitType limittype,
-					  const ResGroupCaps *caps)
+ResGroupAlterOnCommit(const ResourceGroupCallbackContext *callbackCtx)
 {
 	ResGroupData	*group;
-	bool			shouldWakeUp;
 	volatile int	savedInterruptHoldoffCount;
-
-	Assert(caps != NULL);
 
 	LWLockAcquire(ResGroupLock, LW_EXCLUSIVE);
 
 	PG_TRY();
 	{
 		savedInterruptHoldoffCount = InterruptHoldoffCount;
-		group = groupHashFind(groupId, true);
+		group = groupHashFind(callbackCtx->groupid, true);
 
-		group->caps = *caps;
+		group->caps = callbackCtx->caps;
 
-		if (limittype == RESGROUP_LIMIT_TYPE_CPU)
+		if (callbackCtx->limittype == RESGROUP_LIMIT_TYPE_CPU)
 		{
-			ResGroupOps_SetCpuRateLimit(groupId, caps->cpuRateLimit);
+			ResGroupOps_SetCpuRateLimit(callbackCtx->groupid,
+										callbackCtx->caps.cpuRateLimit);
 		}
-		else if (limittype != RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO)
+		else if (callbackCtx->limittype == RESGROUP_LIMIT_TYPE_CPUSET)
 		{
-			shouldWakeUp = groupApplyMemCaps(group);
+			if (gp_resource_group_enable_cgroup_cpuset)
+				ResGroupOps_SetCpuSet(callbackCtx->groupid,
+									  callbackCtx->caps.cpuset);
+		}
+		else if (callbackCtx->limittype != RESGROUP_LIMIT_TYPE_MEMORY_SPILL_RATIO)
+		{
+			Assert(pResGroupControl->totalChunks > 0);
+			ResGroupCap	memLimitGap = 0;
+			if (callbackCtx->limittype == RESGROUP_LIMIT_TYPE_MEMORY)
+				memLimitGap = callbackCtx->oldCaps.memLimit - callbackCtx->caps.memLimit;
+			group->memGap += pResGroupControl->totalChunks * memLimitGap / 100;
 
-			wakeupSlots(group, true);
-			if (shouldWakeUp)
-				wakeupGroups(groupId);
+			Assert(group->groupMemOps != NULL);
+			if (group->groupMemOps->group_mem_on_alter)
+				group->groupMemOps->group_mem_on_alter(callbackCtx->groupid, group);
+		}
+		/* reset default group if cpuset has changed */
+		if (strcmp(callbackCtx->oldCaps.cpuset, callbackCtx->caps.cpuset) &&
+			gp_resource_group_enable_cgroup_cpuset)
+		{
+			char defaultCpusetGroup[MaxCpuSetLength];
+			/* get current default group value */
+			ResGroupOps_GetCpuSet(DEFAULT_CPUSET_GROUP_ID,
+								  defaultCpusetGroup,
+								  MaxCpuSetLength);
+			/* Add old value to default group
+			 * sub new value from default group */
+			CpusetUnion(defaultCpusetGroup,
+							callbackCtx->oldCaps.cpuset,
+							MaxCpuSetLength);
+			CpusetDifference(defaultCpusetGroup,
+							callbackCtx->caps.cpuset,
+							MaxCpuSetLength);
+			ResGroupOps_SetCpuSet(DEFAULT_CPUSET_GROUP_ID, defaultCpusetGroup);
 		}
 	}
 	PG_CATCH();
@@ -681,6 +926,33 @@ ResGroupAlterOnCommit(Oid groupId,
 	PG_END_TRY();
 
 	LWLockRelease(ResGroupLock);
+}
+
+bool
+ResGroupIsAssigned(void)
+{
+	return selfIsAssigned();
+}
+
+/*
+ * Get resource group id of my proc.
+ *
+ * Returns InvalidOid in any of below cases:
+ * - resource group is not enabled;
+ * - resource group is not activated (initialized);
+ * - my proc is not running inside a transaction;
+ * - my proc is not assigned a resource group yet;
+ *
+ * Otherwise a valid resource group id is returned.
+ *
+ * This function is not dead code although there is no consumer in the gpdb
+ * code tree.  Some extensions require this to get the internal resource group
+ * information.
+ */
+Oid
+GetMyResGroupId(void)
+{
+	return self->groupId;
 }
 
 int32
@@ -724,7 +996,7 @@ ResGroupGetStat(Oid groupId, ResGroupStatType type)
 	switch (type)
 	{
 		case RES_GROUP_STAT_NRUNNING:
-			result = Int32GetDatum(group->nRunning);
+			result = Int32GetDatum(group->nRunning + group->nRunningBypassed);
 			break;
 		case RES_GROUP_STAT_NQUEUEING:
 			result = Int32GetDatum(group->waitProcs.size);
@@ -752,40 +1024,25 @@ ResGroupGetStat(Oid groupId, ResGroupStatType type)
 	return result;
 }
 
-static char*
+/*
+ * Get the number of primary segments on this host
+ */
+int
+ResGroupGetSegmentNum()
+{
+	return (Gp_role == GP_ROLE_EXECUTE ? host_segments : pResGroupControl->segmentsOnMaster);
+}
+
+static char *
 groupDumpMemUsage(ResGroupData *group)
 {
 	StringInfoData memUsage;
 
 	initStringInfo(&memUsage);
 
-	appendStringInfo(&memUsage, "{");
-	appendStringInfo(&memUsage, "\"used\":%d, ",
-					 VmemTracker_ConvertVmemChunksToMB(group->memUsage));
-	appendStringInfo(&memUsage, "\"available\":%d, ",
-					 VmemTracker_ConvertVmemChunksToMB(
-						group->memQuotaGranted + group->memSharedGranted - group->memUsage));
-	appendStringInfo(&memUsage, "\"quota_used\":%d, ",
-					 VmemTracker_ConvertVmemChunksToMB(group->memQuotaUsed));
-	appendStringInfo(&memUsage, "\"quota_available\":%d, ",
-					 VmemTracker_ConvertVmemChunksToMB(
-						group->memQuotaGranted - group->memQuotaUsed));
-	appendStringInfo(&memUsage, "\"quota_granted\":%d, ",
-					 VmemTracker_ConvertVmemChunksToMB(group->memQuotaGranted));
-	appendStringInfo(&memUsage, "\"quota_proposed\":%d, ",
-					 VmemTracker_ConvertVmemChunksToMB(
-						groupGetMemQuotaExpected(&group->caps)));
-	appendStringInfo(&memUsage, "\"shared_used\":%d, ",
-					 VmemTracker_ConvertVmemChunksToMB(group->memSharedUsage));
-	appendStringInfo(&memUsage, "\"shared_available\":%d, ",
-					 VmemTracker_ConvertVmemChunksToMB(
-						group->memSharedGranted - group->memSharedUsage));
-	appendStringInfo(&memUsage, "\"shared_granted\":%d, ",
-					 VmemTracker_ConvertVmemChunksToMB(group->memSharedGranted));
-	appendStringInfo(&memUsage, "\"shared_proposed\":%d",
-					 VmemTracker_ConvertVmemChunksToMB(
-						groupGetMemSharedExpected(&group->caps)));
-	appendStringInfo(&memUsage, "}");
+	Assert(group->groupMemOps != NULL);
+	if (group->groupMemOps->group_mem_on_dump)
+		group->groupMemOps->group_mem_on_dump(group, &memUsage);
 
 	return memUsage.data;
 }
@@ -801,7 +1058,7 @@ ResGroupDumpMemoryInfo(void)
 
 	if (group)
 	{
-		Assert(selfIsAssignedValidGroup());
+		Assert(selfIsAssigned());
 
 		write_log("Resource group memory information: "
 				  "current group id is %u, "
@@ -833,7 +1090,7 @@ ResGroupDumpMemoryInfo(void)
 	}
 	else
 	{
-		Assert(selfIsUnassigned());
+		Assert(!selfIsAssigned());
 
 		write_log("Resource group memory information: "
 				  "memory usage in current proc is %d MB",
@@ -874,40 +1131,31 @@ ResGroupReserveMemory(int32 memoryChunks, int32 overuseChunks, bool *waiverUsed)
 	 * when this proc is assigned to a valid resource group.
 	 */
 	self->memUsage += memoryChunks;
-	if (!self->doMemCheck)
-		return true;
-
-	/* When doMemCheck is on, self must has been assigned to a resgroup. */
-	Assert(selfIsAssigned());
-	Assert(slotIsInUse(slot));
-
-	if (selfIsAssignedDroppedGroup())
+	if (bypassedGroup)
 	{
 		/*
-		 * However it might already be dropped. For example QE will stay in
-		 * a resgroup even after a transaction, so if the resgroup is
-		 * concurrently dropped and there is a memory allocation we'll
-		 * reach here.
-		 *
-		 * We would unset the group and slot from self and turn off memory
-		 * limit check so we'll not reach here again and again.
+		 * Do not allow to allocate more than the per proc limit.
 		 */
+		if ((Gp_role == GP_ROLE_DISPATCH &&
+			 self->memUsage > RESGROUP_BYPASS_MODE_MEMORY_LIMIT_ON_QD) ||
+			(Gp_role == GP_ROLE_EXECUTE &&
+			 self->memUsage > RESGROUP_BYPASS_MODE_MEMORY_LIMIT_ON_QE))
+		{
+			self->memUsage -= memoryChunks;
+			return false;
+		}
 
-		Oid		groupGroupId = group->groupId;
-		Oid		selfGroupId = self->groupId;
-
-		selfUnassignDroppedGroup();
-		self->doMemCheck = false;
-
-		LOG_RESGROUP_DEBUG(LOG, "resource group is concurrently dropped while "
-						   "reserving memory: dropped group=%d, my group=%d",
-						   groupGroupId, selfGroupId);
-
-		return true;
+		/*
+		 * Set group & slot to bypassed ones so we could follow the limitation
+		 * checking logic as normal transactions.
+		 */
+		group = bypassedGroup;
+		slot = &bypassedSlot;
 	}
+	else if (!selfIsAssigned())
+		return true;
 
-	/* Otherwise we are in a valid resgroup, perform the memory limit check */
-	Assert(selfIsAssignedValidGroup());
+	Assert(bypassedGroup || slotIsInUse(slot));
 	Assert(group->memUsage >= 0);
 	Assert(self->memUsage >= 0);
 
@@ -915,24 +1163,27 @@ ResGroupReserveMemory(int32 memoryChunks, int32 overuseChunks, bool *waiverUsed)
 	overuseMem = groupIncMemUsage(group, slot, memoryChunks);
 
 	/* then check whether there is over usage */
-	if (CritSectionCount == 0 && overuseMem > overuseChunks)
+	if (CritSectionCount == 0)
 	{
-		/* if the over usage is larger than allowed then revert the change */
-		groupDecMemUsage(group, slot, memoryChunks);
+		if (overuseMem > overuseChunks)
+		{
+			/* if the over usage is larger than allowed then revert the change */
+			groupDecMemUsage(group, slot, memoryChunks);
 
-		/* also revert in proc */
-		self->memUsage -= memoryChunks;
-		Assert(self->memUsage >= 0);
+			/* also revert in proc */
+			self->memUsage -= memoryChunks;
+			Assert(self->memUsage >= 0);
 
-		if (overuseChunks == 0)
-			ResGroupDumpMemoryInfo();
+			if (overuseChunks == 0)
+				ResGroupDumpMemoryInfo();
 
-		return false;
-	}
-	else if (CritSectionCount == 0 && overuseMem > 0)
-	{
-		/* the over usage is within the allowed threshold */
-		*waiverUsed = true;
+			return false;
+		}
+		else if (overuseMem > 0)
+		{
+			/* the over usage is within the allowed threshold */
+			*waiverUsed = true;
+		}
 	}
 
 	return true;
@@ -954,31 +1205,19 @@ ResGroupReleaseMemory(int32 memoryChunks)
 	Assert(memoryChunks <= self->memUsage);
 
 	self->memUsage -= memoryChunks;
-	if (!self->doMemCheck)
+	if (bypassedGroup)
 	{
-		Assert(selfIsUnassigned());
-		return;
+		/*
+		 * Set group & slot to bypassed ones so we could follow the release
+		 * logic as normal transactions.
+		 */
+		group = bypassedGroup;
+		slot = &bypassedSlot;
 	}
-
-	Assert(selfIsAssigned());
-	Assert(slotIsInUse(slot));
-
-	if (selfIsAssignedDroppedGroup())
-	{
-		Oid		groupGroupId = group->groupId;
-		Oid		selfGroupId = self->groupId;
-
-		selfUnassignDroppedGroup();
-		self->doMemCheck = false;
-
-		LOG_RESGROUP_DEBUG(LOG, "resource group is concurrently dropped while "
-						   "releasing memory: dropped group=%d, my group=%d",
-						   groupGroupId, selfGroupId);
-
+	else if (!selfIsAssigned())
 		return;
-	}
 
-	Assert(selfIsAssignedValidGroup());
+	Assert(bypassedGroup || slotIsInUse(slot));
 
 	groupDecMemUsage(group, slot, memoryChunks);
 }
@@ -989,14 +1228,54 @@ ResourceGroupGetQueryMemoryLimit(void)
 	ResGroupSlotData	*slot = self->slot;
 	int64				memSpill;
 
-	Assert(selfIsAssignedValidGroup());
+	Assert(Gp_role == GP_ROLE_DISPATCH);
+
+	if (bypassedGroup)
+	{
+		int64		bytesInMB = 1 << BITS_IN_MB;
+		int64		bytesInChunk = (int64) 1 << VmemTracker_GetChunkSizeInBits();
+
+		/*
+		 * In bypass mode there is a hard memory limit of
+		 * RESGROUP_BYPASS_MODE_MEMORY_LIMIT_ON_QE chunk,
+		 * we should make sure query_mem + misc mem <= chunk.
+		 */
+		return Min(bytesInMB,
+				   bytesInChunk * RESGROUP_BYPASS_MODE_MEMORY_LIMIT_ON_QE / 2);
+	}
+
+	Assert(selfIsAssigned());
 
 	if (IsResManagerMemoryPolicyNone())
 		return 0;
 
 	memSpill = slotGetMemSpill(&slot->caps);
+	/* memSpill is already converted to chunks */
+	Assert(memSpill >= 0);
 
 	return memSpill << VmemTracker_GetChunkSizeInBits();
+}
+
+/*
+ * removeGroup -- remove resource group from share memory and
+ * reclaim the group's memory back to MEM POOL.
+ */
+static void
+removeGroup(Oid groupId)
+{
+	ResGroupData *group;
+
+	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
+	Assert(OidIsValid(groupId));
+
+	group = groupHashRemove(groupId);
+
+	Assert(group->groupMemOps != NULL);
+	if (group->groupMemOps->group_mem_on_drop)
+		group->groupMemOps->group_mem_on_drop(groupId, group);
+
+	group->groupId = InvalidOid;
+	notifyGroupsOnMem(groupId);
 }
 
 /*
@@ -1021,12 +1300,15 @@ createGroup(Oid groupId, const ResGroupCaps *caps)
 	group->groupId = groupId;
 	group->caps = *caps;
 	group->nRunning = 0;
+	group->nRunningBypassed = 0;
 	ProcQueueInit(&group->waitProcs);
 	group->totalExecuted = 0;
 	group->totalQueued = 0;
+	group->memGap = 0;
 	group->memUsage = 0;
 	group->memSharedUsage = 0;
 	group->memQuotaUsed = 0;
+	group->groupMemOps = NULL;
 	memset(&group->totalQueuedTime, 0, sizeof(group->totalQueuedTime));
 	group->lockedForDrop = false;
 
@@ -1037,20 +1319,41 @@ createGroup(Oid groupId, const ResGroupCaps *caps)
 	chunks = mempoolReserve(groupId, group->memExpected);
 	groupRebalanceQuota(group, chunks, caps);
 
+	bindGroupOperation(group);
+
 	return group;
+}
+
+/*
+ * Bind operation to resource group according to memory auditor.
+ */
+static void
+bindGroupOperation(ResGroupData *group)
+{
+	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
+
+	if (group->caps.memAuditor == RESGROUP_MEMORY_AUDITOR_VMTRACKER)
+		group->groupMemOps = &resgroup_memory_operations_vmtracker;
+	else if (group->caps.memAuditor == RESGROUP_MEMORY_AUDITOR_CGROUP)
+		group->groupMemOps = &resgroup_memory_operations_cgroup;
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid memory auditor: %d", group->caps.memAuditor)));
 }
 
 /*
  * Add chunks into group and slot memory usage.
  *
- * Return the over used chunks.
+ * Return the total over used chunks of global share
  */
 static int32
 groupIncMemUsage(ResGroupData *group, ResGroupSlotData *slot, int32 chunks)
 {
-	int32			slotMemUsage;
-	int32			sharedMemUsage;
-	int32			overuseMem = 0;
+	int32			slotMemUsage;	/* the memory current slot has been used */
+	int32			sharedMemUsage;	/* the total shared memory usage,
+										sum of group share and global share */
+	int32			globalOveruse = 0;	/* the total over used chunks of global share*/
 
 	/* Add the chunks to memUsage in slot */
 	slotMemUsage = pg_atomic_add_fetch_u32((pg_atomic_uint32 *) &slot->memUsage,
@@ -1060,30 +1363,39 @@ groupIncMemUsage(ResGroupData *group, ResGroupSlotData *slot, int32 chunks)
 	sharedMemUsage = slotMemUsage - slot->memQuota;
 	if (sharedMemUsage > 0)
 	{
-		int32			total;
-
 		/* Decide how many chunks should be counted as shared memory */
-		sharedMemUsage = Min(sharedMemUsage, chunks);
+		int32 deltaSharedMemUsage = Min(sharedMemUsage, chunks);
 
-		/* Add these chunks to memSharedUsage in group */
-		total = pg_atomic_add_fetch_u32((pg_atomic_uint32 *) &group->memSharedUsage,
-										sharedMemUsage);
+		/* Add these chunks to memSharedUsage in group, 
+		 * and record the old value*/
+		int32 oldSharedUsage = pg_atomic_fetch_add_u32((pg_atomic_uint32 *)
+													   &group->memSharedUsage,
+													   deltaSharedMemUsage);
+		/* the free space of group share */
+		int32 oldSharedFree = Max(0, group->memSharedGranted - oldSharedUsage);
 
-		/* Calculate the over used chunks */
-		overuseMem = Max(0, total - group->memSharedGranted);
+		/* Calculate the global over used chunks */
+		int32 deltaGlobalSharedMemUsage = Max(0, deltaSharedMemUsage - oldSharedFree);
+
+		/* freeChunks -= deltaGlobalSharedMemUsage and get the new value */
+		int32 newFreeChunks = pg_atomic_sub_fetch_u32(&pResGroupControl->freeChunks,
+													  deltaGlobalSharedMemUsage);
+		/* calculate the total over used chunks of global share */
+		globalOveruse = Max(0, 0 - newFreeChunks);
 	}
 
 	/* Add the chunks to memUsage in group */
 	pg_atomic_add_fetch_u32((pg_atomic_uint32 *) &group->memUsage,
 							chunks);
 
-	return overuseMem;
+	return globalOveruse;
 }
 
 /*
- * Sub chunks from group and slot memory usage.
+ * Sub chunks from group ,slot memory usage and global shared memory.
+ * return memory chunks of global shared released this time
  */
-static void
+static int32 
 groupDecMemUsage(ResGroupData *group, ResGroupSlotData *slot, int32 chunks)
 {
 	int32			value;
@@ -1105,41 +1417,48 @@ groupDecMemUsage(ResGroupData *group, ResGroupSlotData *slot, int32 chunks)
 	if (sharedMemUsage > 0)
 	{
 		/* Decide how many chunks should be counted as shared memory */
-		sharedMemUsage = Min(sharedMemUsage, chunks);
+		int32 deltaSharedMemUsage = Min(sharedMemUsage, chunks);
 
 		/* Sub chunks from memSharedUsage in group */
-		value = pg_atomic_sub_fetch_u32((pg_atomic_uint32 *) &group->memSharedUsage,
-										sharedMemUsage);
-		Assert(value >= 0);
+		int32 oldSharedUsage = pg_atomic_fetch_sub_u32((pg_atomic_uint32 *) &group->memSharedUsage,
+										deltaSharedMemUsage);
+		Assert(oldSharedUsage >= deltaSharedMemUsage);
+
+		/* record the total global share usage of current group */
+		int32 grpTotalGlobalUsage = Max(0, oldSharedUsage - group->memSharedGranted);
+		/* calculate the global share usage of current release */
+		int32 deltaGlobalSharedMemUsage = Min(grpTotalGlobalUsage, deltaSharedMemUsage);
+		/* add chunks to global shared memory */
+		pg_atomic_add_fetch_u32(&pResGroupControl->freeChunks,
+								deltaGlobalSharedMemUsage);
+		return deltaGlobalSharedMemUsage;
 	}
+
+	return 0;
 }
 
 /*
  * Attach a process (QD or QE) to a slot.
  */
 static void
-selfAttachToSlot(ResGroupData *group, ResGroupSlotData *slot)
+selfAttachResGroup(ResGroupData *group, ResGroupSlotData *slot)
 {
+	selfSetGroup(group);
 	selfSetSlot(slot);
 	groupIncMemUsage(group, slot, self->memUsage);
 	pg_atomic_add_fetch_u32((pg_atomic_uint32*) &slot->nProcs, 1);
-
-	/* Start memory limit checking */
-	self->doMemCheck = true;
 }
 
 /*
  * Detach a process (QD or QE) from a slot.
  */
 static void
-selfDetachSlot(ResGroupData *group, ResGroupSlotData *slot)
+selfDetachResGroup(ResGroupData *group, ResGroupSlotData *slot)
 {
-	/* Stop memory limit checking */
-	self->doMemCheck = false;
-
 	groupDecMemUsage(group, slot, self->memUsage);
 	pg_atomic_sub_fetch_u32((pg_atomic_uint32*) &slot->nProcs, 1);
 	selfUnsetSlot();
+	selfUnsetGroup();
 }
 
 /*
@@ -1302,7 +1621,7 @@ groupPutSlot(ResGroupData *group, ResGroupSlotData *slot)
 	/* And finally release the overused memory quota */
 	released = mempoolAutoRelease(group);
 	if (released > 0)
-		wakeupGroups(group->groupId);
+		notifyGroupsOnMem(group->groupId);
 
 	/*
 	 * Once we have waken up other groups then the slot we just released
@@ -1381,8 +1700,8 @@ decideResGroupId(void)
  *
  * An exception is thrown if current role is invalid.
  */
-static ResGroupData *
-decideResGroup(void)
+static void
+decideResGroup(ResGroupInfo *pGroupInfo)
 {
 	ResGroupData	*group;
 	Oid				 groupId;
@@ -1406,9 +1725,48 @@ decideResGroup(void)
 
 	Assert(group != NULL);
 
-	selfSetGroup(group);
 	LWLockRelease(ResGroupLock);
-	return group;
+
+	pGroupInfo->group = group;
+	pGroupInfo->groupId = groupId;
+}
+
+/*
+ * Increase the bypassed ref count
+ *
+ * Return true if the operation is done, or false if the group is dropped.
+ */
+static bool
+groupIncBypassedRef(ResGroupInfo *pGroupInfo)
+{
+	ResGroupData	*group = pGroupInfo->group;
+	bool			result = false;
+
+	LWLockAcquire(ResGroupLock, LW_EXCLUSIVE);
+
+	/* Has the group been dropped? */
+	if (groupIsDropped(pGroupInfo))
+		goto end;
+
+	/* Is the group locked for drop? */
+	if (group->lockedForDrop)
+		goto end;
+
+	result = true;
+	pg_atomic_add_fetch_u32((pg_atomic_uint32 *) &group->nRunningBypassed, 1);
+
+end:
+	LWLockRelease(ResGroupLock);
+	return result;
+}
+
+/*
+ * Decrease the bypassed ref count
+ */
+static void
+groupDecBypassedRef(ResGroupData *group)
+{
+	pg_atomic_sub_fetch_u32((pg_atomic_uint32 *) &group->nRunningBypassed, 1);
 }
 
 /*
@@ -1419,17 +1777,18 @@ decideResGroup(void)
  * and current slot in MyProc->resSlot.
  */
 static ResGroupSlotData *
-groupAcquireSlot(ResGroupData *group)
+groupAcquireSlot(ResGroupInfo *pGroupInfo)
 {
 	ResGroupSlotData *slot;
+	ResGroupData	 *group;
 
-	/* should not been granted a slot yet */
-	Assert(selfIsAssigned());
-	Assert(!selfHasSlot());
+	Assert(!selfIsAssigned());
+	group = pGroupInfo->group;
 
 	LWLockAcquire(ResGroupLock, LW_EXCLUSIVE);
 
-	if (selfIsAssignedDroppedGroup())
+	/* Has the group been dropped? */
+	if (groupIsDropped(pGroupInfo))
 	{
 		LWLockRelease(ResGroupLock);
 		return NULL;
@@ -1532,18 +1891,32 @@ groupApplyMemCaps(ResGroupData *group)
 static int32
 mempoolReserve(Oid groupId, int32 chunks)
 {
+	int32 oldFreeChunks;
+	int32 newFreeChunks;
+	int32 reserved = 0;
+
 	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
 
+	/* Compare And Save to avoid concurrency problem without using lock */
+	while (true)
+	{
+		oldFreeChunks = pg_atomic_read_u32(&pResGroupControl->freeChunks);
+		reserved = Min(Max(0, oldFreeChunks), chunks);
+		newFreeChunks = oldFreeChunks - reserved;
+		if (reserved == 0)
+			break;
+		if (pg_atomic_compare_exchange_u32(&pResGroupControl->freeChunks,
+										   (uint32 *) &oldFreeChunks,
+										   (uint32) newFreeChunks))
+			break;
+	}
+
 	LOG_RESGROUP_DEBUG(LOG, "allocate %u out of %u chunks to group %d",
-					   chunks, pResGroupControl->freeChunks, groupId);
+					   reserved, oldFreeChunks, groupId);
 
-	chunks = Min(pResGroupControl->freeChunks, chunks);
-	pResGroupControl->freeChunks -= chunks;
+	Assert(newFreeChunks <= pResGroupControl->totalChunks);
 
-	Assert(pResGroupControl->freeChunks >= 0);
-	Assert(pResGroupControl->freeChunks <= pResGroupControl->totalChunks);
-
-	return chunks;
+	return reserved;
 }
 
 /*
@@ -1552,16 +1925,18 @@ mempoolReserve(Oid groupId, int32 chunks)
 static void
 mempoolRelease(Oid groupId, int32 chunks)
 {
-	LOG_RESGROUP_DEBUG(LOG, "free %u to pool(%u) chunks from group %d",
-					   chunks, pResGroupControl->freeChunks, groupId);
+	int32 newFreeChunks;
 
 	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
 	Assert(chunks >= 0);
 
-	pResGroupControl->freeChunks += chunks;
+	newFreeChunks = pg_atomic_add_fetch_u32(&pResGroupControl->freeChunks,
+											chunks);
 
-	Assert(pResGroupControl->freeChunks >= 0);
-	Assert(pResGroupControl->freeChunks <= pResGroupControl->totalChunks);
+	LOG_RESGROUP_DEBUG(LOG, "free %u to pool(%u) chunks from group %d",
+					   chunks, newFreeChunks - chunks, groupId);
+
+	Assert(newFreeChunks <= pResGroupControl->totalChunks);
 }
 
 /*
@@ -1657,7 +2032,12 @@ groupGetMemSharedExpected(const ResGroupCaps *caps)
 static int32
 groupGetMemSpillTotal(const ResGroupCaps *caps)
 {
-	return groupGetMemExpected(caps) * memory_spill_ratio / 100;
+	if (memory_spill_ratio != RESGROUP_FALLBACK_MEMORY_SPILL_RATIO)
+		/* memSpill is in percentage mode */
+		return groupGetMemExpected(caps) * memory_spill_ratio / 100;
+	else
+		/* memSpill is in fallback mode, return statement_mem instead */
+		return VmemTracker_ConvertVmemMBToChunks(statement_mem >> 10);
 }
 
 /*
@@ -1698,8 +2078,20 @@ slotGetMemQuotaOnQE(const ResGroupCaps *caps, ResGroupData *group)
 static int32
 slotGetMemSpill(const ResGroupCaps *caps)
 {
-	Assert(caps->concurrency != 0);
-	return groupGetMemSpillTotal(caps) / caps->concurrency;
+	if (memory_spill_ratio != RESGROUP_FALLBACK_MEMORY_SPILL_RATIO)
+	{
+		/* memSpill is in percentage mode */
+		Assert(caps->concurrency != 0);
+		return groupGetMemSpillTotal(caps) / caps->concurrency;
+	}
+	else
+	{
+		/*
+		 * memSpill is in fallback mode, it is an absolute value, no need to
+		 * divide by concurrency.
+		 */
+		return groupGetMemSpillTotal(caps);
+	}
 }
 
 /*
@@ -1743,23 +2135,22 @@ wakeupSlots(ResGroupData *group, bool grant)
 }
 
 /*
- * When a group returns chunks to MEM POOL, we need to wake up
- * the transactions waiting on other groups for memory quota.
+ * When a group returns chunks to MEM POOL, we need to:
+ * 1. For groups with vmtracker memory auditor, wake up the
+ *    transactions waiting on them for memory quota.
+ * 2. For groups with cgroup memory auditor, increase their
+ *    memory limit if needed.
  */
 static void
-wakeupGroups(Oid skipGroupId)
+notifyGroupsOnMem(Oid skipGroupId)
 {
 	int				i;
-
-	if (Gp_role != GP_ROLE_DISPATCH)
-		return;
 
 	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
 
 	for (i = 0; i < MaxResourceGroups; i++)
 	{
 		ResGroupData	*group = &pResGroupControl->groups[i];
-		int32			delta;
 
 		if (group->groupId == InvalidOid)
 			continue;
@@ -1767,19 +2158,11 @@ wakeupGroups(Oid skipGroupId)
 		if (group->groupId == skipGroupId)
 			continue;
 
-		if (group->lockedForDrop)
-			continue;
+		Assert(group->groupMemOps != NULL);
+		if (group->groupMemOps->group_mem_on_notify)
+			group->groupMemOps->group_mem_on_notify(group);
 
-		if (groupWaitQueueIsEmpty(group))
-			continue;
-
-		delta = group->memExpected - group->memQuotaGranted - group->memSharedGranted;
-		if (delta <= 0)
-			continue;
-
-		wakeupSlots(group, true);
-
-		if (!pResGroupControl->freeChunks)
+		if (!pg_atomic_read_u32(&pResGroupControl->freeChunks))
 			break;
 	}
 }
@@ -1931,7 +2314,7 @@ groupReleaseSlot(ResGroupData *group, ResGroupSlotData *slot)
 {
 	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
 	Assert(Gp_role == GP_ROLE_DISPATCH);
-	Assert(!selfHasSlot());
+	Assert(!selfIsAssigned());
 
 	groupPutSlot(group, slot);
 
@@ -1949,28 +2332,42 @@ groupReleaseSlot(ResGroupData *group, ResGroupSlotData *slot)
 void
 SerializeResGroupInfo(StringInfo str)
 {
-	int i;
-	int tmp;
-	ResGroupCaps caps0;
-	ResGroupCap *caps;
+	unsigned int cpuset_len;
+	int32		itmp;
+	ResGroupCaps empty_caps;
+	ResGroupCaps *caps;
 
-	if (selfIsAssignedValidGroup())
-		caps = (ResGroupCap *) &self->caps;
+	if (selfIsAssigned())
+		caps = &self->caps;
 	else
 	{
-		Assert(selfIsUnassigned());
-		MemSet(&caps0, 0, sizeof(caps0));
-		caps = (ResGroupCap *) &caps0;
+		ClearResGroupCaps(&empty_caps);
+		caps = &empty_caps;
 	}
 
-	tmp = htonl(self->groupId);
-	appendBinaryStringInfo(str, (char *) &tmp, sizeof(self->groupId));
+	itmp = htonl(self->groupId);
+	appendBinaryStringInfo(str, &itmp, sizeof(int32));
 
-	for (i = 0; i < RESGROUP_LIMIT_TYPE_COUNT; i++)
-	{
-		tmp = htonl(caps[i]);
-		appendBinaryStringInfo(str, (char *) &tmp, sizeof(caps[i]));
-	}
+	itmp = htonl(caps->concurrency);
+	appendBinaryStringInfo(str, &itmp, sizeof(int32));
+	itmp = htonl(caps->cpuRateLimit);
+	appendBinaryStringInfo(str, &itmp, sizeof(int32));
+	itmp = htonl(caps->memLimit);
+	appendBinaryStringInfo(str, &itmp, sizeof(int32));
+	itmp = htonl(caps->memSharedQuota);
+	appendBinaryStringInfo(str, &itmp, sizeof(int32));
+	itmp = htonl(caps->memSpillRatio);
+	appendBinaryStringInfo(str, &itmp, sizeof(int32));
+	itmp = htonl(caps->memAuditor);
+	appendBinaryStringInfo(str, &itmp, sizeof(int32));
+
+	cpuset_len = strlen(caps->cpuset);
+	itmp = htonl(cpuset_len);
+	appendBinaryStringInfo(str, &itmp, sizeof(int32));
+	appendBinaryStringInfo(str, caps->cpuset, cpuset_len);
+
+	itmp = htonl(bypassedSlot.groupId);
+	appendBinaryStringInfo(str, (char *) &itmp, sizeof(itmp));
 }
 
 /*
@@ -1982,23 +2379,39 @@ DeserializeResGroupInfo(struct ResGroupCaps *capsOut,
 						const char *buf,
 						int len)
 {
-	int			i;
-	int			tmp;
+	int32		itmp;
+	unsigned int cpuset_len;
 	const char	*ptr = buf;
-	ResGroupCap *caps = (ResGroupCap *) capsOut;
 
 	Assert(len > 0);
 
-	memcpy(&tmp, ptr, sizeof(*groupId));
-	*groupId = ntohl(tmp);
-	ptr += sizeof(*groupId);
+	ClearResGroupCaps(capsOut);
 
-	for (i = 0; i < RESGROUP_LIMIT_TYPE_COUNT; i++)
-	{
-		memcpy(&tmp, ptr, sizeof(caps[i]));
-		caps[i] = ntohl(tmp);
-		ptr += sizeof(caps[i]);
-	}
+	memcpy(&itmp, ptr, sizeof(int32)); ptr += sizeof(int32);
+	*groupId = ntohl(itmp);
+
+	memcpy(&itmp, ptr, sizeof(int32)); ptr += sizeof(int32);
+	capsOut->concurrency = ntohl(itmp);
+	memcpy(&itmp, ptr, sizeof(int32)); ptr += sizeof(int32);
+	capsOut->cpuRateLimit = ntohl(itmp);
+	memcpy(&itmp, ptr, sizeof(int32)); ptr += sizeof(int32);
+	capsOut->memLimit = ntohl(itmp);
+	memcpy(&itmp, ptr, sizeof(int32)); ptr += sizeof(int32);
+	capsOut->memSharedQuota = ntohl(itmp);
+	memcpy(&itmp, ptr, sizeof(int32)); ptr += sizeof(int32);
+	capsOut->memSpillRatio = ntohl(itmp);
+	memcpy(&itmp, ptr, sizeof(int32)); ptr += sizeof(int32);
+	capsOut->memAuditor = ntohl(itmp);
+
+	memcpy(&itmp, ptr, sizeof(int32)); ptr += sizeof(int32);
+	cpuset_len = ntohl(itmp);
+	if (cpuset_len >= sizeof(capsOut->cpuset))
+		elog(ERROR, "malformed serialized resource group info");
+	memcpy(capsOut->cpuset, ptr, len); ptr += cpuset_len;
+	capsOut->cpuset[cpuset_len] = '\0';
+
+	memcpy(&itmp, ptr, sizeof(int32)); ptr += sizeof(int32);
+	bypassedSlot.groupId = ntohl(itmp);
 
 	Assert(len == ptr - buf);
 }
@@ -2047,8 +2460,8 @@ ShouldUnassignResGroup(void)
 void
 AssignResGroupOnMaster(void)
 {
-	ResGroupData		*group;
 	ResGroupSlotData	*slot;
+	ResGroupInfo		groupInfo;
 
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 
@@ -2057,37 +2470,69 @@ AssignResGroupOnMaster(void)
 	 * resource group, leave self unassigned
 	 */
 	if (shouldBypassQuery(debug_query_string))
+	{
+		/*
+		 * Although we decide to bypass this query we should load the
+		 * memory_spill_ratio setting from the resgroup, otherwise a
+		 * `SHOW memory_spill_ratio` command will output the default value 20
+		 * if it's the first query in the connection (make sure tab completion
+		 * is not triggered otherwise it will run some implicit query before
+		 * you execute the SHOW command).
+		 *
+		 * Also need to increase a bypassed ref count to prevent the group
+		 * being dropped concurrently.
+		 */
+		do {
+			decideResGroup(&groupInfo);
+		} while (!groupIncBypassedRef(&groupInfo));
+
+		/* Record which resgroup we are running in */
+		bypassedGroup = groupInfo.group;
+
+		/* Update pg_stat_activity statistics */
+		bypassedGroup->totalExecuted++;
+		pgstat_report_resgroup(0, bypassedGroup->groupId);
+
+		/* Initialize the fake slot */
+		bypassedSlot.groupId = groupInfo.groupId;
+		bypassedSlot.memQuota = 0;
+		bypassedSlot.memUsage = 0;
+
+		/* Attach self memory usage to resgroup */
+		groupIncMemUsage(bypassedGroup, &bypassedSlot, self->memUsage);
+
+		/* Add into cgroup */
+		ResGroupOps_AssignGroup(bypassedGroup->groupId,
+								&bypassedGroup->caps,
+								MyProcPid);
+
+		groupSetMemorySpillRatio(&bypassedGroup->caps);
 		return;
+	}
 
 	PG_TRY();
 	{
-retry:
-		group = decideResGroup();
+		do {
+			decideResGroup(&groupInfo);
 
-		/* Acquire slot */
-		slot = groupAcquireSlot(group);
-		if (slot == NULL)
-		{
-			selfUnsetGroup();
-			goto retry;
-		}
-
-		Assert(!self->doMemCheck);
+			/* Acquire slot */
+			slot = groupAcquireSlot(&groupInfo);
+		} while (slot == NULL);
 
 		/* Set resource group slot for current session */
 		sessionSetSlot(slot);
 
 		/* Add proc memory accounting info into group and slot */
-		selfAttachToSlot(group, slot);
+		selfAttachResGroup(groupInfo.group, slot);
 
 		/* Init self */
 		self->caps = slot->caps;
 
 		/* Don't error out before this line in this function */
-		SIMPLE_FAULT_INJECTOR(ResGroupAssignedOnMaster);
+		SIMPLE_FAULT_INJECTOR("resgroup_assigned_on_master");
 
 		/* Add into cgroup */
-		ResGroupOps_AssignGroup(self->groupId, MyProcPid);
+		ResGroupOps_AssignGroup(self->groupId, &(self->caps), MyProcPid);
 
 		/* Set spill guc */
 		groupSetMemorySpillRatio(&slot->caps);
@@ -2109,14 +2554,26 @@ UnassignResGroup(void)
 	ResGroupData		*group = self->group;
 	ResGroupSlotData	*slot = self->slot;
 
-	if (selfIsUnassigned())
+	if (bypassedGroup)
 	{
-		Assert(self->doMemCheck == false);
+		/* bypass mode ref count is only maintained on qd */
+		if (Gp_role == GP_ROLE_DISPATCH)
+			groupDecBypassedRef(bypassedGroup);
+
+		/* Detach self memory usage from resgroup */
+		groupDecMemUsage(bypassedGroup, &bypassedSlot, self->memUsage);
+
+		/* Reset the fake slot */
+		bypassedSlot.groupId = InvalidOid;
+		bypassedGroup = NULL;
+
+		/* Update pg_stat_activity statistics */
+		pgstat_report_resgroup(0, InvalidOid);
 		return;
 	}
 
-	Assert(selfIsAssignedValidGroup());
-	Assert(selfHasSlot());
+	if (!selfIsAssigned())
+		return;
 
 	/* Cleanup self */
 	if (self->memUsage > 10)
@@ -2125,18 +2582,19 @@ UnassignResGroup(void)
 	LWLockAcquire(ResGroupLock, LW_EXCLUSIVE);
 
 	/* Sub proc memory accounting info from group and slot */
-	selfDetachSlot(group, slot);
+	selfDetachResGroup(group, slot);
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
 		/* Release the slot */
 		groupReleaseSlot(group, slot);
-		Assert(!selfHasSlot());
 
 		sessionResetSlot();
 	}
 	else if (slot->nProcs == 0)
 	{
+		int32 released;
+
 		Assert(Gp_role == GP_ROLE_EXECUTE);
 
 		group->memQuotaUsed -= slot->memQuota;
@@ -2151,16 +2609,15 @@ UnassignResGroup(void)
 		group->nRunning--;
 
 		/* And finally release the overused memory quota */
-		mempoolAutoRelease(group);
+		released = mempoolAutoRelease(group);
+		if (released > 0)
+			notifyGroupsOnMem(group->groupId);
+
 	}
 
-	/* Cleanup group */
-	selfUnsetGroup();
 	LWLockRelease(ResGroupLock);
 
 	pgstat_report_resgroup(0, InvalidOid);
-
-	Assert(selfIsUnassigned());
 }
 
 /*
@@ -2176,15 +2633,40 @@ SwitchResGroupOnSegment(const char *buf, int len)
 	ResGroupData		*group;
 	ResGroupSlotData	*slot;
 
-	/* Stop memory limit checking */
-	self->doMemCheck = false;
-
 	DeserializeResGroupInfo(&caps, &newGroupId, buf, len);
+
+	/*
+	 * QD will dispatch the resgroup id via bypassedSlot.groupId
+	 * in bypass mode.
+	 */
+	if (bypassedSlot.groupId != InvalidOid)
+	{
+		/* Are we already running in bypass mode? */
+		if (bypassedGroup != NULL)
+		{
+			Assert(bypassedGroup->groupId == bypassedSlot.groupId);
+			return;
+		}
+
+		/* Find out the resgroup by id */
+		LWLockAcquire(ResGroupLock, LW_EXCLUSIVE);
+		bypassedGroup = groupHashFind(bypassedSlot.groupId, true);
+		LWLockRelease(ResGroupLock);
+
+		Assert(bypassedGroup != NULL);
+
+		/* Initialize the fake slot */
+		bypassedSlot.memQuota = 0;
+		bypassedSlot.memUsage = 0;
+
+		/* Attach self memory usage to resgroup */
+		groupIncMemUsage(bypassedGroup, &bypassedSlot, self->memUsage);
+		return;
+	}
 
 	if (newGroupId == InvalidOid)
 	{
 		UnassignResGroup();
-		Assert(selfIsUnassigned());
 		return;
 	}
 
@@ -2192,8 +2674,13 @@ SwitchResGroupOnSegment(const char *buf, int len)
 	{
 		/* it's not the first dispatch in the same transaction */
 		Assert(self->groupId == newGroupId);
-		Assert(!memcmp((void*)&self->caps, (void*)&caps, sizeof(caps)));
-		self->doMemCheck = true;
+		Assert(self->caps.concurrency == caps.concurrency);
+		Assert(self->caps.cpuRateLimit == caps.cpuRateLimit);
+		Assert(self->caps.memLimit == caps.memLimit);
+		Assert(self->caps.memSharedQuota == caps.memSharedQuota);
+		Assert(self->caps.memSpillRatio == caps.memSpillRatio);
+		Assert(self->caps.memAuditor == caps.memAuditor);
+		Assert(!strcmp(self->caps.cpuset, caps.cpuset));
 		return;
 	}
 
@@ -2204,7 +2691,6 @@ SwitchResGroupOnSegment(const char *buf, int len)
 	/* Init self */
 	Assert(host_segments > 0);
 	Assert(caps.concurrency > 0);
-	selfSetGroup(group);
 	self->caps = caps;
 
 	/* Init slot */
@@ -2228,16 +2714,15 @@ SwitchResGroupOnSegment(const char *buf, int len)
 		group->nRunning++;
 	}
 
-	selfAttachToSlot(group, slot);
-	Assert(selfHasSlot());
+	selfAttachResGroup(group, slot);
 
 	LWLockRelease(ResGroupLock);
 
 	/* finally we can say we are in a valid resgroup */
-	Assert(selfIsAssignedValidGroup());
+	Assert(selfIsAssigned());
 
 	/* Add into cgroup */
-	ResGroupOps_AssignGroup(self->groupId, MyProcPid);
+	ResGroupOps_AssignGroup(self->groupId, &(self->caps), MyProcPid);
 }
 
 /*
@@ -2249,8 +2734,7 @@ waitOnGroup(ResGroupData *group)
 	PGPROC *proc = MyProc;
 
 	Assert(!LWLockHeldExclusiveByMe(ResGroupLock));
-	Assert(selfHasGroup());
-	Assert(!selfHasSlot());
+	Assert(!selfIsAssigned());
 
 	pgstat_report_resgroup(GetCurrentTimestamp(), group->groupId);
 
@@ -2259,7 +2743,7 @@ waitOnGroup(ResGroupData *group)
 	 *
 	 * This is used for interrupt cleanup, similar to lockAwaited in ProcSleep
 	 */
-	localResWaiting = true;
+	groupAwaited = group;
 
 	/*
 	 * Make sure we have released all locks before going to sleep, to eliminate
@@ -2285,9 +2769,9 @@ waitOnGroup(ResGroupData *group)
 	}
 	PG_END_TRY();
 
-	localResWaiting = false;
+	groupAwaited = NULL;
 
-	pgstat_report_waiting(PGBE_WAITING_NONE);
+	gpstat_report_waiting(PGBE_WAITING_NONE);
 }
 
 /*
@@ -2315,7 +2799,7 @@ groupHashNew(Oid groupId)
 	Assert(i < pResGroupControl->nGroups);
 
 	entry = (ResGroupHashEntry *)
-		hash_search(pResGroupControl->htbl, (void *) &groupId, HASH_ENTER_NULL, &found);
+		hash_search(pResGroupControl->htbl, (void *) &groupId, HASH_ENTER, &found);
 	/* caller should test that the group does not exist already */
 	Assert(!found);
 	entry->index = i;
@@ -2367,7 +2851,7 @@ groupHashFind(Oid groupId, bool raise)
  *	The resource group lightweight lock (ResGroupLock) *must* be held for
  *	this operation.
  */
-static void
+static ResGroupData *
 groupHashRemove(Oid groupId)
 {
 	bool		found;
@@ -2387,12 +2871,8 @@ groupHashRemove(Oid groupId)
 						groupId)));
 
 	group = &pResGroupControl->groups[entry->index];
-	mempoolRelease(groupId, group->memQuotaGranted + group->memSharedGranted);
-	group->memQuotaGranted = 0;
-	group->memSharedGranted = 0;
-	group->groupId = InvalidOid;
 
-	wakeupGroups(groupId);
+	return group;
 }
 
 /* Process exit without waiting for slot or received SIGTERM */
@@ -2420,18 +2900,19 @@ groupWaitCancel(void)
 	ResGroupData		*group;
 	ResGroupSlotData	*slot;
 
-	/* Process exit without waiting for slot */
-	if (!selfHasGroup() || !localResWaiting)
+	/* Nothing to do if we weren't waiting on a group */
+	if (groupAwaited == NULL)
 		return;
+
+	Assert(!selfIsAssigned());
+
+	group = groupAwaited;
 
 	/* We are sure to be interrupted in the for loop of waitOnGroup now */
 	LWLockAcquire(ResGroupLock, LW_EXCLUSIVE);
 
-	group = self->group;
-
 	AssertImply(procIsWaiting(MyProc),
 				groupWaitQueueFind(group, MyProc));
-	Assert(!selfHasSlot());
 
 	if (procIsWaiting(MyProc))
 	{
@@ -2441,16 +2922,16 @@ groupWaitCancel(void)
 		 */
 
 		Assert(!groupWaitQueueIsEmpty(group));
-		Assert(selfHasGroup());
 
 		groupWaitQueueErase(group, MyProc);
+
+		addTotalQueueDuration(group);
 	}
 	else if (MyProc->resSlot != NULL)
 	{
 		/* Woken up by a slot holder */
 
 		Assert(!procIsWaiting(MyProc));
-		Assert(selfIsAssignedValidGroup());
 
 		/* First complete the slot's transfer from MyProc to self */
 		slot = MyProc->resSlot;
@@ -2464,6 +2945,8 @@ groupWaitCancel(void)
 		Assert(sessionGetSlot() == NULL);
 
 		group->totalExecuted++;
+
+		addTotalQueueDuration(group);
 	}
 	else
 	{
@@ -2478,14 +2961,10 @@ groupWaitCancel(void)
 		Assert(!procIsWaiting(MyProc));
 	}
 
-	if (selfIsAssignedValidGroup())
-		addTotalQueueDuration(group);
-
 	LWLockRelease(ResGroupLock);
 
-	localResWaiting = false;
-	pgstat_report_waiting(PGBE_WAITING_NONE);
-	selfUnsetGroup();
+	groupAwaited = NULL;
+	gpstat_report_waiting(PGBE_WAITING_NONE);
 }
 
 static void
@@ -2493,9 +2972,13 @@ groupSetMemorySpillRatio(const ResGroupCaps *caps)
 {
 	char value[64];
 
+	/* No need to set memory_spill_ratio if it is already up-to-date */
+	if (caps->memSpillRatio == memory_spill_ratio)
+		return;
+
 	snprintf(value, sizeof(value), "%d", caps->memSpillRatio);
 	set_config_option("memory_spill_ratio", value, PGC_USERSET, PGC_S_RESGROUP,
-			GUC_ACTION_SET, true);
+					  GUC_ACTION_SET, true, 0);
 }
 
 void
@@ -2523,55 +3006,6 @@ selfValidateResGroupInfo(void)
 }
 
 /*
- * Check whether self is assigned and the assigned resgroup is dropped.
- *
- * The assigned resgroup is dropped if its groupId is invalid or
- * different with the groupId recorded in self.
- *
- * This function requires the slot and group to be in
- * a consistent status, they must both be set or unset,
- * so calling this function during the assign/unassign/switch process
- * might cause an error, use with caution.
- *
- * Even selfIsAssignedDroppedGroup() is true it doesn't mean the assign/switch
- * process is completely done, for example the memory accounting
- * information might not been updated yet.
- */
-static bool
-selfIsAssignedDroppedGroup(void)
-{
-	selfValidateResGroupInfo();
-
-	return self->groupId != InvalidOid
-		&& self->groupId != self->group->groupId;
-}
-
-/*
- * Check whether self is assigned and the assigned resgroup is valid.
- *
- * The assigned resgroup is valid if its groupId is valid and equal
- * to the groupId recorded in self.
- *
- * This function requires the slot and group to be in
- * a consistent status, they must both be set or unset,
- * so calling this function during the assign/unassign/switch process
- * might cause an error, use with caution.
- *
- * Even selfIsAssignedValidGroup() is true it doesn't mean the assign/switch
- * process is completely done, for example the memory accounting
- * information might not been updated yet.
- */
-static bool
-selfIsAssignedValidGroup(void)
-{
-	selfValidateResGroupInfo();
-
-	return self->groupId != InvalidOid
-		&& self->groupId == self->group->groupId;
-}
-
-#ifdef USE_ASSERT_CHECKING
-/*
  * Check whether self is assigned.
  *
  * This is mostly equal to (selfHasSlot() && selfHasGroup()),
@@ -2591,48 +3025,12 @@ static bool
 selfIsAssigned(void)
 {
 	selfValidateResGroupInfo();
+	AssertImply(self->group == NULL,
+			self->slot == NULL);
+	AssertImply(self->group != NULL,
+			self->slot != NULL);
 
 	return self->groupId != InvalidOid;
-}
-#endif /* USE_ASSERT_CHECKING */
-
-/*
- * Check whether self is unassigned.
- *
- * This is mostly equal to (!selfHasSlot() && !selfHasGroup()),
- * however this function requires the slot and group to be in
- * a consistent status, they must both be set or unset,
- * so calling this function during the assign/unassign/switch process
- * might cause an error, use with caution.
- *
- * Even selfIsUnassigned() is true it doesn't mean the unassign/switch
- * process is completely done, for example the memory accounting
- * information might not been updated yet.
- */
-static bool
-selfIsUnassigned(void)
-{
-	selfValidateResGroupInfo();
-
-	return self->groupId == InvalidOid;
-}
-
-/*
- * Unassign from an assigned but dropped resgroup.
- *
- * This is mostly equal to selfUnsetGroup() + selfUnsetSlot(),
- * however this function requires self must be assigned
- * to that dropped resgroup before unassign.
- */
-static void
-selfUnassignDroppedGroup(void)
-{
-	Assert(selfIsAssignedDroppedGroup());
-
-	selfUnsetSlot();
-	selfUnsetGroup();
-
-	Assert(selfIsUnassigned());
 }
 
 #ifdef USE_ASSERT_CHECKING
@@ -2646,7 +3044,6 @@ selfHasSlot(void)
 {
 	return self->slot != NULL;
 }
-#endif /* USE_ASSERT_CHECKING */
 
 /*
  * Check whether self has been set a resgroup.
@@ -2665,6 +3062,7 @@ selfHasGroup(void)
 
 	return self->groupId != InvalidOid;
 }
+#endif /* USE_ASSERT_CHECKING */
 
 /*
  * Set both the groupId and the group pointer in self.
@@ -2678,7 +3076,7 @@ selfHasGroup(void)
 static void
 selfSetGroup(ResGroupData *group)
 {
-	Assert(selfIsUnassigned());
+	Assert(!selfIsAssigned());
 	Assert(groupIsNotDropped(group));
 
 	self->group = group;
@@ -2696,6 +3094,7 @@ static void
 selfUnsetGroup(void)
 {
 	Assert(selfHasGroup());
+	Assert(!selfHasSlot());
 
 	self->groupId = InvalidOid;
 	self->group = NULL;
@@ -2851,6 +3250,7 @@ lockResGroupForDrop(ResGroupData *group)
 	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 	Assert(group->nRunning == 0);
+	Assert(group->nRunningBypassed == 0);
 	group->lockedForDrop = true;
 }
 
@@ -2860,6 +3260,7 @@ unlockResGroupForDrop(ResGroupData *group)
 	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 	Assert(group->nRunning == 0);
+	Assert(group->nRunningBypassed == 0);
 	group->lockedForDrop = false;
 }
 
@@ -2874,8 +3275,6 @@ unlockResGroupForDrop(ResGroupData *group)
  * resgroup does is dropped.
  *
  * So this function is not always reliable, use with caution.
- *
- * Consider use selfIsAssignedDroppedGroup() instead of this whenever possible.
  */
 static bool
 groupIsNotDropped(const ResGroupData *group)
@@ -3039,12 +3438,16 @@ groupWaitQueueFind(ResGroupData *group, const PGPROC *proc)
  * Currently, only SET/RESET/SHOW command can be bypassed
  */
 static bool
-shouldBypassQuery(const char* query_string)
+shouldBypassQuery(const char *query_string)
 {
 	MemoryContext oldcontext;
 	List *parsetree_list; 
 	ListCell *parsetree_item;
 	Node *parsetree;
+	bool		bypass;
+
+	if (gp_resource_group_bypass)
+		return true;
 
 	if (!query_string)
 		return false;
@@ -3062,16 +3465,33 @@ shouldBypassQuery(const char* query_string)
 		return false;
 
 	/* Only bypass SET/RESET/SHOW command for now */
+	bypass = true;
 	foreach(parsetree_item, parsetree_list)
 	{
 		parsetree = (Node *) lfirst(parsetree_item);
 
 		if (nodeTag(parsetree) != T_VariableSetStmt &&
 			nodeTag(parsetree) != T_VariableShowStmt)
-			return false;
+		{
+			bypass = false;
+			break;
+		}
 	}
 
-	return true;
+	list_free_deep(parsetree_list);
+	return bypass;
+}
+
+/*
+ * Check whether the resource group has been dropped.
+ */
+static bool
+groupIsDropped(ResGroupInfo *pGroupInfo)
+{
+	Assert(pGroupInfo != NULL);
+	Assert(pGroupInfo->group != NULL);
+
+	return pGroupInfo->group->groupId != pGroupInfo->groupId;
 }
 
 /*
@@ -3085,14 +3505,12 @@ ResGroupDumpInfo(StringInfo str)
 	if (!IsResGroupEnabled())
 		return;
 
-	verifyGpIdentityIsSet();
-
 	appendStringInfo(str, "{\"segid\":%d,", GpIdentity.segindex);
 	/* dump fields in pResGroupControl. */
 	appendStringInfo(str, "\"segmentsOnMaster\":%d,", pResGroupControl->segmentsOnMaster);
 	appendStringInfo(str, "\"loaded\":%s,", pResGroupControl->loaded ? "true" : "false");
 	appendStringInfo(str, "\"totalChunks\":%d,", pResGroupControl->totalChunks);
-	appendStringInfo(str, "\"freeChunks\":%d,", pResGroupControl->freeChunks);
+	appendStringInfo(str, "\"freeChunks\":%d,", pg_atomic_read_u32(&pResGroupControl->freeChunks));
 	appendStringInfo(str, "\"chunkSizeInBits\":%d,", pResGroupControl->chunkSizeInBits);
 	
 	/* dump each group */
@@ -3121,6 +3539,7 @@ resgroupDumpGroup(StringInfo str, ResGroupData *group)
 	appendStringInfo(str, "{");
 	appendStringInfo(str, "\"group_id\":%u,", group->groupId);
 	appendStringInfo(str, "\"nRunning\":%d,", group->nRunning);
+	appendStringInfo(str, "\"nRunningBypassed\":%d,", group->nRunningBypassed);
 	appendStringInfo(str, "\"locked_for_drop\":%d,", group->lockedForDrop);
 	appendStringInfo(str, "\"memExpected\":%d,", group->memExpected);
 	appendStringInfo(str, "\"memQuotaGranted\":%d,", group->memQuotaGranted);
@@ -3243,7 +3662,10 @@ sessionSetSlot(ResGroupSlotData *slot)
 static ResGroupSlotData *
 sessionGetSlot(void)
 {
-	return (ResGroupSlotData *) MySessionState->resGroupSlot;
+	if (MySessionState == NULL)
+		return NULL;
+	else
+		return (ResGroupSlotData *) MySessionState->resGroupSlot;
 }
 
 /*
@@ -3255,4 +3677,526 @@ sessionResetSlot(void)
 	Assert(MySessionState->resGroupSlot != NULL);
 
 	MySessionState->resGroupSlot = NULL;
+}
+
+/*
+ * Operation for resource groups with vmtracker memory auditor
+ * when alter its memory limit.
+ */
+static void
+groupMemOnAlterForVmtracker(Oid groupId, ResGroupData *group)
+{
+	bool shouldNotify;
+
+	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
+
+	shouldNotify = groupApplyMemCaps(group);
+
+	wakeupSlots(group, true);
+	if (shouldNotify)
+		notifyGroupsOnMem(groupId);
+}
+
+/*
+ * Operation for resource groups with vmtracker memory auditor
+ * when reclaiming its memory back to MEM POOL.
+ */
+static void
+groupMemOnDropForVmtracker(Oid groupId, ResGroupData *group)
+{
+	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
+
+	mempoolRelease(groupId, group->memQuotaGranted + group->memSharedGranted);
+	group->memQuotaGranted = 0;
+	group->memSharedGranted = 0;
+}
+
+/*
+ * Operation for resource groups with vmtracker memory auditor
+ * when memory in MEM POOL is increased.
+ */
+static void
+groupMemOnNotifyForVmtracker(ResGroupData *group)
+{
+	int32			delta;
+
+	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
+
+	if (Gp_role != GP_ROLE_DISPATCH)
+		return;
+
+	if (group->lockedForDrop)
+		return;
+
+	if (groupWaitQueueIsEmpty(group))
+		return;
+
+	delta = group->memExpected - group->memQuotaGranted - group->memSharedGranted;
+	if (delta <= 0)
+		return;
+
+	wakeupSlots(group, true);
+}
+
+/*
+ * Operation for resource groups with vmtracker memory auditor
+ * when dump memory statistics.
+ */
+static void
+groupMemOnDumpForVmtracker(ResGroupData *group, StringInfo str)
+{
+	appendStringInfo(str, "{");
+	appendStringInfo(str, "\"used\":%d, ",
+			VmemTracker_ConvertVmemChunksToMB(group->memUsage));
+	appendStringInfo(str, "\"available\":%d, ",
+			VmemTracker_ConvertVmemChunksToMB(
+				group->memQuotaGranted + group->memSharedGranted - group->memUsage));
+	appendStringInfo(str, "\"quota_used\":%d, ",
+			VmemTracker_ConvertVmemChunksToMB(group->memQuotaUsed));
+	appendStringInfo(str, "\"quota_available\":%d, ",
+			VmemTracker_ConvertVmemChunksToMB(
+				group->memQuotaGranted - group->memQuotaUsed));
+	appendStringInfo(str, "\"quota_granted\":%d, ",
+			VmemTracker_ConvertVmemChunksToMB(group->memQuotaGranted));
+	appendStringInfo(str, "\"quota_proposed\":%d, ",
+			VmemTracker_ConvertVmemChunksToMB(
+				groupGetMemQuotaExpected(&group->caps)));
+	appendStringInfo(str, "\"shared_used\":%d, ",
+			VmemTracker_ConvertVmemChunksToMB(group->memSharedUsage));
+	appendStringInfo(str, "\"shared_available\":%d, ",
+			VmemTracker_ConvertVmemChunksToMB(
+				group->memSharedGranted - group->memSharedUsage));
+	appendStringInfo(str, "\"shared_granted\":%d, ",
+			VmemTracker_ConvertVmemChunksToMB(group->memSharedGranted));
+	appendStringInfo(str, "\"shared_proposed\":%d",
+			VmemTracker_ConvertVmemChunksToMB(
+				groupGetMemSharedExpected(&group->caps)));
+	appendStringInfo(str, "}");
+}
+
+/*
+ * Operation for resource groups with cgroup memory auditor
+ * when alter its memory limit.
+ */
+static void
+groupMemOnAlterForCgroup(Oid groupId, ResGroupData *group)
+{
+	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
+
+	/*
+	 * If memGap is positive, it indicates this group should
+	 * give back these many memory back to MEM POOL.
+	 *
+	 * If memGap is negative, it indicates this group should
+	 * retrieve these many memory from MEM POOL.
+	 *
+	 * If memGap is zero, this group is holding the same memory
+	 * as it expects.
+	 */
+	if (group->memGap == 0)
+		return;
+
+	if (group->memGap > 0)
+		groupApplyCgroupMemDec(group);
+	else
+		groupApplyCgroupMemInc(group);
+}
+
+/*
+ * Increase a resource group's cgroup memory limit
+ *
+ * This may not take effect immediately.
+ */
+static void
+groupApplyCgroupMemInc(ResGroupData *group)
+{
+	ResGroupCompType comp = RESGROUP_COMP_TYPE_MEMORY;
+	int32 memory_limit;
+	int32 memory_inc;
+	int fd;
+
+	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
+	Assert(group->memGap < 0);
+
+	memory_inc = mempoolReserve(group->groupId, group->memGap * -1);
+
+	if (memory_inc <= 0)
+		return;
+
+	fd = ResGroupOps_LockGroup(group->groupId, comp, true);
+	memory_limit = ResGroupOps_GetMemoryLimit(group->groupId);
+	ResGroupOps_SetMemoryLimitByValue(group->groupId, memory_limit + memory_inc);
+	ResGroupOps_UnLockGroup(group->groupId, fd);
+
+	group->memGap += memory_inc;
+}
+
+/*
+ * Decrease a resource group's cgroup memory limit
+ *
+ * This will take effect immediately for now.
+ */
+static void
+groupApplyCgroupMemDec(ResGroupData *group)
+{
+	ResGroupCompType comp = RESGROUP_COMP_TYPE_MEMORY;
+	int32 memory_limit;
+	int32 memory_dec;
+	int fd;
+
+	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
+	Assert(group->memGap > 0);
+
+	fd = ResGroupOps_LockGroup(group->groupId, comp, true);
+	memory_limit = ResGroupOps_GetMemoryLimit(group->groupId);
+	Assert(memory_limit > group->memGap);
+
+	memory_dec = group->memGap;
+
+	ResGroupOps_SetMemoryLimitByValue(group->groupId, memory_limit - memory_dec);
+	ResGroupOps_UnLockGroup(group->groupId, fd);
+
+	mempoolRelease(group->groupId, memory_dec);
+	notifyGroupsOnMem(group->groupId);
+
+	group->memGap -= memory_dec;
+}
+
+/*
+ * Operation for resource groups with cgroup memory auditor
+ * when reclaiming its memory back to MEM POOL.
+ */
+static void
+groupMemOnDropForCgroup(Oid groupId, ResGroupData *group)
+{
+	int32 memory_expected;
+
+	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
+
+	memory_expected = groupGetMemExpected(&group->caps);
+
+	mempoolRelease(groupId, memory_expected + group->memGap);
+}
+
+/*
+ * Operation for resource groups with cgroup memory auditor
+ * when memory in MEM POOL is increased.
+ */
+static void
+groupMemOnNotifyForCgroup(ResGroupData *group)
+{
+	Assert(LWLockHeldExclusiveByMe(ResGroupLock));
+
+	if (group->memGap < 0)
+		groupApplyCgroupMemInc(group);
+}
+
+/*
+ * Operation for resource groups with cgroup memory auditor
+ * when dump memory statistics.
+ */
+static void
+groupMemOnDumpForCgroup(ResGroupData *group, StringInfo str)
+{
+	appendStringInfo(str, "{");
+	appendStringInfo(str, "\"used\":%d, ",
+			VmemTracker_ConvertVmemChunksToMB(
+				ResGroupOps_GetMemoryUsage(group->groupId) / ResGroupGetSegmentNum()));
+	appendStringInfo(str, "\"limit_granted\":%d",
+			VmemTracker_ConvertVmemChunksToMB(
+				ResGroupOps_GetMemoryLimit(group->groupId) / ResGroupGetSegmentNum()));
+	appendStringInfo(str, "}");
+}
+
+/*
+ * Parse cpuset to bitset
+ * If cpuset is "1,3-5", Bitmapset 1,3,4,5 are set.
+ */
+Bitmapset *
+CpusetToBitset(const char *cpuset, int len)
+{
+	int	pos = 0, num1 = 0, num2 = 0;
+	enum Status
+	{
+		Initial,
+		Begin,
+		Number,
+		Interval,
+		Number2
+	};
+	enum Status	s = Initial;
+
+	Bitmapset	*bms = NULL;
+	if (cpuset == NULL || len <= 0)
+		return bms;
+	while (pos < len && cpuset[pos])
+	{
+		char c = cpuset[pos++];
+		if (c == ',')
+		{
+			if (s == Initial || s == Begin)
+			{
+				continue;
+			}
+			else if (s == Interval)
+			{
+				goto error_logic;
+			}
+			else if (s == Number)
+			{
+				bms = bms_union(bms, bms_make_singleton(num1));
+				num1 = 0;
+				s = Begin;
+			}
+			else if (s == Number2)
+			{
+				if (num1 > num2)
+				{
+					goto error_logic;
+				}
+				for (int i = num1; i <= num2; ++i)
+				{
+					bms = bms_union(bms, bms_make_singleton(i));
+				}
+				num1 = num2 = 0;
+				s = Begin;
+			}
+		}
+		else if (c == '-')
+		{
+			if (s != Number)
+			{
+				goto error_logic;
+			}
+			s = Interval;
+		}
+		else if (isdigit(c))
+		{
+			if (s == Initial || s == Begin)
+			{
+				s = Number;
+			}
+			else if (s == Interval)
+			{
+				s = Number2;
+			}
+			if (s == Number)
+			{
+				num1 = num1 * 10 + (c - '0');
+			}
+			else if (s == Number2)
+			{
+				num2 = num2 * 10 + (c - '0');
+			}
+		}
+		else if (c == '\n')
+		{
+			break;
+		}
+		else
+		{
+			goto error_logic;
+		}
+	}
+	if (s == Number)
+	{
+		bms = bms_union(bms, bms_make_singleton(num1));
+	}
+	else if (s == Number2)
+	{
+		if (num1 > num2)
+		{
+			goto error_logic;
+		}
+		for (int i = num1; i <= num2; ++i)
+		{
+			bms = bms_union(bms, bms_make_singleton(i));
+		}
+	}
+	else if (s == Initial || s == Interval)
+	{
+		goto error_logic;
+	}
+	return bms;
+error_logic:
+	return NULL;
+}
+
+/*
+ * Check the value of cpuset is empty or not
+ */
+bool CpusetIsEmpty(const char *cpuset)
+{
+	return strcmp(cpuset, DefaultCpuset) == 0;
+}
+
+/*
+ * Set cpuset value to default value -1.
+ */
+void SetCpusetEmpty(char *cpuset, int cpusetSize)
+{
+	StrNCpy(cpuset, DefaultCpuset, cpusetSize);
+}
+
+/*
+ * Transform non-empty bitset to cpuset.
+ *
+ * This function does not check the cpu cores are available or not.
+ */
+void
+BitsetToCpuset(const Bitmapset *bms,
+			   char *cpuset,
+			   int cpusetSize)
+{
+	int len = 0;
+	int lastContinuousBit = -1;
+	int	intervalStart = -1;
+	int num;
+	char buffer[32] = {0};
+
+	Assert(!bms_is_empty(bms));
+
+	cpuset[0] = '\0';
+
+	num = -1;
+	while ((num = bms_next_member(bms, num)) >= 0)
+	{
+		if (lastContinuousBit == -1)
+		{
+			intervalStart = lastContinuousBit = num;
+		}
+		else
+		{
+			if (num != lastContinuousBit + 1)
+			{
+				if (intervalStart == lastContinuousBit)
+				{
+					snprintf(buffer, sizeof(buffer), "%d,", intervalStart);
+				}
+				else
+				{
+					snprintf(buffer, sizeof(buffer), "%d-%d,", intervalStart, lastContinuousBit);
+				}
+				if (len + strlen(buffer) >= cpusetSize)
+				{
+					Assert(cpuset[0]);
+					return ;
+				}
+				strcpy(cpuset + len, buffer);
+				len += strlen(buffer);
+				intervalStart = lastContinuousBit = num;
+			}
+			else
+			{
+				lastContinuousBit = num;
+			}
+		}
+	}
+	if (intervalStart != -1)
+	{
+		if (intervalStart == lastContinuousBit)
+		{
+			snprintf(buffer, sizeof(buffer), "%d", intervalStart);
+		}
+		else
+		{
+			snprintf(buffer, sizeof(buffer), "%d-%d", intervalStart, lastContinuousBit);
+		}
+		if (len + strlen(buffer) >= cpusetSize)
+		{
+			Assert(cpuset[0]);
+			return ;
+		}
+		strcpy(cpuset + len, buffer);
+		len += strlen(buffer);
+	}
+	else
+	{
+		/* bms is non-empty, so it should never reach here */
+		pg_unreachable();
+	}
+}
+
+/*
+ * calculate the result of cpuset1 plus/minus cpuset2 and save in place
+ * if sub is true, the operation is minus
+ * if sub is false, the operation is plus
+ */
+void
+cpusetOperation(char *cpuset1, const char *cpuset2,
+							int len, bool sub)
+{
+	char cpuset[MaxCpuSetLength] = {0};
+	int defaultCore = -1;
+	Bitmapset *bms1 = CpusetToBitset(cpuset1, len);
+	Bitmapset *bms2 = CpusetToBitset(cpuset2, len);
+	if (sub)
+	{
+		bms1 = bms_del_members(bms1, bms2);
+	}
+	else
+	{
+		bms1 = bms_add_members(bms1, bms2);
+	}
+	if (!bms_is_empty(bms1))
+	{
+		BitsetToCpuset(bms1, cpuset1, len);
+	}
+	else
+	{
+		/* Get cpuset from cpuset/gpdb, and transform it into bitset */
+		ResGroupOps_GetCpuSet(RESGROUP_ROOT_ID, cpuset, MaxCpuSetLength);
+		Bitmapset *bmsDefault = CpusetToBitset(cpuset, MaxCpuSetLength);
+		/* get the minimum core number, in case of the zero core is not exist */
+		defaultCore = bms_next_member(bmsDefault, -1);
+		Assert(defaultCore >= 0);
+		snprintf(cpuset1, MaxCpuSetLength, "%d", defaultCore);
+	}
+}
+
+/*
+ * union cpuset2 to cpuset1
+ */
+void
+CpusetUnion(char *cpuset1, const char *cpuset2, int len)
+{
+	cpusetOperation(cpuset1, cpuset2, len, false);
+}
+
+/*
+ * subtract cpuset2 from cpuset1
+ */
+void
+CpusetDifference(char *cpuset1, const char *cpuset2, int len)
+{
+	cpusetOperation(cpuset1, cpuset2, len, true);
+}
+
+/*
+ * ensure that cpuset is available.
+ */
+bool
+EnsureCpusetIsAvailable(int elevel)
+{
+	if (!IsResGroupActivated())
+	{
+		ereport(elevel,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("resource group must be enabled to use cpuset feature")));
+
+		return false;
+	}
+
+	if (!gp_resource_group_enable_cgroup_cpuset)
+	{
+		ereport(elevel,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cgroup is not properly configured to use the cpuset feature"),
+				 errhint("Extra cgroup configurations are required to enable this feature, "
+						 "please refer to the Greenplum Documentations for details")));
+
+		return false;
+	}
+
+	return true;
 }

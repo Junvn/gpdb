@@ -23,6 +23,7 @@
 #include "catalog/pg_proc.h"
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -31,6 +32,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/tqual.h"
 #include "utils/fmgroids.h"
 #include "utils/memutils.h"
 #include "utils/uri.h"
@@ -47,13 +49,12 @@
 void
 InsertExtTableEntry(Oid 	tbloid,
 					bool 	iswritable,
-					bool 	isweb,
 					bool	issreh,
 					char	formattype,
 					char	rejectlimittype,
 					char*	commandString,
 					int		rejectlimit,
-					Oid		fmtErrTblOid,
+					bool    logerrors,
 					int		encoding,
 					Datum	formatOptStr,
 					Datum   optionsStr,
@@ -99,24 +100,18 @@ InsertExtTableEntry(Oid 	tbloid,
 		nulls[Anum_pg_exttable_command - 1] = true;
 	}
 
-	if(issreh)
+	if (issreh)
 	{
 		values[Anum_pg_exttable_rejectlimit -1] = Int32GetDatum(rejectlimit);
 		values[Anum_pg_exttable_rejectlimittype - 1] = CharGetDatum(rejectlimittype);
-
-		/* if error log specified store its OID, otherwise put a NULL */
-		if(fmtErrTblOid != InvalidOid)
-			values[Anum_pg_exttable_fmterrtbl - 1] = ObjectIdGetDatum(fmtErrTblOid);
-		else
-			nulls[Anum_pg_exttable_fmterrtbl - 1] = true;
 	}
 	else
 	{
 		nulls[Anum_pg_exttable_rejectlimit -1] = true;
 		nulls[Anum_pg_exttable_rejectlimittype - 1] = true;
-		nulls[Anum_pg_exttable_fmterrtbl - 1] = true;
 	}
 
+	values[Anum_pg_exttable_logerrors - 1] = BoolGetDatum(logerrors);
 	values[Anum_pg_exttable_encoding - 1] = Int32GetDatum(encoding);
 	values[Anum_pg_exttable_writable - 1] = BoolGetDatum(iswritable);
 
@@ -164,7 +159,7 @@ InsertExtTableEntry(Oid 	tbloid,
 			myself.objectSubId = 0;
 
 			referenced.classId = ExtprotocolRelationId;
-			referenced.objectId = LookupExtProtocolOid(protocol, true);
+			referenced.objectId = get_extprotocol_oid(protocol, true);
 			referenced.objectSubId = 0;
 
 			/*
@@ -215,7 +210,7 @@ GetExtTableEntryIfExists(Oid relid)
 				command,
 				rejectlimit,
 				rejectlimittype,
-				fmterrtbl,
+				logerrors,
 				encoding,
 				iswritable;
 	bool		isNull;
@@ -229,7 +224,7 @@ GetExtTableEntryIfExists(Oid relid)
 				ObjectIdGetDatum(relid));
 
 	scan = systable_beginscan(pg_exttable_rel, ExtTableReloidIndexId, true,
-							  SnapshotNow, 1, &skey);
+							  NULL, 1, &skey);
 	tuple = systable_getnext(scan);
 
 	if (!HeapTupleIsValid(tuple))
@@ -389,21 +384,19 @@ GetExtTableEntryIfExists(Oid relid)
 								   &isNull);
 
 	extentry->rejectlimittype = DatumGetChar(rejectlimittype);
-	if(!isNull)
+	if (!isNull)
 		Insist(extentry->rejectlimittype == 'r' || extentry->rejectlimittype == 'p');
 	else
 		extentry->rejectlimittype = -1;
 
 	/* get the error table oid */
-	fmterrtbl = heap_getattr(tuple,
-							 Anum_pg_exttable_fmterrtbl,
+	logerrors = heap_getattr(tuple,
+							 Anum_pg_exttable_logerrors,
 							 RelationGetDescr(pg_exttable_rel),
 							 &isNull);
 
-	if(isNull)
-		extentry->fmterrtbl = InvalidOid;
-	else
-		extentry->fmterrtbl = DatumGetObjectId(fmterrtbl);
+	Insist(!isNull);
+	extentry->logerrors = DatumGetBool(logerrors);
 
 	/* get the table encoding */
 	encoding = heap_getattr(tuple,
@@ -456,7 +449,7 @@ RemoveExtTableEntry(Oid relid)
 				ObjectIdGetDatum(relid));
 
 	scan = systable_beginscan(pg_exttable_rel, ExtTableReloidIndexId, true,
-							  SnapshotNow, 1, &skey);
+							  NULL, 1, &skey);
 	tuple = systable_getnext(scan);
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,

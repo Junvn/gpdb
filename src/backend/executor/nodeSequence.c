@@ -23,8 +23,6 @@
 #include "executor/executor.h"
 #include "miscadmin.h"
 
-#define SEQUENCE_NSLOTS 1
-
 SequenceState *
 ExecInitSequence(Sequence *node, EState *estate, int eflags)
 {
@@ -73,21 +71,6 @@ ExecInitSequence(Sequence *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&sequenceState->ps);
 
 	return sequenceState;
-}
-
-int
-ExecCountSlotsSequence(Sequence *node)
-{
-	Assert(list_length(node->subplans) > 0);
-
-	int numSlots = 0;
-	ListCell *lc = NULL;
-	foreach(lc, node->subplans)
-	{
-		numSlots += ExecCountSlotsNode((Plan *)lfirst(lc));
-	}
-
-	return numSlots + SEQUENCE_NSLOTS;
 }
 
 /*
@@ -150,7 +133,7 @@ ExecEndSequence(SequenceState *node)
 }
 
 void
-ExecReScanSequence(SequenceState *node, ExprContext *exprCtxt)
+ExecReScanSequence(SequenceState *node)
 {
 	for (int i = 0; i < node->numSubplans; i++)
 	{
@@ -169,8 +152,15 @@ ExecReScanSequence(SequenceState *node, ExprContext *exprCtxt)
 		 * Always rescan the inputs immediately, to ensure we can pass down
 		 * any outer tuple that might be used in index quals.
 		 */
-		ExecReScan(subnode, exprCtxt);
+		ExecReScan(subnode);
 	}
 
 	node->initState = true;
+}
+
+void
+ExecSquelchSequence(SequenceState *node)
+{
+	for (int i = 0; i < node->numSubplans; i++)
+		ExecSquelchNode(node->subplans[i]);
 }

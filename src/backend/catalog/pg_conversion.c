@@ -3,29 +3,30 @@
  * pg_conversion.c
  *	  routines to support manipulation of the pg_conversion relation
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/catalog/pg_conversion.c,v 1.46 2008/11/02 01:45:27 tgl Exp $
+ *	  src/backend/catalog/pg_conversion.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_conversion_fn.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "mb/pg_wchar.h"
-#include "miscadmin.h"
-#include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -58,10 +59,9 @@ ConversionCreate(const char *conname, Oid connamespace,
 		elog(ERROR, "no conversion name supplied");
 
 	/* make sure there is no existing conversion of same name */
-	if (SearchSysCacheExists(CONNAMENSP,
-							 PointerGetDatum(conname),
-							 ObjectIdGetDatum(connamespace),
-							 0, 0))
+	if (SearchSysCacheExists2(CONNAMENSP,
+							  PointerGetDatum(conname),
+							  ObjectIdGetDatum(connamespace)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("conversion \"%s\" already exists", conname)));
@@ -131,8 +131,12 @@ ConversionCreate(const char *conname, Oid connamespace,
 	/* create dependency on owner */
 	recordDependencyOnOwner(ConversionRelationId, HeapTupleGetOid(tup),
 							conowner);
+
 	/* dependency on extension */
 	recordDependencyOnCurrentExtension(&myself, false);
+
+	/* Post creation hook for new conversion */
+	InvokeObjectPostCreateHook(ConversionRelationId, HeapTupleGetOid(tup), 0);
 
 	heap_freetuple(tup);
 	heap_close(rel, RowExclusiveLock);
@@ -162,8 +166,7 @@ RemoveConversionById(Oid conversionOid)
 	/* open pg_conversion */
 	rel = heap_open(ConversionRelationId, RowExclusiveLock);
 
-	scan = heap_beginscan(rel, SnapshotNow,
-						  1, &scanKeyData);
+	scan = heap_beginscan_catalog(rel, 1, &scanKeyData);
 
 	/* search for the target tuple */
 	if (HeapTupleIsValid(tuple = heap_getnext(scan, ForwardScanDirection)))
@@ -192,11 +195,10 @@ FindDefaultConversion(Oid name_space, int32 for_encoding, int32 to_encoding)
 	Oid			proc = InvalidOid;
 	int			i;
 
-	catlist = SearchSysCacheList(CONDEFAULT, 3,
-								 ObjectIdGetDatum(name_space),
-								 Int32GetDatum(for_encoding),
-								 Int32GetDatum(to_encoding),
-								 0);
+	catlist = SearchSysCacheList3(CONDEFAULT,
+								  ObjectIdGetDatum(name_space),
+								  Int32GetDatum(for_encoding),
+								  Int32GetDatum(to_encoding));
 
 	for (i = 0; i < catlist->n_members; i++)
 	{
@@ -210,39 +212,4 @@ FindDefaultConversion(Oid name_space, int32 for_encoding, int32 to_encoding)
 	}
 	ReleaseSysCacheList(catlist);
 	return proc;
-}
-
-/*
- * FindConversion
- *
- * Find conversion by namespace and conversion name.
- * Returns conversion OID.
- */
-Oid
-FindConversion(const char *conname, Oid connamespace)
-{
-	HeapTuple	tuple;
-	Oid			procoid;
-	Oid			conoid;
-	AclResult	aclresult;
-
-	/* search pg_conversion by connamespace and conversion name */
-	tuple = SearchSysCache(CONNAMENSP,
-						   PointerGetDatum(conname),
-						   ObjectIdGetDatum(connamespace),
-						   0, 0);
-	if (!HeapTupleIsValid(tuple))
-		return InvalidOid;
-
-	procoid = ((Form_pg_conversion) GETSTRUCT(tuple))->conproc;
-	conoid = HeapTupleGetOid(tuple);
-
-	ReleaseSysCache(tuple);
-
-	/* Check we have execute rights for the function */
-	aclresult = pg_proc_aclcheck(procoid, GetUserId(), ACL_EXECUTE);
-	if (aclresult != ACLCHECK_OK)
-		return InvalidOid;
-
-	return conoid;
 }

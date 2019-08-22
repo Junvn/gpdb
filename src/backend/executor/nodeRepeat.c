@@ -174,12 +174,6 @@ ExecInitRepeat(Repeat *node, EState *estate, int eflags)
 	return repeatstate;
 }
 
-int
-ExecCountSlotsRepeat(Repeat *node)
-{
-	return ExecCountSlotsNode(outerPlan(node)) + 1;
-}
-
 void
 ExecEndRepeat(RepeatState *node)
 {
@@ -196,7 +190,7 @@ ExecEndRepeat(RepeatState *node)
 }
 
 void
-ExecReScanRepeat(RepeatState *node, ExprContext *exprCtxt)
+ExecReScanRepeat(RepeatState *node)
 {
 	/* Clean out the tuple table */
 	ExecClearTuple(node->ps.ps_ResultTupleSlot);
@@ -208,7 +202,7 @@ ExecReScanRepeat(RepeatState *node, ExprContext *exprCtxt)
 	 * first ExecProcNode.
 	 */
 	if (((PlanState *) node)->lefttree->chgParam == NULL)
-		ExecReScan(((PlanState *) node)->lefttree, exprCtxt);
+		ExecReScan(((PlanState *) node)->lefttree);
 }
 
 /*

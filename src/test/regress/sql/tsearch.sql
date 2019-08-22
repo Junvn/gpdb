@@ -34,7 +34,7 @@ WHERE mapcfg = 0 OR mapdict = 0;
 -- Look for pg_ts_config_map entries that aren't one of parser's token types
 SELECT * FROM
   ( SELECT oid AS cfgid, (ts_token_type(cfgparser)).tokid AS tokid
-    FROM pg_ts_config ) AS tt 
+    FROM pg_ts_config ) AS tt
 RIGHT JOIN pg_ts_config_map AS m
     ON (tt.cfgid=m.mapcfg AND tt.tokid=m.maptokentype)
 WHERE
@@ -49,10 +49,17 @@ SELECT count(*) FROM test_tsvector WHERE a @@ 'eq|yt';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq&yt)|(wr&qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq|yt)&(wr|qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'w:*|q:*';
+SELECT count(*) FROM test_tsvector WHERE a @@ any ('{wr,qh}');
+SELECT count(*) FROM test_tsvector WHERE a @@ 'no_such_lexeme';
+SELECT count(*) FROM test_tsvector WHERE a @@ '!no_such_lexeme';
 
 create index wowidx on test_tsvector using gist (a);
 
 SET enable_seqscan=OFF;
+SET enable_indexscan=ON;
+SET enable_bitmapscan=OFF;
+
+explain (costs off) SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
 
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr&qh';
@@ -61,14 +68,38 @@ SELECT count(*) FROM test_tsvector WHERE a @@ 'eq|yt';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq&yt)|(wr&qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq|yt)&(wr|qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'w:*|q:*';
+SELECT count(*) FROM test_tsvector WHERE a @@ any ('{wr,qh}');
+SELECT count(*) FROM test_tsvector WHERE a @@ 'no_such_lexeme';
+SELECT count(*) FROM test_tsvector WHERE a @@ '!no_such_lexeme';
+
+SET enable_indexscan=OFF;
+SET enable_bitmapscan=ON;
+
+explain (costs off) SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
+
+SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
+SELECT count(*) FROM test_tsvector WHERE a @@ 'wr&qh';
+SELECT count(*) FROM test_tsvector WHERE a @@ 'eq&yt';
+SELECT count(*) FROM test_tsvector WHERE a @@ 'eq|yt';
+SELECT count(*) FROM test_tsvector WHERE a @@ '(eq&yt)|(wr&qh)';
+SELECT count(*) FROM test_tsvector WHERE a @@ '(eq|yt)&(wr|qh)';
+SELECT count(*) FROM test_tsvector WHERE a @@ 'w:*|q:*';
+SELECT count(*) FROM test_tsvector WHERE a @@ any ('{wr,qh}');
+SELECT count(*) FROM test_tsvector WHERE a @@ 'no_such_lexeme';
+SELECT count(*) FROM test_tsvector WHERE a @@ '!no_such_lexeme';
 
 RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
 
 DROP INDEX wowidx;
 
---CREATE INDEX wowidx ON test_tsvector USING gin (a);
+CREATE INDEX wowidx ON test_tsvector USING gin (a);
 
---SET enable_seqscan=OFF;
+SET enable_seqscan=OFF;
+-- GIN only supports bitmapscan, so no need to test plain indexscan
+
+explain (costs off) SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
 
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr|qh';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'wr&qh';
@@ -77,8 +108,12 @@ SELECT count(*) FROM test_tsvector WHERE a @@ 'eq|yt';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq&yt)|(wr&qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ '(eq|yt)&(wr|qh)';
 SELECT count(*) FROM test_tsvector WHERE a @@ 'w:*|q:*';
-  
+SELECT count(*) FROM test_tsvector WHERE a @@ any ('{wr,qh}');
+SELECT count(*) FROM test_tsvector WHERE a @@ 'no_such_lexeme';
+SELECT count(*) FROM test_tsvector WHERE a @@ '!no_such_lexeme';
+
 RESET enable_seqscan;
+
 INSERT INTO test_tsvector VALUES ('???', 'DFG:1A,2B,6C,10 FGH');
 SELECT * FROM ts_stat('SELECT a FROM test_tsvector') ORDER BY ndoc DESC, nentry DESC, word LIMIT 10;
 SELECT * FROM ts_stat('SELECT a FROM test_tsvector', 'AB') ORDER BY ndoc DESC, nentry DESC, word;
@@ -105,6 +140,12 @@ SELECT length(to_tsvector('english', '345 qwe@efd.r '' http://www.com/ http://ae
 -- ts_debug
 
 SELECT * from ts_debug('english', '<myns:foo-bar_baz.blurfl>abc&nm1;def&#xa9;ghi&#245;jkl</myns:foo-bar_baz.blurfl>');
+
+-- check parsing of URLs
+SELECT * from ts_debug('english', 'http://www.harewoodsolutions.co.uk/press.aspx</span>');
+SELECT * from ts_debug('english', 'http://aew.wer0c.ewr/id?ad=qwe&dw<span>');
+SELECT * from ts_debug('english', 'http://5aew.werc.ewr:8100/?');
+SELECT * from ts_debug('english', '5aew.werc.ewr:8100/?xx');
 
 -- to_tsquery
 
@@ -158,6 +199,12 @@ Water, water, every where,
 S. T. Coleridge (1772-1834)
 '), to_tsquery('english', 'ocean'));
 
+SELECT ts_rank_cd(strip(to_tsvector('both stripped')),
+                  to_tsquery('both & stripped'));
+
+SELECT ts_rank_cd(to_tsvector('unstripped') || strip(to_tsvector('stripped')),
+                  to_tsquery('unstripped & stripped'));
+
 --headline tests
 SELECT ts_headline('english', '
 Day after day, day after day,
@@ -209,7 +256,7 @@ ff-bg
 </html>',
 to_tsquery('english', 'sea&foo'), 'HighlightAll=true');
 
---Check if headline fragments work 
+--Check if headline fragments work
 SELECT ts_headline('english', '
 Day after day, day after day,
   We stuck, nor breath nor motion,
@@ -298,6 +345,8 @@ SELECT COUNT(*) FROM test_tsquery WHERE keyword >  'new & york';
 RESET enable_seqscan;
 
 SELECT ts_rewrite('foo & bar & qq & new & york',  'new & york'::tsquery, 'big & apple | nyc | new & york & city');
+SELECT ts_rewrite(ts_rewrite('new & !york ', 'york', '!jersey'),
+                  'jersey', 'mexico');
 
 SELECT ts_rewrite('moscow', 'SELECT keyword, sample FROM test_tsquery'::text );
 SELECT ts_rewrite('moscow & hotel', 'SELECT keyword, sample FROM test_tsquery'::text );
@@ -307,6 +356,9 @@ SELECT ts_rewrite( 'moscow', 'SELECT keyword, sample FROM test_tsquery');
 SELECT ts_rewrite( 'moscow & hotel', 'SELECT keyword, sample FROM test_tsquery');
 SELECT ts_rewrite( 'bar & new & qq & foo & york', 'SELECT keyword, sample FROM test_tsquery');
 
+-- Check empty substitution
+SELECT ts_rewrite(to_tsquery('5 & (6 | 5)'), to_tsquery('5'), to_tsquery(''));
+SELECT ts_rewrite(to_tsquery('!5'), to_tsquery('5'), to_tsquery(''));
 
 SELECT keyword FROM test_tsquery WHERE keyword @> 'new';
 SELECT keyword FROM test_tsquery WHERE keyword @> 'moscow';
@@ -368,3 +420,6 @@ SELECT count(*) FROM test_tsvector WHERE a @@ to_tsquery('345&qwerty');
 INSERT INTO test_tsvector (t) VALUES ('345 qwerty');
 
 SELECT count(*) FROM test_tsvector WHERE a @@ to_tsquery('345&qwerty');
+
+COPY test_tsvector TO '/tmp/test_tsvector.txt';
+COPY test_tsvector FROM '/tmp/test_tsvector.txt';

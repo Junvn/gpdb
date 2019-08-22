@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/reindex.sgml,v 1.38 2008/11/14 10:22:47 petere Exp $
+doc/src/sgml/ref/reindex.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-REINDEX">
+ <indexterm zone="sql-reindex">
+  <primary>REINDEX</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-REINDEX-TITLE">REINDEX</refentrytitle>
+  <refentrytitle>REINDEX</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -14,10 +18,6 @@ PostgreSQL documentation
   <refname>REINDEX</refname>
   <refpurpose>rebuild indexes</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-reindex">
-  <primary>REINDEX</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -46,7 +46,7 @@ REINDEX { INDEX | TABLE | DATABASE | SYSTEM } <replaceable class="PARAMETER">nam
 
     <listitem>
      <para>
-      An index has become <quote>bloated</>, that it is contains many
+      An index has become <quote>bloated</>, that is it contains many
       empty or nearly-empty pages.  This can occur with B-tree indexes in
       <productname>PostgreSQL</productname> under certain uncommon access
       patterns. <command>REINDEX</command> provides a way to reduce
@@ -74,10 +74,9 @@ REINDEX { INDEX | TABLE | DATABASE | SYSTEM } <replaceable class="PARAMETER">nam
      </para>
     </listitem>
 
-   </itemizedlist>
-  </para>
+   </itemizedlist></para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -106,9 +105,9 @@ REINDEX { INDEX | TABLE | DATABASE | SYSTEM } <replaceable class="PARAMETER">nam
     <listitem>
      <para>
       Recreate all indexes within the current database.
-      Indexes on shared system catalogs are skipped except in stand-alone mode
-      (see below). This form of <command>REINDEX</command> cannot be executed 
-      inside a transaction block.
+      Indexes on shared system catalogs are also processed.
+      This form of <command>REINDEX</command> cannot be executed inside a
+      transaction block.
      </para>
     </listitem>
    </varlistentry>
@@ -118,8 +117,8 @@ REINDEX { INDEX | TABLE | DATABASE | SYSTEM } <replaceable class="PARAMETER">nam
     <listitem>
      <para>
       Recreate all indexes on system catalogs within the current database.
-      Indexes on user tables are not processed.  Also, indexes on shared
-      system catalogs are skipped except in stand-alone mode (see below).
+      Indexes on shared system catalogs are included.
+      Indexes on user tables are not processed.
       This form of <command>REINDEX</command> cannot be executed inside a
       transaction block.
      </para>
@@ -134,7 +133,7 @@ REINDEX { INDEX | TABLE | DATABASE | SYSTEM } <replaceable class="PARAMETER">nam
       reindexed.  Index and table names can be schema-qualified.
       Presently, <command>REINDEX DATABASE</> and <command>REINDEX SYSTEM</>
       can only reindex the current database, so their parameter must match
-      the current database's name. 
+      the current database's name.
      </para>
     </listitem>
    </varlistentry>
@@ -156,7 +155,7 @@ REINDEX { INDEX | TABLE | DATABASE | SYSTEM } <replaceable class="PARAMETER">nam
   <para>
    If you suspect corruption of an index on a user table, you can
    simply rebuild that index, or all indexes on the table, using
-   <command>REINDEX INDEX</command> or <command>REINDEX TABLE</command>.  
+   <command>REINDEX INDEX</command> or <command>REINDEX TABLE</command>.
   </para>
 
   <para>
@@ -198,37 +197,13 @@ REINDEX { INDEX | TABLE | DATABASE | SYSTEM } <replaceable class="PARAMETER">nam
   </para>
 
   <para>
-   If corruption is suspected in the indexes of any of the shared
-   system catalogs (which are <structname>pg_authid</structname>,
-   <structname>pg_auth_members</structname>,
-   <structname>pg_database</structname>,
-   <structname>pg_pltemplate</structname>,
-   <structname>pg_shdepend</structname>,
-   <structname>pg_shdescription</structname>, and
-   <structname>pg_tablespace</structname>), then a standalone server
-   must be used to repair it.  <command>REINDEX</> will not process
-   shared catalogs in multiuser mode.
-  </para>
-
-  <para>
-   For all indexes except the shared system catalogs, <command>REINDEX</>
-   is crash-safe and transaction-safe.  <command>REINDEX</> is not
-   crash-safe for shared indexes, which is why this case is disallowed
-   during normal operation.  If a failure occurs while reindexing one
-   of these catalogs in standalone mode, it will not be possible to
-   restart the regular server until the problem is rectified.  (The
-   typical symptom of a partially rebuilt shared index is <quote>index is not
-   a btree</> errors.)
-  </para>
-
-  <para>
    <command>REINDEX</command> is similar to a drop and recreate of the index
    in that the index contents are rebuilt from scratch.  However, the locking
    considerations are rather different.  <command>REINDEX</> locks out writes
    but not reads of the index's parent table.  It also takes an exclusive lock
    on the specific index being processed, which will block reads that attempt
    to use that index.  In contrast, <command>DROP INDEX</> momentarily takes
-   exclusive lock on the parent table, blocking both writes and reads.  The
+   an exclusive lock on the parent table, blocking both writes and reads.  The
    subsequent <command>CREATE INDEX</> locks out writes but not reads; since
    the index is not there, no read will attempt to use it, meaning that there
    will be no blocking but reads might be forced into expensive sequential
@@ -243,19 +218,6 @@ REINDEX { INDEX | TABLE | DATABASE | SYSTEM } <replaceable class="PARAMETER">nam
    reindex anything.
   </para>
 
-  <para>
-   Prior to <productname>PostgreSQL</productname> 8.1, <command>REINDEX
-   DATABASE</> processed only system indexes, not all indexes as one would
-   expect from the name.  This has been changed to reduce the surprise
-   factor.  The old behavior is available as <command>REINDEX SYSTEM</>.
-  </para>
-
-  <para>
-   Prior to <productname>PostgreSQL</productname> 7.4, <command>REINDEX
-   TABLE</> did not automatically process TOAST tables, and so those had
-   to be reindexed by separate commands.  This is still possible, but
-   redundant.
-  </para>
  </refsect1>
 
  <refsect1>
@@ -287,10 +249,9 @@ $ <userinput>psql broken_db</userinput>
 ...
 broken_db=&gt; REINDEX DATABASE broken_db;
 broken_db=&gt; \q
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 

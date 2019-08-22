@@ -337,7 +337,6 @@ select c1 from t1 where not c1 >=all (select c2 from t2 where c2 = c1);
 
 --
 --q38
--- GPDB_90_MERGE_FIXME: We should generate c2 IS NOT NULL derived filter.
 --
 explain select c1 from t1 where not exists (select c2 from t2 where c2 = c1);
 select c1 from t1 where not exists (select c2 from t2 where c2 = c1);
@@ -376,6 +375,19 @@ select c1 from t1 where c1 not in (select c2 from t2 where c2 > 4) and c1 is not
 --q44
 --
 select c1 from t1 where c1 not in (select c2 from t2 where c2 > 4) and c1 > 2;
+
+-- Test if the equality operator is implemented by a SQL function
+--
+--q45
+--
+create domain absint as int4;
+create function iszero(absint) returns bool as $$ begin return $1::int4 = 0; end; $$ language plpgsql immutable strict;
+create or replace function abseq (absint, absint) returns bool as $$ select iszero(abs($1) - abs($2)); $$ language sql immutable strict;
+create operator = (PROCEDURE = abseq, leftarg=absint, rightarg=absint);
+explain select c1 from t1 where c1::absint not in
+	(select c1n::absint from t1n);
+select c1 from t1 where c1::absint not in
+	(select c1n::absint from t1n);
 
 reset search_path;
 drop schema notin cascade;

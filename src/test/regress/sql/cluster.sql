@@ -176,7 +176,7 @@ UPDATE clustertest SET key = 100 WHERE key = 10;
 -- Test update where the new row version is found first in the scan
 UPDATE clustertest SET key = 35 WHERE key = 40;
 
--- Test longer update chain 
+-- Test longer update chain
 UPDATE clustertest SET key = 60 WHERE key = 50;
 UPDATE clustertest SET key = 70 WHERE key = 60;
 UPDATE clustertest SET key = 80 WHERE key = 70;
@@ -188,6 +188,13 @@ SELECT key FROM clustertest;
 COMMIT;
 
 SELECT key FROM clustertest;
+
+-- check that temp tables can be clustered
+create temp table clstr_temp (col1 int primary key, col2 text);
+insert into clstr_temp values (2, 'two'), (1, 'one');
+cluster clstr_temp using clstr_temp_pkey;
+select * from clstr_temp;
+drop table clstr_temp;
 
 -- clean up
 \c -

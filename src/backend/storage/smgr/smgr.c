@@ -8,63 +8,53 @@
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/storage/smgr/smgr.c,v 1.114 2008/11/19 10:34:52 heikki Exp $
+ *	  src/backend/storage/smgr/smgr.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "access/persistentfilesysobjname.h"
 #include "access/xact.h"
-#include "access/xlogmm.h"
 #include "access/xlogutils.h"
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
-#include "cdb/cdbpersistentfilespace.h"
-#include "cdb/cdbpersistenttablespace.h"
-#include "cdb/cdbpersistentdatabase.h"
-#include "cdb/cdbpersistentrelation.h"
 #include "commands/tablespace.h"
 #include "postmaster/postmaster.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/smgr.h"
-#include "storage/smgr_ao.h"
 #include "utils/faultinjector.h"
 #include "utils/hsearch.h"
-#include "utils/memutils.h"
+#include "utils/inval.h"
+
+/*
+ * Hook for plugins to collect statistics from storage functions
+ * For example, disk quota extension will use these hooks to
+ * detect active tables.
+ */
+file_create_hook_type file_create_hook = NULL;
+file_extend_hook_type file_extend_hook = NULL;
+file_truncate_hook_type file_truncate_hook = NULL;
+file_unlink_hook_type file_unlink_hook = NULL;
 
 /*
  * Each backend has a hashtable that stores all extant SMgrRelation objects.
+ * In addition, "unowned" SMgrRelation objects are chained together in a list.
  */
 static HTAB *SMgrRelationHash = NULL;
 
+static SMgrRelation first_unowned_reln = NULL;
+
 /* local function prototypes */
 static void smgrshutdown(int code, Datum arg);
+static void add_to_unowned_list(SMgrRelation reln);
+static void remove_from_unowned_list(SMgrRelation reln);
 
-char *
-StorageManagerMirrorMode_Name(StorageManagerMirrorMode mirrorMode)
-{
-	switch (mirrorMode)
-	{
-		case StorageManagerMirrorMode_None:
-			return "None";
-		case StorageManagerMirrorMode_PrimaryOnly:
-			return "Primary Only";
-		case StorageManagerMirrorMode_MirrorOnly:
-			return "Mirror Only";
-		case StorageManagerMirrorMode_Both:
-			return "Both";
-
-		default:
-			return "Unknown";
-	}
-}
 
 /*
  *	smgrinit(), smgrshutdown() -- Initialize or shut down storage
@@ -94,13 +84,17 @@ smgrshutdown(int code, Datum arg)
 /*
  *	smgropen() -- Return an SMgrRelation object, creating it if need be.
  *
- *		This does not attempt to actually open the object.
+ *		This does not attempt to actually open the underlying file.
  */
 SMgrRelation
-smgropen(RelFileNode rnode)
+smgropen(RelFileNode rnode, BackendId backend)
 {
+	RelFileNodeBackend brnode;
 	SMgrRelation reln;
 	bool		found;
+
+	/* GPDB: don't support MyBackendId as a possible backend. */
+	Assert(backend == InvalidBackendId || backend == TempRelBackendId);
 
 	if (SMgrRelationHash == NULL)
 	{
@@ -108,30 +102,39 @@ smgropen(RelFileNode rnode)
 		HASHCTL		ctl;
 
 		MemSet(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(RelFileNode);
+		ctl.keysize = sizeof(RelFileNodeBackend);
 		ctl.entrysize = sizeof(SMgrRelationData);
 		ctl.hash = tag_hash;
 		SMgrRelationHash = hash_create("smgr relation table", 400,
 									   &ctl, HASH_ELEM | HASH_FUNCTION);
+		first_unowned_reln = NULL;
 	}
 
 	/* Look up or create an entry */
+	brnode.node = rnode;
+	brnode.backend = backend;
 	reln = (SMgrRelation) hash_search(SMgrRelationHash,
-									  (void *) &rnode,
+									  (void *) &brnode,
 									  HASH_ENTER, &found);
 
 	/* Initialize it if not present before */
 	if (!found)
 	{
-		int forknum;
+		int			forknum;
 
 		/* hash_search already filled in the lookup key */
 		reln->smgr_owner = NULL;
+		reln->smgr_targblock = InvalidBlockNumber;
+		reln->smgr_fsm_nblocks = InvalidBlockNumber;
+		reln->smgr_vm_nblocks = InvalidBlockNumber;
 		reln->smgr_which = 0;	/* we only have md.c at present */
 
 		/* mark it not open */
-		for(forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 			reln->md_fd[forknum] = NULL;
+
+		/* it has no owner yet */
+		add_to_unowned_list(reln);
 	}
 
 	return reln;
@@ -146,18 +149,92 @@ smgropen(RelFileNode rnode)
 void
 smgrsetowner(SMgrRelation *owner, SMgrRelation reln)
 {
+	/* We don't support "disowning" an SMgrRelation here, use smgrclearowner */
+	Assert(owner != NULL);
+
 	/*
 	 * First, unhook any old owner.  (Normally there shouldn't be any, but it
 	 * seems possible that this can happen during swap_relation_files()
 	 * depending on the order of processing.  It's ok to close the old
 	 * relcache entry early in that case.)
+	 *
+	 * If there isn't an old owner, then the reln should be in the unowned
+	 * list, and we need to remove it.
 	 */
 	if (reln->smgr_owner)
 		*(reln->smgr_owner) = NULL;
+	else
+		remove_from_unowned_list(reln);
 
 	/* Now establish the ownership relationship. */
 	reln->smgr_owner = owner;
 	*owner = reln;
+}
+
+/*
+ * smgrclearowner() -- Remove long-lived reference to an SMgrRelation object
+ *					   if one exists
+ */
+void
+smgrclearowner(SMgrRelation *owner, SMgrRelation reln)
+{
+	/* Do nothing if the SMgrRelation object is not owned by the owner */
+	if (reln->smgr_owner != owner)
+		return;
+
+	/* unset the owner's reference */
+	*owner = NULL;
+
+	/* unset our reference to the owner */
+	reln->smgr_owner = NULL;
+
+	add_to_unowned_list(reln);
+}
+
+/*
+ * add_to_unowned_list -- link an SMgrRelation onto the unowned list
+ *
+ * Check remove_from_unowned_list()'s comments for performance
+ * considerations.
+ */
+static void
+add_to_unowned_list(SMgrRelation reln)
+{
+	/* place it at head of the list (to make smgrsetowner cheap) */
+	reln->next_unowned_reln = first_unowned_reln;
+	first_unowned_reln = reln;
+}
+
+/*
+ * remove_from_unowned_list -- unlink an SMgrRelation from the unowned list
+ *
+ * If the reln is not present in the list, nothing happens.  Typically this
+ * would be caller error, but there seems no reason to throw an error.
+ *
+ * In the worst case this could be rather slow; but in all the cases that seem
+ * likely to be performance-critical, the reln being sought will actually be
+ * first in the list.  Furthermore, the number of unowned relns touched in any
+ * one transaction shouldn't be all that high typically.  So it doesn't seem
+ * worth expending the additional space and management logic needed for a
+ * doubly-linked list.
+ */
+static void
+remove_from_unowned_list(SMgrRelation reln)
+{
+	SMgrRelation *link;
+	SMgrRelation cur;
+
+	for (link = &first_unowned_reln, cur = *link;
+		 cur != NULL;
+		 link = &cur->next_unowned_reln, cur = *link)
+	{
+		if (cur == reln)
+		{
+			*link = cur->next_unowned_reln;
+			cur->next_unowned_reln = NULL;
+			break;
+		}
+	}
 }
 
 /*
@@ -176,12 +253,15 @@ void
 smgrclose(SMgrRelation reln)
 {
 	SMgrRelation *owner;
-	ForkNumber forknum;
+	ForkNumber	forknum;
 
 	for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 		mdclose(reln, forknum);
 
 	owner = reln->smgr_owner;
+
+	if (!owner)
+		remove_from_unowned_list(reln);
 
 	if (hash_search(SMgrRelationHash,
 					(void *) &(reln->smgr_rnode),
@@ -224,7 +304,7 @@ smgrcloseall(void)
  * such entry exists already.
  */
 void
-smgrclosenode(RelFileNode rnode)
+smgrclosenode(RelFileNodeBackend rnode)
 {
 	SMgrRelation reln;
 
@@ -240,130 +320,6 @@ smgrclosenode(RelFileNode rnode)
 }
 
 /*
- *	smgrcreatefilespacedir() -- Create a new filespace directory.
- */
-void
-smgrcreatefilespacedir(Oid filespaceOid,
-					   char *primaryFilespaceLocation,
-
- /*
-  * The primary filespace directory path.  NOT Blank padded. Just a NULL
-  * terminated string.
-  */
-					   char *mirrorFilespaceLocation,
-					   StorageManagerMirrorMode mirrorMode,
-					   bool ignoreAlreadyExists,
-					   int *primaryError,
-					   bool *mirrorDataLossOccurred)
-{
-	mdcreatefilespacedir(filespaceOid,
-						 primaryFilespaceLocation,
-						 mirrorFilespaceLocation,
-						 mirrorMode,
-						 ignoreAlreadyExists,
-						 primaryError,
-						 mirrorDataLossOccurred);
-}
-
-/*
- *	smgrcreatetablespacedir() -- Create a new tablespace directory.
- *
- */
-void
-smgrcreatetablespacedir(Oid tablespaceOid,
-						StorageManagerMirrorMode mirrorMode,
-						bool ignoreAlreadyExists,
-						int *primaryError,
-						bool *mirrorDataLossOccurred)
-{
-	mdcreatetablespacedir(tablespaceOid,
-						  mirrorMode,
-						  ignoreAlreadyExists,
-						  primaryError,
-						  mirrorDataLossOccurred);
-}
-
-/*
- *	smgrcreatedbdir() -- Create a new database directory.
- */
-void
-smgrcreatedbdir(DbDirNode *dbDirNode,
-				StorageManagerMirrorMode mirrorMode,
-				bool ignoreAlreadyExists,
-				int *primaryError,
-				bool *mirrorDataLossOccurred)
-{
-	mdcreatedbdir(dbDirNode,
-				  mirrorMode,
-				  ignoreAlreadyExists,
-				  primaryError,
-				  mirrorDataLossOccurred);
-}
-
-void
-smgrcreatedbdirjustintime(DbDirNode *justInTimeDbDirNode,
-						  MirroredObjectExistenceState mirrorExistenceState,
-						  StorageManagerMirrorMode mirrorMode,
-						  ItemPointer persistentTid,
-						  int64 *persistentSerialNum,
-						  int *primaryError,
-						  bool *mirrorDataLossOccurred)
-{
-	PersistentDatabase_MarkJustInTimeCreatePending(justInTimeDbDirNode,
-												   mirrorExistenceState,
-												   persistentTid,
-												   persistentSerialNum);
-
-	mdcreatedbdir(justInTimeDbDirNode,
-				  mirrorMode,
-				  /* ignoreAlreadyExists */ true,
-				  primaryError,
-				  mirrorDataLossOccurred);
-	if (*primaryError != 0)
-	{
-		PersistentDatabase_AbandonJustInTimeCreatePending(justInTimeDbDirNode,
-														  persistentTid,
-														  *persistentSerialNum);
-		return;
-	}
-
-	PersistentDatabase_JustInTimeCreated(justInTimeDbDirNode,
-										 persistentTid,
-										 *persistentSerialNum);
-
-	/* be sure to set PG_VERSION file for just in time dirs too */
-	set_short_version(NULL, justInTimeDbDirNode, true);
-}
-
-/*
- *	smgrcreate() -- Create a new relation.
- *
- *		Given an already-created (but presumably unused) SMgrRelation,
- *		cause the underlying disk file or other storage for the fork
- *		to be created.
- *
- *		We assume the persistent 'Create Pending' work has already been done.
- *
- *		And, we assume the Just-In-Time database directory in the tablespace has already
- *		been created.
- */
-void
-smgrmirroredcreate(SMgrRelation reln,
-				   char *relationName, /* For tracing only.  Can be NULL in some execution paths. */
-				   MirrorDataLossTrackingState mirrorDataLossTrackingState,
-				   int64 mirrorDataLossTrackingSessionNum,
-				   bool ignoreAlreadyExists,
-				   bool *mirrorDataLossOccurred) /* FIXME: is this arg still needed? */
-{
-	mdmirroredcreate(reln,
-					 relationName,
-					 mirrorDataLossTrackingState,
-					 mirrorDataLossTrackingSessionNum,
-					 ignoreAlreadyExists,
-					 mirrorDataLossOccurred);
-}
-
-/*
  *	smgrcreate() -- Create a new relation.
  *
  *		Given an already-created (but presumably unused) SMgrRelation,
@@ -372,55 +328,82 @@ smgrmirroredcreate(SMgrRelation reln,
  *
  *		If isRedo is true, it is okay for the underlying file to exist
  *		already because we are in a WAL replay sequence.
- *
- *
- * In GPDB, this is currently only used for non-main forks, which are
- * not mirrored. smgrmirroredcreate must be used for the main fork.
  */
 void
 smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
-	/*
-	 * GPDB_84_MERGE_FIXME: the following performance tweak came in from 8.4;
-	 * is it still applicable to our system here?
-	 */
-#if 0
 	/*
 	 * Exit quickly in WAL replay mode if we've already opened the file. If
 	 * it's open, it surely must exist.
 	 */
 	if (isRedo && reln->md_fd[forknum] != NULL)
 		return;
-#endif
+
+	/*
+	 * We may be using the target table space for the first time in this
+	 * database, so create a per-database subdirectory if needed.
+	 *
+	 * XXX this is a fairly ugly violation of module layering, but this seems
+	 * to be the best place to put the check.  Maybe TablespaceCreateDbspace
+	 * should be here and not in commands/tablespace.c?  But that would imply
+	 * importing a lot of stuff that smgr.c oughtn't know, either.
+	 */
+	TablespaceCreateDbspace(reln->smgr_rnode.node.spcNode,
+							reln->smgr_rnode.node.dbNode,
+							isRedo);
 
 	mdcreate(reln, forknum, isRedo);
+
+	if (file_create_hook)
+		(*file_create_hook)(reln->smgr_rnode);
 }
 
+/*
+ *		smgrcreate_ao() -- Create a new AO relation segment.
+ *		Given a RelFileNode, cause the underlying disk file for the
+ *		AO segment to be created.
+ *
+ *		If isRedo is true, it is okay for the underlying file to exist
+ *		already because we are in a WAL replay sequence.
+ */
+void
+smgrcreate_ao(RelFileNodeBackend rnode, int32 segmentFileNum, bool isRedo)
+{
+	mdcreate_ao(rnode, segmentFileNum, isRedo);
+	if (file_create_hook)
+		(*file_create_hook)(rnode);
+}
 
 /*
- *	smgrdounlink() -- Immediately unlink a relation.
+ *	smgrdounlink() -- Immediately unlink all forks of a relation.
  *
- *		The specified fork of the relation is removed from the store.  This
- *		should not be used during transactional operations, since it can't be
- *		undone.
+ *		All forks of the relation are removed from the store.  This should
+ *		not be used during transactional operations, since it can't be undone.
  *
- *		If isRedo is true, it is okay for the underlying file to be gone
+ *		If isRedo is true, it is okay for the underlying file(s) to be gone
  *		already.
  */
 void
-smgrdomirroredunlink(RelFileNode *relFileNode,
-	bool isLocalBuf,
-	char *relationName, /* For tracing only.  Can be NULL in some execution paths. */
-	bool primaryOnly,
-	bool isRedo,
-	bool ignoreNonExistence,
-	bool *mirrorDataLossOccurred)
+smgrdounlink(SMgrRelation reln, bool isRedo, char relstorage)
 {
+	RelFileNodeBackend rnode = reln->smgr_rnode;
+	ForkNumber	forknum;
+
+	/* Close the forks at smgr level */
+	for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		mdclose(reln, forknum);
+
 	/*
 	 * Get rid of any remaining buffers for the relation.  bufmgr will just
 	 * drop them without bothering to write the contents.
+	 *
+	 * Apart from relstorage == RELSTORAGE_HEAP do any other RELSTOARGE type
+	 * expected to have buffers in shared memory ? Can check only for
+	 * RELSTORAGE_HEAP below.
 	 */
-	DropRelFileNodeBuffers(*relFileNode, MAIN_FORKNUM, isLocalBuf, 0);
+	if ((relstorage != RELSTORAGE_AOROWS) &&
+		(relstorage != RELSTORAGE_AOCOLS))
+		DropRelFileNodesAllBuffers(&rnode, 1);
 
 	/*
 	 * It'd be nice to tell the stats collector to forget it immediately, too.
@@ -430,122 +413,115 @@ smgrdomirroredunlink(RelFileNode *relFileNode,
 	 */
 
 	/*
-	 * And delete the physical files.
+	 * Send a shared-inval message to force other backends to close any
+	 * dangling smgr references they may have for this rel.  We should do this
+	 * before starting the actual unlinking, in case we fail partway through
+	 * that step.  Note that the sinval message will eventually come back to
+	 * this backend, too, and thereby provide a backstop that we closed our
+	 * own smgr rel.
+	 */
+	CacheInvalidateSmgr(rnode);
+
+	/*
+	 * Delete the physical file(s).
 	 *
 	 * Note: smgr_unlink must treat deletion failure as a WARNING, not an
 	 * ERROR, because we've already decided to commit or abort the current
 	 * xact.
 	 */
-	mdmirroredunlink(*relFileNode,
-					 relationName,
-					 primaryOnly,
-					 isRedo,
-					 ignoreNonExistence,
-					 mirrorDataLossOccurred);
-}
-
-void
-smgrdounlink(SMgrRelation reln, ForkNumber forknum, bool isTemp, bool isRedo)
-{
-	RelFileNode rnode = reln->smgr_rnode;
-
-	/* Close the fork */
-	mdclose(reln, forknum);
-
-	DropRelFileNodeBuffers(rnode, forknum, isTemp, 0);
-
-	mdunlink(rnode, forknum, isRedo);
-}
-
-void
-smgrdormfilespacedir(Oid filespaceOid,
-					 char *primaryFilespaceLocation,
-
- /*
-  * The primary filespace directory path.  NOT Blank padded. Just a NULL
-  * terminated string.
-  */
-					 char *mirrorFilespaceLocation,
-					 bool primaryOnly,
-					 bool mirrorOnly,
-					 bool ignoreNonExistence,
-					 bool *mirrorDataLossOccurred)
-{
-	/*
-	 * And remove the physical filespace directory.
-	 *
-	 * Note: we treat deletion failure as a WARNING, not an error, because
-	 * we've already decided to commit or abort the current xact.
-	 */
-	if (!mdrmfilespacedir(filespaceOid,
-						  primaryFilespaceLocation,
-						  mirrorFilespaceLocation,
-						  primaryOnly,
-						  mirrorOnly,
-						  ignoreNonExistence,
-						  mirrorDataLossOccurred))
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not remove filespace directory %u: %m",
-						filespaceOid)));
-}
-
-void
-smgrdormtablespacedir(Oid tablespaceOid,
-					  bool primaryOnly,
-					  bool mirrorOnly,
-					  bool ignoreNonExistence,
-					  bool *mirrorDataLossOccurred)
-{
-	/*
-	 * And remove the physical tablespace directory.
-	 *
-	 * Note: we treat deletion failure as a WARNING, not an error, because
-	 * we've already decided to commit or abort the current xact.
-	 */
-	if (!mdrmtablespacedir(tablespaceOid, primaryOnly, mirrorOnly, ignoreNonExistence, mirrorDataLossOccurred))
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not remove tablespace directory %u: %m",
-						tablespaceOid)));
+	for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		mdunlink(rnode, forknum, isRedo, relstorage);
 }
 
 /*
- * Shared subroutine that actually does the rmdir of a database directory ...
+ *	smgrdounlinkall() -- Immediately unlink all forks of all given relations
+ *
+ *		All forks of all given relations are removed from the store.  This
+ *		should not be used during transactional operations, since it can't be
+ *		undone.
+ *
+ *		If isRedo is true, it is okay for the underlying file(s) to be gone
+ *		already.
+ *
+ *		This is equivalent to calling smgrdounlink for each relation, but it's
+ *		significantly quicker so should be preferred when possible.
+ *
+ * 'relstorages' is an array of pg_class.relstorage fields. It must have the
+ * same size as 'rels'.
  */
-static void
-smgr_internal_rmdbdir(DbDirNode *dbDirNode,
-					  bool primaryOnly,
-					  bool mirrorOnly,
-					  bool ignoreNonExistence,
-					  bool *mirrorDataLossOccurred)
-{
-	/*
-	 * And remove the physical database directory.
-	 *
-	 * Note: we treat deletion failure as a WARNING, not an error, because
-	 * we've already decided to commit or abort the current xact.
-	 */
-	if (!mdrmdbdir(dbDirNode, primaryOnly, mirrorOnly, ignoreNonExistence, mirrorDataLossOccurred))
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not remove database directory %u/%u: %m",
-						dbDirNode->tablespace,
-						dbDirNode->database)));
-}
-
 void
-smgrdormdbdir(DbDirNode *dbDirNode,
-			  bool primaryOnly,
-			  bool mirrorOnly,
-			  bool ignoreNonExistence,
-			  bool *mirrorDataLossOccurred)
+smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo, char *relstorages)
 {
-	smgr_internal_rmdbdir(dbDirNode,
-						  primaryOnly,
-						  mirrorOnly,
-						  ignoreNonExistence,
-						  mirrorDataLossOccurred);
+	int			i = 0;
+	RelFileNodeBackend *rnodes;
+	ForkNumber	forknum;
+	bool		has_heaps = false;
+
+	if (nrels == 0)
+		return;
+
+	/*
+	 * create an array which contains all relations to be dropped, and close
+	 * each relation's forks at the smgr level while at it
+	 */
+	rnodes = palloc(sizeof(RelFileNodeBackend) * nrels);
+	for (i = 0; i < nrels; i++)
+	{
+		RelFileNodeBackend rnode = rels[i]->smgr_rnode;
+
+		rnodes[i] = rnode;
+
+		/* Close the forks at smgr level */
+		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+			mdclose(rels[i], forknum);
+
+		if ((relstorages[i] != RELSTORAGE_AOROWS) &&
+			(relstorages[i] != RELSTORAGE_AOCOLS))
+			has_heaps = true;
+	}
+
+	/*
+	 * Get rid of any remaining buffers for the relations.  bufmgr will just
+	 * drop them without bothering to write the contents.
+	 */
+	if (has_heaps)
+		DropRelFileNodesAllBuffers(rnodes, nrels);
+
+	/*
+	 * It'd be nice to tell the stats collector to forget them immediately,
+	 * too. But we can't because we don't know the OIDs.
+	 */
+
+	/*
+	 * Send a shared-inval message to force other backends to close any
+	 * dangling smgr references they may have for these rels.  We should do
+	 * this before starting the actual unlinking, in case we fail partway
+	 * through that step.  Note that the sinval messages will eventually come
+	 * back to this backend, too, and thereby provide a backstop that we
+	 * closed our own smgr rel.
+	 */
+	for (i = 0; i < nrels; i++)
+		CacheInvalidateSmgr(rnodes[i]);
+
+	/*
+	 * Delete the physical file(s).
+	 *
+	 * Note: smgr_unlink must treat deletion failure as a WARNING, not an
+	 * ERROR, because we've already decided to commit or abort the current
+	 * xact.
+	 */
+
+	for (i = 0; i < nrels; i++)
+	{
+		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+			mdunlink(rnodes[i], forknum, isRedo, relstorages[i]);
+	}
+
+	if (file_unlink_hook)
+		for (i = 0; i < nrels; i++)
+			(*file_unlink_hook)(rnodes[i]);
+
+	pfree(rnodes);
 }
 
 /*
@@ -559,10 +535,21 @@ smgrdormdbdir(DbDirNode *dbDirNode,
  *		failure we clean up by truncating.
  */
 void
-smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, 
-		   char *buffer, bool isTemp)
+smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+		   char *buffer, bool skipFsync)
 {
-	mdextend(reln, forknum, blocknum, buffer, isTemp);
+	mdextend(reln, forknum, blocknum, buffer, skipFsync);
+	if (file_extend_hook)
+		(*file_extend_hook)(reln->smgr_rnode);
+}
+
+/*
+ *	smgrprefetch() -- Initiate asynchronous read of the specified block of a relation.
+ */
+void
+smgrprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+{
+	mdprefetch(reln, forknum, blocknum);
 }
 
 /*
@@ -574,7 +561,7 @@ smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  *		return pages in the format that POSTGRES expects.
  */
 void
-smgrread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, 
+smgrread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		 char *buffer)
 {
 	mdread(reln, forknum, blocknum, buffer);
@@ -591,15 +578,15 @@ smgrread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  *		on disk at return, only dumped out to the kernel.  However,
  *		provisions will be made to fsync the write before the next checkpoint.
  *
- *		isTemp indicates that the relation is a temp table (ie, is managed
- *		by the local-buffer manager).  In this case no provisions need be
- *		made to fsync the write before checkpointing.
+ *		skipFsync indicates that the caller will make other provisions to
+ *		fsync the relation, so we needn't bother.  Temporary relations also
+ *		do not require fsync.
  */
 void
-smgrwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, 
-		  char *buffer, bool isTemp)
+smgrwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+		  char *buffer, bool skipFsync)
 {
-		mdwrite(reln, forknum, blocknum, buffer, isTemp);
+	mdwrite(reln, forknum, blocknum, buffer, skipFsync);
 }
 
 /*
@@ -615,20 +602,37 @@ smgrnblocks(SMgrRelation reln, ForkNumber forknum)
 /*
  *	smgrtruncate() -- Truncate supplied relation to the specified number
  *					  of blocks
+ *
+ * The truncation is done immediately, so this can't be rolled back.
  */
 void
-smgrtruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks,
-			 bool isTemp)
+smgrtruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 {
 	/*
 	 * Get rid of any buffers for the about-to-be-deleted blocks. bufmgr will
 	 * just drop them without bothering to write the contents.
 	 */
-	DropRelFileNodeBuffers(reln->smgr_rnode, forknum, isTemp, nblocks);
+	DropRelFileNodeBuffers(reln->smgr_rnode, forknum, nblocks);
 
-	/* Do the truncation */
-	// GPDB_84_MERGE_FIXME: is allowedNotFound = false correct here?
-	mdtruncate(reln, forknum, nblocks, isTemp, false /* allowedNotFound */);
+	/*
+	 * Send a shared-inval message to force other backends to close any smgr
+	 * references they may have for this rel.  This is useful because they
+	 * might have open file pointers to segments that got removed, and/or
+	 * smgr_targblock variables pointing past the new rel end.  (The inval
+	 * message will come back to our backend, too, causing a
+	 * probably-unnecessary local smgr flush.  But we don't expect that this
+	 * is a performance-critical path.)  As in the unlink code, we want to be
+	 * sure the message is sent before we start changing things on-disk.
+	 */
+	CacheInvalidateSmgr(reln->smgr_rnode);
+
+	/*
+	 * Do the truncation.
+	 */
+	mdtruncate(reln, forknum, nblocks);
+
+	if (file_truncate_hook)
+		(*file_truncate_hook)(reln->smgr_rnode);
 }
 
 /*
@@ -647,7 +651,7 @@ smgrtruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks,
  *		to use the WAL log for PITR or replication purposes: in that case
  *		we have to make WAL entries as well.)
  *
- *		The preceding writes should specify isTemp = true to avoid
+ *		The preceding writes should specify skipFsync = true to avoid
  *		duplicative fsyncs.
  *
  *		Note that you need to do FlushRelationBuffers() first if there is
@@ -660,6 +664,7 @@ smgrimmedsync(SMgrRelation reln, ForkNumber forknum)
 	mdimmedsync(reln, forknum);
 }
 
+
 /*
  *	smgrpreckpt() -- Prepare for checkpoint.
  */
@@ -670,7 +675,7 @@ smgrpreckpt(void)
 }
 
 /*
- *     smgrsync() -- Sync files to disk during checkpoint.
+ *	smgrsync() -- Sync files to disk during checkpoint.
  */
 void
 smgrsync(void)
@@ -685,4 +690,30 @@ void
 smgrpostckpt(void)
 {
 	mdpostckpt();
+}
+
+/*
+ * AtEOXact_SMgr
+ *
+ * This routine is called during transaction commit or abort (it doesn't
+ * particularly care which).  All transient SMgrRelation objects are closed.
+ *
+ * We do this as a compromise between wanting transient SMgrRelations to
+ * live awhile (to amortize the costs of blind writes of multiple blocks)
+ * and needing them to not live forever (since we're probably holding open
+ * a kernel file descriptor for the underlying file, and we need to ensure
+ * that gets closed reasonably soon if the file gets deleted).
+ */
+void
+AtEOXact_SMgr(void)
+{
+	/*
+	 * Zap all unowned SMgrRelations.  We rely on smgrclose() to remove each
+	 * one from the list.
+	 */
+	while (first_unowned_reln != NULL)
+	{
+		Assert(first_unowned_reln->smgr_owner == NULL);
+		smgrclose(first_unowned_reln);
+	}
 }

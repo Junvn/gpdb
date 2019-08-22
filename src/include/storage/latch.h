@@ -52,6 +52,22 @@
  * do. Otherwise, if someone sets the latch between the check and the
  * ResetLatch call, you will miss it and Wait will incorrectly block.
  *
+ * Another valid coding pattern looks like:
+ *
+ * for (;;)
+ * {
+ *	   if (work to do)
+ *		   Do Stuff(); // in particular, exit loop if some condition satisfied
+ *	   WaitLatch();
+ *	   ResetLatch();
+ * }
+ *
+ * This is useful to reduce latch traffic if it's expected that the loop's
+ * termination condition will often be satisfied in the first iteration;
+ * the cost is an extra loop iteration before blocking when it is not.
+ * What must be avoided is placing any checks for asynchronous events after
+ * WaitLatch and before ResetLatch, as that creates a race condition.
+ *
  * To wake up the waiter, you must first set a global flag or something
  * else that the wait loop tests in the "if (work to do)" part, and call
  * SetLatch *after* that. SetLatch is designed to return quickly if the
@@ -75,7 +91,7 @@
  * use of any generic handler.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/latch.h

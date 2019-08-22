@@ -11,7 +11,7 @@ NOTICE:  table "exttabtest_options_r" does not exist, skipping
     EXCEPT ALL
     SELECT * FROM exttabtest;
 ERROR:  This is greenplum. (gpextprotocol.c:54)
-DETAIL:  External table exttabtest_options_r, file demoprot://exttabtest.txt
+CONTEXT:  External table exttabtest_options_r, file demoprot://exttabtest.txt
     DROP EXTERNAL TABLE IF EXISTS exttabtest_w;
 NOTICE:  table "exttabtest_w" does not exist, skipping
     CREATE WRITABLE EXTERNAL TABLE exttabtest_w(like exttabtest)
@@ -28,7 +28,7 @@ NOTICE:  table "exttabtest_r" does not exist, skipping
     select urilocation,fmttype,fmtopts,encoding,writable from pg_exttable 
     where reloid='exttabtest_r'::regclass 
        or reloid='exttabtest_w'::regclass;
-         urilocation         | fmttype |                fmtopts                 | encoding | writable
+         urilocation         | fmttype |                fmtopts                 | encoding | writable 
 -----------------------------+---------+----------------------------------------+----------+----------
  {demoprot://exttabtest.txt} | t       | delimiter '     ' null '\N' escape '\' |        6 | t
  {demoprot://exttabtest.txt} | t       | delimiter '     ' null '\N' escape '\' |        6 | f
@@ -168,7 +168,7 @@ NOTICE:  table "exttabtest_w_2url" does not exist, skipping
 ----+------+--------+--------
 (0 rows)
 
-    -- verify data should be evenly distributed
+-- verify data should be evenly distributed
 with t as (
   SELECT gp_segment_id as segid, count(*) as cnt from exttabtest_r_2url group by gp_segment_id
 )
@@ -203,7 +203,7 @@ select max(cnt) - min(cnt)  > 20 from t;
 ----+------+--------+--------
 (0 rows)
 
-    -- verify data should be evenly distributed
+-- verify data should be evenly distributed
 with t as (
   SELECT gp_segment_id as segid, count(*) as cnt from exttabtest_r_2url group by gp_segment_id
 )
@@ -228,7 +228,7 @@ NOTICE:  table "exttabtest_w_5url" does not exist, skipping
     DISTRIBUTED BY (id);
     -- write to WET
     INSERT INTO exttabtest_w_5url (SELECT * FROM exttabtest);
-ERROR:  External table has more URLs than available primary segments that can write into them  (seg0 rh55-qavm55:7532 pid=1235)
+ERROR:  external table has more URLs than available primary segments that can write into them  (seg0 rh55-qavm55:7532 pid=1235)
 -- @skip Skipping this test because of a duplicate key violation error.
 -- Test 9: Negative - duplicte protocol name (check pg_extprotocol)
     SELECT count(*) FROM pg_extprotocol WHERE ptcname='demoprot';
@@ -345,7 +345,7 @@ NOTICE:  table "exttabtest_w_misspath" does not exist, skipping
     insert into exttabtest_w_misspath (select * from exttabletest);
 ERROR:  relation "exttabletest" does not exist
 LINE 1: insert into exttabtest_w_misspath (select * from exttabletes...
-                                                         ^    
+                                                         ^
 -- Test 17: Negative - invalid URL: missing protocol
     CREATE READABLE EXTERNAL TABLE exttabtest_r_missprot(like exttabtest)
         LOCATION('exttabtest.txt') 
@@ -377,12 +377,12 @@ NOTICE:  table "exttabtest_r_20records" does not exist, skipping
     INSERT INTO exttabtest_w_20records (SELECT * FROM exttabtest where id<=20);
     -- read from RET
     SELECT * FROM exttabtest_r_20records order by id;
- id | name  | value1 | value2 
+ id |  name  | value1 | value2 
 ----+--------+--------+--------
-  1 | name1 |      2 |      3
-  2 | name2 |      4 |      6
-  3 | name3 |      6 |      9
-  4 | name4 |      8 |     12
+  1 | name1  |      2 |      3
+  2 | name2  |      4 |      6
+  3 | name3  |      6 |      9
+  4 | name4  |      8 |     12
   5 | name5  |     10 |     15
   6 | name6  |     12 |     18
   7 | name7  |     14 |     21
@@ -401,7 +401,7 @@ NOTICE:  table "exttabtest_r_20records" does not exist, skipping
  20 | name20 |     40 |     60
 (20 rows)
 
-    -- verify data should be evenly distributed
+-- verify data should be evenly distributed
 with t as (
   SELECT gp_segment_id as segid, count(*) as cnt from exttabtest_r_20records group by gp_segment_id
 )
@@ -435,7 +435,7 @@ NOTICE:  table "exttabtest_r_1record" does not exist, skipping
     -- and will cause following SElECT query to fail
     SELECT * FROM exttabtest_r_1record order by id;
 ERROR:  demoprot_import: could not open file "exttabtest_1record.txt" for reading: No such file or directory  (seg0 slice1 rh55-qavm55:7532 pid=23845)
-DETAIL:  External table exttabtest_r_1record, file demoprot://exttabtest_1record.txt
+CONTEXT:  External table exttabtest_r_1record, file demoprot://exttabtest_1record.txt
     -- Drop External Tables
     DROP EXTERNAL TABLE IF EXISTS exttabtest_r_1record;
     DROP EXTERNAL TABLE IF EXISTS exttabtest_w_1record;
@@ -629,7 +629,7 @@ NOTICE:  protocol "demoprot" does not exist, skipping
         writefunc = write_to_file_stable
     );
     -- CREATE PROTOCOL
-     CREATE READABLE EXTERNAL TABLE exttabtest_r(like exttabtest)
+    CREATE READABLE EXTERNAL TABLE exttabtest_r(like exttabtest)
         LOCATION('demoprot://exttabtest.txt') 
     FORMAT 'text';
     CREATE WRITABLE EXTERNAL TABLE exttabtest_w(like exttabtest)
@@ -689,9 +689,9 @@ Type: readable
 Encoding: UTF8
 Format type: text
 Format options: delimiter '	' null '\N' escape '\'
+External options: {}
 External location: demoprot://exttabtest.txt
 Execute on: all segments
-External options: {}
 
     select count(*) from pg_class where relname = 'exttabtest_r_newname';
  count 
@@ -740,10 +740,10 @@ NOTICE:  table "exttabtest_w_invalid" does not exist, skipping
     CREATE WRITABLE EXTERNAL TABLE exttabtest_w_invalid(like exttabtest)
         LOCATION('demoprot://exttabtest_invalid.txt') 
     FORMAT 'text';
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     -- Drop a column (id) from WET
     ALTER EXTERNAL TABLE exttabtest_w_invalid DROP COLUMN id;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
     -- Write to WET 
     INSERT INTO exttabtest_w_invalid (SELECT * from exttabtest);
 ERROR:  INSERT has more expressions than target columns
@@ -821,7 +821,7 @@ DROP FUNCTION formatter_import_todrop();
 -- Note: Only STABLE is supported for formatter, this is enforced
 -- When it is not STABLE (VOLATILE, or IMMUTABLE),
 -- the expected error like:
--- ERROR: formatter function formatter_export_i is not declared STABLE. (seg1 rh55-qavm55:7533 pid=14816)
+-- ERROR: formatter function formatter_export_i is not declared STABLE (seg1 rh55-qavm55:7533 pid=14816)
     -- Create RET and WET using IMMUTABLE functions will succeed
     -- However query such RET or WET should fail
     DROP EXTERNAL TABLE IF EXISTS format_w;
@@ -829,28 +829,28 @@ NOTICE:  table "format_w" does not exist, skipping
     CREATE WRITABLE EXTERNAL TABLE format_w(like formatsource) 
     LOCATION ('demoprot://exttabtest_test63') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_export_i');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_r;
 NOTICE:  table "format_r" does not exist, skipping
     CREATE READABLE EXTERNAL TABLE format_r(like formatsource) 
     LOCATION ('demoprot://exttabtest_test63') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_import_i');
     INSERT INTO format_w (SELECT * FROM formatsource);
-ERROR:  formatter function formatter_export_i is not declared STABLE.  (seg1 rh55-qavm55:7533 pid=30568)
-    -- ERROR:  formatter function formatter_export_i is not declared STABLE.  (seg1 rh55-qavm55:7533 pid=14816)
+ERROR:  formatter function formatter_export_i is not declared STABLE  (seg1 rh55-qavm55:7533 pid=30568)
+    -- ERROR:  formatter function formatter_export_i is not declared STABLE  (seg1 rh55-qavm55:7533 pid=14816)
     -- Create RET and WET using STABLE functions 
     DROP EXTERNAL TABLE IF EXISTS format_w;
     CREATE WRITABLE EXTERNAL TABLE format_w(like formatsource) 
     LOCATION ('demoprot://exttabtest_test63') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_export_s');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_r;
     CREATE READABLE EXTERNAL TABLE format_r(like formatsource) 
     LOCATION ('demoprot://exttabtest_test63') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_import_s');
     -- Displaying table info
     \d format_w
-      External table "exttableext.format_w"
+   External table "exttableext.format_w"
  Column |         Type          | Modifiers 
 --------+-----------------------+-----------
  name   | character varying(40) | 
@@ -864,6 +864,7 @@ Format options: formatter 'formatter_export_s'
 External options: {}
 External location: demoprot://exttabtest_test63
 Execute on: all segments
+Distributed by: (id)
 
     \d format_r
    External table "exttableext.format_r"
@@ -921,7 +922,7 @@ Execute on: all segments
    100
 (1 row)
 
-    -- verify data should be evenly distributed
+-- verify data should be evenly distributed
 with t as (
   SELECT gp_segment_id as segid, count(*) as cnt from format_r group by gp_segment_id
 )
@@ -967,10 +968,10 @@ select max(cnt) - min(cnt)  > 20 from t;
 (0 rows)
 
     INSERT INTO format_w (SELECT * FROM formatsource);
-ERROR:  formatter function formatter_export_s of type writable was not found.  (seg0 rh55-qavm55:7532 pid=30616)
+ERROR:  formatter function "formatter_export_s" of type writable was not found  (seg0 rh55-qavm55:7532 pid=30616)
     -- Read from RET, should fail
     SELECT count(*) FROM format_r;
-ERROR:  formatter function formatter_import_s of type readable was not found.
+ERROR:  formatter function "formatter_import_s" of type readable was not found
 HINT:  Create it with CREATE FUNCTION.
 -- Test 65: Restore (recreate) functions with same name, external table should work again
     -- Recreate UDFs with same function names
@@ -1021,7 +1022,7 @@ NOTICE:  table "format_w_s1" does not exist, skipping
     CREATE WRITABLE EXTERNAL TABLE format_w_s1(like formatsource) 
         LOCATION ('demoprot://exttabtest_test67_s1') 
         FORMAT 'CUSTOM' (FORMATTER='formatter_export_s');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_r_s1;
 NOTICE:  table "format_r_s1" does not exist, skipping
     CREATE READABLE EXTERNAL TABLE format_r_s1(like formatsource) 
@@ -1034,7 +1035,7 @@ NOTICE:  table "format_w_s2" does not exist, skipping
     CREATE WRITABLE EXTERNAL TABLE format_w_s2(like formatsource) 
         LOCATION ('demoprot://exttabtest_test67_s2') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_export_s');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_r_s2;
 NOTICE:  table "format_r_s2" does not exist, skipping
     CREATE READABLE EXTERNAL TABLE format_r_s2(like formatsource) 
@@ -1111,7 +1112,7 @@ NOTICE:  table "format_long_w" does not exist, skipping
     CREATE WRITABLE EXTERNAL TABLE format_long_w(like format_long) 
     LOCATION ('demoprot://exttabtest_test71.txt') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_export_s');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_long_r;
 NOTICE:  table "format_long_r" does not exist, skipping
     CREATE READABLE EXTERNAL TABLE format_long_r(like format_long) 
@@ -1183,7 +1184,7 @@ ERROR:  formatter_export: buffer too small (gpformatter.c:182)  (seg0 rh55-qavm5
     CREATE WRITABLE EXTERNAL TABLE format_long_w(like format_long) 
     LOCATION ('demoprot://exttabtest_test72.txt') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_export_s');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_long_r;
     CREATE READABLE EXTERNAL TABLE format_long_r(like format_long) 
     LOCATION ('demoprot://exttabtest_test72.txt') 
@@ -1234,7 +1235,7 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution 
     CREATE WRITABLE EXTERNAL TABLE format_long_w(like format_long) 
     LOCATION ('demoprot://exttabtest_test73.txt') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_export_s');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_long_r;
     CREATE READABLE EXTERNAL TABLE format_long_r(like format_long) 
     LOCATION ('demoprot://exttabtest_test73.txt') 
@@ -1284,7 +1285,7 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution 
     CREATE WRITABLE EXTERNAL TABLE format_long_w(like format_long) 
     LOCATION ('demoprot://format_long_test14') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_export_s');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_long_r;
     CREATE READABLE EXTERNAL TABLE format_long_r(like format_long) 
         -- using source data file format_long_test13 created by previous test
@@ -1305,7 +1306,7 @@ ERROR:  formatter_export error: unsupported data type (gpformatter.c:100)  (seg1
     -- select should fail since INT type is not supported
     select count(*) from format_long_r;
 ERROR:  demoprot_import: could not open file "format_long_test13" for reading: No such file or directory  (seg1 slice1 rh55-qavm55:7533 pid=27134)
-DETAIL:  External table format_long_r
+CONTEXT:  External table format_long_r
     -- ERROR:  formatter_import error: unsupported data type (gpformatter.c:256)  (seg1 slice1 rh55-qavm57:5533 pid=20204) (cdbdisp.c:1458)
 -- Test 75: External table contains dropped columns
 -- SAS example formatter does NOT support dropping column from external table (both RET and WET).
@@ -1322,15 +1323,15 @@ DETAIL:  External table format_long_r
     CREATE WRITABLE EXTERNAL TABLE format_w(like formatsource) 
     LOCATION ('demoprot://format_test15') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_export_s');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_r;
     CREATE READABLE EXTERNAL TABLE format_r(like formatsource) 
         -- using source data file format_long_test13 created by previous test
     LOCATION ('demoprot://format_long_test13') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_import_s');
-    -- Drop colum value1 from source table formatsource
+    -- Drop column value1 from source table formatsource
     ALTER TABLE formatsource DROP COLUMN value1;
-    -- Drop colum value1 from RET and WET
+    -- Drop column value1 from RET and WET
     ALTER EXTERNAL TABLE format_r DROP COLUMN value1;
     ALTER EXTERNAL TABLE format_w DROP COLUMN value1;
     -- Loading records 
@@ -1347,7 +1348,7 @@ ERROR:  formatter_export: dropped columns (gpformatter.c:80)  (seg0 rh55-qavm55:
     -- Read from RET using data file format_long_test13 create by previous test
     select count(*) from format_r;
 ERROR:  demoprot_import: could not open file "format_long_test13" for reading: No such file or directory  (seg0 slice1 rh55-qavm55:7532 pid=27212)
-DETAIL:  External table format_r
+CONTEXT:  External table format_r
     -- ERROR:  formatter_import: dropped columns (gpformatter.c:244)  (seg2 slice1 rh55-qavm58:5532 pid=20911) (cdbdisp.c:1458)
 -- Test 76: External table contains added column
 -- Add column to external table is fine.
@@ -1363,7 +1364,7 @@ DETAIL:  External table format_r
     CREATE WRITABLE EXTERNAL TABLE format_w(like formatsource) 
     LOCATION ('demoprot://exttabtest_test76.txt') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_export_s');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_r;
     CREATE READABLE EXTERNAL TABLE format_r(like formatsource) 
     LOCATION ('demoprot://exttabtest_test76.txt') 
@@ -1416,7 +1417,7 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution 
     CREATE WRITABLE EXTERNAL TABLE format_w(like formatsource) 
     LOCATION ('demoprot://exttabtest_test77.txt') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_export_s');
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
+NOTICE:  table doesn't have 'DISTRIBUTED BY' clause, defaulting to distribution columns from LIKE table
     DROP EXTERNAL TABLE IF EXISTS format_r;
     CREATE READABLE EXTERNAL TABLE format_r(like formatsource) 
     LOCATION ('demoprot://exttabtest_test77.txt') 
@@ -1545,19 +1546,9 @@ ERROR:  protocol attribute "validatorproc" not recognized
     drop role if exists demoprot_super;
     create role demoprot_super with SUPERUSER LOGIN;
     -- Create a non-privileged user demoprot_nopriv
-   drop role if exists demoprot_nopriv;
+    drop role if exists demoprot_nopriv;
     create role demoprot_nopriv with login ;
 NOTICE:  resource queue required -- using default resource queue "pg_default"
-    -- Create a gphdfs_user with CREATEEXTTABLE privilege using gphdfs protocol
-   drop role if exists gphdfs_user;
-    create role gphdfs_user with login CREATEEXTTABLE (protocol='gphdfs');
-WARNING:  GRANT/REVOKE on gphdfs is deprecated
-HINT:  Issue the GRANT or REVOKE on the protocol itself
-NOTICE:  resource queue required -- using default resource queue "pg_default"
-    -- WARNING:  GRANT/REVOKE on gphdfs is deprecated
-    -- HINT:  Issue the GRANT or REVOKE on the protocol itself
-    -- NOTICE:  resource queue required -- using default resource queue "pg_default"
-    -- CREATE ROLE
 -- Test 92: Rename existing protocol
     DROP FUNCTION IF EXISTS url_validator();
     CREATE OR REPLACE FUNCTION url_validator() RETURNS void AS
@@ -1599,7 +1590,7 @@ NOTICE:  table "exttabtest_r" does not exist, skipping
 
     -- Check existing ext table that created still refer to old protocol name
     \d exttabtest_r
-    External table "exttableext.exttabtest_r"
+ External table "exttableext.exttabtest_r"
  Column |         Type          | Modifiers 
 --------+-----------------------+-----------
  id     | integer               | 
@@ -1636,7 +1627,7 @@ ERROR:  protocol "demoprot" does not exist  (seg0 slice1 rh55-qavm55:7532 pid=18
     -- therefore the error is expected.
     select count(*) from exttabtest_r_new;
 ERROR:  internal error: demoprot called with a different protocol (demoprot_new) (gpextprotocol.c:106)  (seg0 slice1 rh55-qavm55:7532 pid=18394) (cdbdisp.c:1453)
-DETAIL:  External table exttabtest_r_new, file demoprot_new://exttabtest.txt
+CONTEXT:  External table exttabtest_r_new, file demoprot_new://exttabtest.txt
     -- Rename protocol name back to demoprot
     ALTER PROTOCOL demoprot_new RENAME to demoprot;
     -- Verify access old ext table that referencing old protocol name would succeed
@@ -1852,7 +1843,7 @@ RESET ROLE;
 --------
 (0 rows)
 
-   -- Verify superuser "demoprot_super" can create new ext table using untrusted protocol demoprot
+    -- Verify superuser "demoprot_super" can create new ext table using untrusted protocol demoprot
     DROP EXTERNAL TABLE IF EXISTS exttabtest_r_new;
 NOTICE:  table "exttabtest_r_new" does not exist, skipping
     CREATE READABLE EXTERNAL TABLE exttabtest_r_new(like exttabtest)
@@ -2070,7 +2061,7 @@ drop cascades to external table exttabtest_w_new
     -- As superuser, REVOKE ALL privileges on protocol from non-privileged user demoprot_nopriv
     -- Both SELECT and INSERT permissions are revoked
     REVOKE ALL ON PROTOCOL demoprot FROM demoprot_nopriv;
-NOTICE:  no privileges could be revoked from role demoprot_nopriv on object demoprot
+NOTICE:  no privileges could be revoked
     -- login as non-privileged user "demoprot_nopriv"
     SET ROLE demoprot_nopriv;
     select user;
@@ -2166,7 +2157,7 @@ NOTICE:  drop cascades to external table exttabtest_r_new
     GRANT SELECT ON exttabtest TO demoprot_nopriv;
     -- As superuser, REVOKE SElECT privilege on protocol from non-privileged user demoprot_nopriv
     REVOKE SELECT ON PROTOCOL demoprot FROM demoprot_nopriv;
-NOTICE:  no privileges could be revoked from role demoprot_nopriv on object demoprot
+NOTICE:  no privileges could be revoked
     -- login as non-privileged user "demoprot_nopriv"
     SET ROLE demoprot_nopriv;
     select user;
@@ -2244,7 +2235,7 @@ NOTICE:  drop cascades to external table exttabtest_w_new
     GRANT SELECT ON exttabtest TO demoprot_nopriv;
     -- As superuser, REVOKE INSERT privilege on protocol from non-privileged user demoprot_nopriv
     REVOKE INSERT ON PROTOCOL demoprot FROM demoprot_nopriv;
-NOTICE:  no privileges could be revoked from role demoprot_nopriv on object demoprot
+NOTICE:  no privileges could be revoked
     -- login as non-privileged user "demoprot_nopriv"
     SET ROLE demoprot_nopriv;
     select user;

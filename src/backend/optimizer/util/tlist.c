@@ -5,12 +5,12 @@
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/optimizer/util/tlist.c,v 1.83 2008/10/21 20:42:53 tgl Exp $
+ *	  src/backend/optimizer/util/tlist.c
  *
  *-------------------------------------------------------------------------
  */
@@ -20,8 +20,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planmain.h"
 #include "optimizer/tlist.h"
-#include "optimizer/var.h"
-#include "utils/lsyscache.h"
+#include "utils/lsyscache.h" /* get_typavgwidth() */
 
 typedef struct maxSortGroupRef_context
 {
@@ -39,7 +38,7 @@ bool maxSortGroupRef_walker(Node *node, maxSortGroupRef_context *cxt);
 /*
  * tlist_member
  *	  Finds the (first) member of the given tlist whose expression is
- *	  equal() to the given expression.	Result is NULL if no such member.
+ *	  equal() to the given expression.  Result is NULL if no such member.
  */
 TargetEntry *
 tlist_member(Node *node, List *targetlist)
@@ -116,12 +115,40 @@ tlist_member_ignore_relabel(Node *node, List *targetlist)
 }
 
 /*
+ * tlist_member_match_var
+ *	  Same as above, except that we match the provided Var on the basis
+ *	  of varno/varattno/varlevelsup only, rather than using full equal().
+ *
+ * This is needed in some cases where we can't be sure of an exact typmod
+ * match.  It's probably a good idea to check the vartype anyway, but
+ * we leave it to the caller to apply any suitable sanity checks.
+ */
+TargetEntry *
+tlist_member_match_var(Var *var, List *targetlist)
+{
+	ListCell   *temp;
+
+	foreach(temp, targetlist)
+	{
+		TargetEntry *tlentry = (TargetEntry *) lfirst(temp);
+		Var		   *tlvar = (Var *) tlentry->expr;
+
+		if (!tlvar || !IsA(tlvar, Var))
+			continue;
+		if (var->varno == tlvar->varno &&
+			var->varattno == tlvar->varattno &&
+			var->varlevelsup == tlvar->varlevelsup)
+			return tlentry;
+	}
+	return NULL;
+}
+
+/*
  * flatten_tlist
  *	  Create a target list that only contains unique variables.
  *
- * Note that Vars with varlevelsup > 0 are not included in the output
- * tlist.  We expect that those will eventually be replaced with Params,
- * but that probably has not happened at the time this routine is called.
+ * Aggrefs and PlaceHolderVars in the input are treated according to
+ * aggbehavior and phbehavior, for which see pull_var_clause().
  *
  * 'tlist' is the current target list
  *
@@ -131,40 +158,49 @@ tlist_member_ignore_relabel(Node *node, List *targetlist)
  * Copying the Var nodes is probably overkill, but be safe for now.
  */
 List *
-flatten_tlist(List *tlist)
+flatten_tlist(List *tlist, PVCAggregateBehavior aggbehavior,
+			  PVCPlaceHolderBehavior phbehavior)
 {
-	List	   *vlist = pull_var_clause((Node *) tlist, true);
+	List	   *vlist = pull_var_clause((Node *) tlist,
+										aggbehavior,
+										phbehavior);
 	List	   *new_tlist;
 
-	new_tlist = add_to_flat_tlist(NIL, vlist, false /* resjunk */);
+	new_tlist = add_to_flat_tlist(NIL, vlist);
 	list_free(vlist);
 	return new_tlist;
 }
 
 /*
  * add_to_flat_tlist
- *		Add more vars to a flattened tlist (if they're not already in it)
+ *		Add more items to a flattened tlist (if they're not already in it)
  *
  * 'tlist' is the flattened tlist
- * 'vars' is a list of Var and/or PlaceHolderVar nodes
+ * 'exprs' is a list of expressions (usually, but not necessarily, Vars)
  *
  * Returns the extended tlist.
  */
 List *
-add_to_flat_tlist(List *tlist, List *vars, bool resjunk)
+add_to_flat_tlist(List *tlist, List *exprs)
+{
+	return add_to_flat_tlist_junk(tlist, exprs, false);
+}
+
+List *
+add_to_flat_tlist_junk(List *tlist, List *exprs, bool resjunk)
 {
 	int			next_resno = list_length(tlist) + 1;
-	ListCell   *v;
+	ListCell   *lc;
 
-	foreach(v, vars)
+	foreach(lc, exprs)
 	{
-		Node	   *var = (Node *) lfirst(v);
+		Node	   *expr = (Node *) lfirst(lc);
 
-		if (!tlist_member_ignore_relabel(var, tlist))
+		if (!tlist_member_ignore_relabel(expr, tlist))
 		{
 			TargetEntry *tle;
 
-			tle = makeTargetEntry(copyObject(var),		/* copy needed?? */
+			tle = makeTargetEntry(copyObject(expr),		/* copy needed?? */
 								  next_resno++,
 								  NULL,
 								  resjunk);
@@ -177,7 +213,7 @@ add_to_flat_tlist(List *tlist, List *vars, bool resjunk)
 
 /*
  * get_tlist_exprs
- *		Get Ejust the expression subtrees of a tlist
+ *		Get just the expression subtrees of a tlist
  *
  * Resjunk columns are ignored unless includeJunk is true
  */
@@ -197,6 +233,43 @@ get_tlist_exprs(List *tlist, bool includeJunk)
 		result = lappend(result, tle->expr);
 	}
 	return result;
+}
+
+
+/*
+ * tlist_same_exprs
+ *		Check whether two target lists contain the same expressions
+ *
+ * Note: this function is used to decide whether it's safe to jam a new tlist
+ * into a non-projection-capable plan node.  Obviously we can't do that unless
+ * the node's tlist shows it already returns the column values we want.
+ * However, we can ignore the TargetEntry attributes resname, ressortgroupref,
+ * resorigtbl, resorigcol, and resjunk, because those are only labelings that
+ * don't affect the row values computed by the node.  (Moreover, if we didn't
+ * ignore them, we'd frequently fail to make the desired optimization, since
+ * the planner tends to not bother to make resname etc. valid in intermediate
+ * plan nodes.)  Note that on success, the caller must still jam the desired
+ * tlist into the plan node, else it won't have the desired labeling fields.
+ */
+bool
+tlist_same_exprs(List *tlist1, List *tlist2)
+{
+	ListCell   *lc1,
+			   *lc2;
+
+	if (list_length(tlist1) != list_length(tlist2))
+		return false;			/* not same length, so can't match */
+
+	forboth(lc1, tlist1, lc2, tlist2)
+	{
+		TargetEntry *tle1 = (TargetEntry *) lfirst(lc1);
+		TargetEntry *tle2 = (TargetEntry *) lfirst(lc2);
+
+		if (!equal(tle1->expr, tle2->expr))
+			return false;
+	}
+
+	return true;
 }
 
 
@@ -234,6 +307,40 @@ tlist_same_datatypes(List *tlist, List *colTypes, bool junkOK)
 	}
 	if (curColType != NULL)
 		return false;			/* tlist shorter than colTypes */
+	return true;
+}
+
+/*
+ * Does tlist have same exposed collations as listed in colCollations?
+ *
+ * Identical logic to the above, but for collations.
+ */
+bool
+tlist_same_collations(List *tlist, List *colCollations, bool junkOK)
+{
+	ListCell   *l;
+	ListCell   *curColColl = list_head(colCollations);
+
+	foreach(l, tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(l);
+
+		if (tle->resjunk)
+		{
+			if (!junkOK)
+				return false;
+		}
+		else
+		{
+			if (curColColl == NULL)
+				return false;	/* tlist longer than colCollations */
+			if (exprCollation((Node *) tle->expr) != lfirst_oid(curColColl))
+				return false;
+			curColColl = lnext(curColColl);
+		}
+	}
+	if (curColColl != NULL)
+		return false;			/* tlist shorter than colCollations */
 	return true;
 }
 
@@ -609,10 +716,7 @@ grouping_is_sortable(List *groupClause)
 /*
  * grouping_is_hashable - is it possible to implement grouping list by hashing?
  *
- * We assume hashing is OK if the equality operators are marked oprcanhash.
- * (If there isn't actually a supporting hash function, the executor will
- * complain at runtime; but this is a misdeclaration of the operator, not
- * a system bug.)
+ * We rely on the parser to have set the hashable flag correctly.
  */
 bool
 grouping_is_hashable(List *groupClause)
@@ -640,7 +744,7 @@ grouping_is_hashable(List *groupClause)
 		{
 			SortGroupClause *groupcl = (SortGroupClause *) node;
 
-			if (!op_hashjoinable(groupcl->eqop))
+			if (!groupcl->hashable)
 				return false;
 		}
 	}
@@ -701,12 +805,12 @@ bool maxSortGroupRef_walker(Node *node, maxSortGroupRef_context *cxt)
 	if ( IsA(node, Aggref) )
 	{
 		Aggref *ref = (Aggref*)node;
-		if ( ref->aggorder && cxt->include_orderedagg )
+
+		if ( cxt->include_orderedagg )
 		{
 			ListCell *lc;
-			AggOrder *aggorder = ref->aggorder;
 
-			foreach (lc, aggorder->sortClause)
+			foreach (lc, ref->aggorder)
 			{
 				SortGroupClause *sort = (SortGroupClause *)lfirst(lc);
 				Assert(IsA(sort, SortGroupClause));

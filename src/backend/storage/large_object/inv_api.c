@@ -19,30 +19,34 @@
  * memory context given to inv_open (for LargeObjectDesc structs).
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/storage/large_object/inv_api.c,v 1.136 2008/12/04 14:51:02 alvherre Exp $
+ *	  src/backend/storage/large_object/inv_api.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/sysattr.h"
 #include "access/tuptoaster.h"
 #include "access/xact.h"
-#include "catalog/catalog.h"
+#include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_largeobject.h"
-#include "commands/comment.h"
+#include "catalog/pg_largeobject_metadata.h"
 #include "libpq/libpq-fs.h"
+#include "miscadmin.h"
 #include "storage/large_object.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
-#include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/tqual.h"
 
@@ -79,7 +83,7 @@ open_lo_relation(void)
 		if (lo_heap_r == NULL)
 			lo_heap_r = heap_open(LargeObjectRelationId, RowExclusiveLock);
 		if (lo_index_r == NULL)
-			lo_index_r = index_open(LargeObjectLoidPagenoIndexId, RowExclusiveLock);
+			lo_index_r = index_open(LargeObjectLOidPNIndexId, RowExclusiveLock);
 	}
 	PG_CATCH();
 	{
@@ -139,42 +143,68 @@ close_lo_relation(bool isCommit)
 static bool
 myLargeObjectExists(Oid loid, Snapshot snapshot)
 {
-	bool		retval = false;
-	Relation	pg_largeobject;
+	Relation	pg_lo_meta;
 	ScanKeyData skey[1];
 	SysScanDesc sd;
+	HeapTuple	tuple;
+	bool		retval = false;
 
-	/*
-	 * See if we can find any tuples belonging to the specified LO
-	 */
 	ScanKeyInit(&skey[0],
-				Anum_pg_largeobject_loid,
+				ObjectIdAttributeNumber,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(loid));
 
-	pg_largeobject = heap_open(LargeObjectRelationId, AccessShareLock);
+	pg_lo_meta = heap_open(LargeObjectMetadataRelationId,
+						   AccessShareLock);
 
-	sd = systable_beginscan(pg_largeobject, LargeObjectLoidPagenoIndexId, true,
+	sd = systable_beginscan(pg_lo_meta,
+							LargeObjectMetadataOidIndexId, true,
 							snapshot, 1, skey);
 
-	if (systable_getnext(sd) != NULL)
+	tuple = systable_getnext(sd);
+	if (HeapTupleIsValid(tuple))
 		retval = true;
 
 	systable_endscan(sd);
 
-	heap_close(pg_largeobject, AccessShareLock);
+	heap_close(pg_lo_meta, AccessShareLock);
 
 	return retval;
 }
 
 
-static int32
-getbytealen(bytea *data)
+/*
+ * Extract data field from a pg_largeobject tuple, detoasting if needed
+ * and verifying that the length is sane.  Returns data pointer (a bytea *),
+ * data length, and an indication of whether to pfree the data pointer.
+ */
+static void
+getdatafield(Form_pg_largeobject tuple,
+			 bytea **pdatafield,
+			 int *plen,
+			 bool *pfreeit)
 {
-	Assert(!VARATT_IS_EXTENDED(data));
-	if (VARSIZE(data) < VARHDRSZ)
-		elog(ERROR, "invalid VARSIZE(data)");
-	return (VARSIZE(data) - VARHDRSZ);
+	bytea	   *datafield;
+	int			len;
+	bool		freeit;
+
+	datafield = &(tuple->data); /* see note at top of file */
+	freeit = false;
+	if (VARATT_IS_EXTENDED(datafield))
+	{
+		datafield = (bytea *)
+			heap_tuple_untoast_attr((struct varlena *) datafield);
+		freeit = true;
+	}
+	len = VARSIZE(datafield) - VARHDRSZ;
+	if (len < 0 || len > LOBLKSIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_largeobject entry for OID %u, page %d has invalid data field size %d",
+						tuple->loid, tuple->pageno, len)));
+	*pdatafield = datafield;
+	*plen = len;
+	*pfreeit = freeit;
 }
 
 
@@ -193,31 +223,34 @@ getbytealen(bytea *data)
 Oid
 inv_create(Oid lobjId)
 {
-	/*
-	 * Allocate an OID to be the LO's identifier, unless we were told what to
-	 * use.  We can use the index on pg_largeobject for checking OID
-	 * uniqueness, even though it has additional columns besides OID.
-	 */
-	if (!OidIsValid(lobjId))
-	{
-		open_lo_relation();
-
-		lobjId = GetNewOidWithIndex(lo_heap_r, LargeObjectLoidPagenoIndexId,
-									Anum_pg_largeobject_loid);
-	}
+	Oid			lobjId_new;
 
 	/*
-	 * Create the LO by writing an empty first page for it in pg_largeobject
-	 * (will fail if duplicate)
+	 * Create a new largeobject with empty data pages
 	 */
-	LargeObjectCreate(lobjId);
+	lobjId_new = LargeObjectCreate(lobjId);
+
+	/*
+	 * dependency on the owner of largeobject
+	 *
+	 * The reason why we use LargeObjectRelationId instead of
+	 * LargeObjectMetadataRelationId here is to provide backward compatibility
+	 * to the applications which utilize a knowledge about internal layout of
+	 * system catalogs. OID of pg_largeobject_metadata and loid of
+	 * pg_largeobject are same value, so there are no actual differences here.
+	 */
+	recordDependencyOnOwner(LargeObjectRelationId,
+							lobjId_new, GetUserId());
+
+	/* Post creation hook for new large object */
+	InvokeObjectPostCreateHook(LargeObjectRelationId, lobjId_new, 0);
 
 	/*
 	 * Advance command counter to make new tuple visible to later operations.
 	 */
 	CommandCounterIncrement();
 
-	return lobjId;
+	return lobjId_new;
 }
 
 /*
@@ -232,38 +265,49 @@ LargeObjectDesc *
 inv_open(Oid lobjId, int flags, MemoryContext mcxt)
 {
 	LargeObjectDesc *retval;
-
-	retval = (LargeObjectDesc *) MemoryContextAlloc(mcxt,
-													sizeof(LargeObjectDesc));
-
-	retval->id = lobjId;
-	retval->subid = GetCurrentSubTransactionId();
-	retval->offset = 0;
+	Snapshot	snapshot = NULL;
+	int			descflags = 0;
 
 	if (flags & INV_WRITE)
 	{
-		retval->snapshot = SnapshotNow;
-		retval->flags = IFS_WRLOCK | IFS_RDLOCK;
+		snapshot = NULL;		/* instantaneous MVCC snapshot */
+		descflags = IFS_WRLOCK | IFS_RDLOCK;
 	}
 	else if (flags & INV_READ)
 	{
-		/*
-		 * We must register the snapshot in TopTransaction's resowner,
-		 * because it must stay alive until the LO is closed rather than until
-		 * the current portal shuts down.
-		 */
-		retval->snapshot = RegisterSnapshotOnOwner(GetActiveSnapshot(),
-												   TopTransactionResourceOwner);
-		retval->flags = IFS_RDLOCK;
+		snapshot = GetActiveSnapshot();
+		descflags = IFS_RDLOCK;
 	}
 	else
-		elog(ERROR, "invalid flags: %d", flags);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid flags for opening a large object: %d",
+						flags)));
 
-	/* Can't use LargeObjectExists here because it always uses SnapshotNow */
-	if (!myLargeObjectExists(lobjId, retval->snapshot))
+	/* Can't use LargeObjectExists here because we need to specify snapshot */
+	if (!myLargeObjectExists(lobjId, snapshot))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("large object %u does not exist", lobjId)));
+
+	/*
+	 * We must register the snapshot in TopTransaction's resowner, because it
+	 * must stay alive until the LO is closed rather than until the current
+	 * portal shuts down. Do this after checking that the LO exists, to avoid
+	 * leaking the snapshot if an error is thrown.
+	 */
+	if (snapshot)
+		snapshot = RegisterSnapshotOnOwner(snapshot,
+										   TopTransactionResourceOwner);
+
+	/* All set, create a descriptor */
+	retval = (LargeObjectDesc *) MemoryContextAlloc(mcxt,
+													sizeof(LargeObjectDesc));
+	retval->id = lobjId;
+	retval->subid = GetCurrentSubTransactionId();
+	retval->offset = 0;
+	retval->snapshot = snapshot;
+	retval->flags = descflags;
 
 	return retval;
 }
@@ -277,9 +321,8 @@ inv_close(LargeObjectDesc *obj_desc)
 {
 	Assert(PointerIsValid(obj_desc));
 
-	if (obj_desc->snapshot != SnapshotNow)
-		UnregisterSnapshotFromOwner(obj_desc->snapshot,
-									TopTransactionResourceOwner);
+	UnregisterSnapshotFromOwner(obj_desc->snapshot,
+								TopTransactionResourceOwner);
 
 	pfree(obj_desc);
 }
@@ -292,10 +335,15 @@ inv_close(LargeObjectDesc *obj_desc)
 int
 inv_drop(Oid lobjId)
 {
-	LargeObjectDrop(lobjId);
+	ObjectAddress object;
 
-	/* Delete any comments on the large object */
-	DeleteComments(lobjId, LargeObjectRelationId, 0);
+	/*
+	 * Delete any comments and dependencies on the large object
+	 */
+	object.classId = LargeObjectRelationId;
+	object.objectId = lobjId;
+	object.objectSubId = 0;
+	performDeletion(&object, DROP_CASCADE, 0);
 
 	/*
 	 * Advance command counter so that tuple removal will be seen by later
@@ -312,11 +360,10 @@ inv_drop(Oid lobjId)
  * NOTE: LOs can contain gaps, just like Unix files.  We actually return
  * the offset of the last byte + 1.
  */
-static uint32
+static uint64
 inv_getsize(LargeObjectDesc *obj_desc)
 {
-	bool		found = false;
-	uint32		lastbyte = 0;
+	uint64		lastbyte = 0;
 	ScanKeyData skey[1];
 	SysScanDesc sd;
 	HeapTuple	tuple;
@@ -339,72 +386,73 @@ inv_getsize(LargeObjectDesc *obj_desc)
 	 * large object in reverse pageno order.  So, it's sufficient to examine
 	 * the first valid tuple (== last valid page).
 	 */
-	while ((tuple = systable_getnext_ordered(sd, BackwardScanDirection)) != NULL)
+	tuple = systable_getnext_ordered(sd, BackwardScanDirection);
+	if (HeapTupleIsValid(tuple))
 	{
 		Form_pg_largeobject data;
 		bytea	   *datafield;
+		int			len;
 		bool		pfreeit;
 
-		found = true;
 		if (HeapTupleHasNulls(tuple))	/* paranoia */
 			elog(ERROR, "null field found in pg_largeobject");
 		data = (Form_pg_largeobject) GETSTRUCT(tuple);
-		datafield = &(data->data);		/* see note at top of file */
-		pfreeit = false;
-		if (VARATT_IS_EXTENDED(datafield))
-		{
-			datafield = (bytea *)
-				heap_tuple_untoast_attr((struct varlena *) datafield);
-			pfreeit = true;
-		}
-		lastbyte = data->pageno * LOBLKSIZE + getbytealen(datafield);
+		getdatafield(data, &datafield, &len, &pfreeit);
+		lastbyte = (uint64) data->pageno * LOBLKSIZE + len;
 		if (pfreeit)
 			pfree(datafield);
-		break;
 	}
 
 	systable_endscan_ordered(sd);
 
-	if (!found)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("large object %u does not exist", obj_desc->id)));
 	return lastbyte;
 }
 
-int
-inv_seek(LargeObjectDesc *obj_desc, int offset, int whence)
+int64
+inv_seek(LargeObjectDesc *obj_desc, int64 offset, int whence)
 {
+	int64		newoffset;
+
 	Assert(PointerIsValid(obj_desc));
 
+	/*
+	 * Note: overflow in the additions is possible, but since we will reject
+	 * negative results, we don't need any extra test for that.
+	 */
 	switch (whence)
 	{
 		case SEEK_SET:
-			if (offset < 0)
-				elog(ERROR, "invalid seek offset: %d", offset);
-			obj_desc->offset = offset;
+			newoffset = offset;
 			break;
 		case SEEK_CUR:
-			if (offset < 0 && obj_desc->offset < ((uint32) (-offset)))
-				elog(ERROR, "invalid seek offset: %d", offset);
-			obj_desc->offset += offset;
+			newoffset = obj_desc->offset + offset;
 			break;
 		case SEEK_END:
-			{
-				uint32		size = inv_getsize(obj_desc);
-
-				if (offset < 0 && size < ((uint32) (-offset)))
-					elog(ERROR, "invalid seek offset: %d", offset);
-				obj_desc->offset = size + offset;
-			}
+			newoffset = inv_getsize(obj_desc) + offset;
 			break;
 		default:
-			elog(ERROR, "invalid whence: %d", whence);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid whence setting: %d", whence)));
+			newoffset = 0;		/* keep compiler quiet */
+			break;
 	}
-	return obj_desc->offset;
+
+	/*
+	 * use errmsg_internal here because we don't want to expose INT64_FORMAT
+	 * in translatable strings; doing better is not worth the trouble
+	 */
+	if (newoffset < 0 || newoffset > MAX_LARGE_OBJECT_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+		   errmsg_internal("invalid large object seek target: " INT64_FORMAT,
+						   newoffset)));
+
+	obj_desc->offset = newoffset;
+	return newoffset;
 }
 
-int
+int64
 inv_tell(LargeObjectDesc *obj_desc)
 {
 	Assert(PointerIsValid(obj_desc));
@@ -416,11 +464,11 @@ int
 inv_read(LargeObjectDesc *obj_desc, char *buf, int nbytes)
 {
 	int			nread = 0;
-	int			n;
-	int			off;
+	int64		n;
+	int64		off;
 	int			len;
 	int32		pageno = (int32) (obj_desc->offset / LOBLKSIZE);
-	uint32		pageoff;
+	uint64		pageoff;
 	ScanKeyData skey[2];
 	SysScanDesc sd;
 	HeapTuple	tuple;
@@ -461,7 +509,7 @@ inv_read(LargeObjectDesc *obj_desc, char *buf, int nbytes)
 		 * there may be missing pages if the LO contains unwritten "holes". We
 		 * want missing sections to read out as zeroes.
 		 */
-		pageoff = ((uint32) data->pageno) * LOBLKSIZE;
+		pageoff = ((uint64) data->pageno) * LOBLKSIZE;
 		if (pageoff > obj_desc->offset)
 		{
 			n = pageoff - obj_desc->offset;
@@ -477,15 +525,7 @@ inv_read(LargeObjectDesc *obj_desc, char *buf, int nbytes)
 			off = (int) (obj_desc->offset - pageoff);
 			Assert(off >= 0 && off < LOBLKSIZE);
 
-			datafield = &(data->data);	/* see note at top of file */
-			pfreeit = false;
-			if (VARATT_IS_EXTENDED(datafield))
-			{
-				datafield = (bytea *)
-					heap_tuple_untoast_attr((struct varlena *) datafield);
-				pfreeit = true;
-			}
-			len = getbytealen(datafield);
+			getdatafield(data, &datafield, &len, &pfreeit);
 			if (len > off)
 			{
 				n = len - off;
@@ -539,14 +579,17 @@ inv_write(LargeObjectDesc *obj_desc, const char *buf, int nbytes)
 	Assert(buf != NULL);
 
 	/* enforce writability because snapshot is probably wrong otherwise */
-	if ((obj_desc->flags & IFS_WRLOCK) == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("large object %u was not opened for writing",
-						obj_desc->id)));
+	Assert(obj_desc->flags & IFS_WRLOCK);
 
 	if (nbytes <= 0)
 		return 0;
+
+	/* this addition can't overflow because nbytes is only int32 */
+	if ((nbytes + obj_desc->offset) > MAX_LARGE_OBJECT_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid large object write request size: %d",
+						nbytes)));
 
 	open_lo_relation();
 
@@ -598,16 +641,7 @@ inv_write(LargeObjectDesc *obj_desc, const char *buf, int nbytes)
 			 *
 			 * First, load old data into workbuf
 			 */
-			datafield = &(olddata->data);		/* see note at top of file */
-			pfreeit = false;
-			if (VARATT_IS_EXTENDED(datafield))
-			{
-				datafield = (bytea *)
-					heap_tuple_untoast_attr((struct varlena *) datafield);
-				pfreeit = true;
-			}
-			len = getbytealen(datafield);
-			Assert(len <= LOBLKSIZE);
+			getdatafield(olddata, &datafield, &len, &pfreeit);
 			memcpy(workb, VARDATA(datafield), len);
 			if (pfreeit)
 				pfree(datafield);
@@ -641,7 +675,7 @@ inv_write(LargeObjectDesc *obj_desc, const char *buf, int nbytes)
 			values[Anum_pg_largeobject_data - 1] = PointerGetDatum(&workbuf);
 			replace[Anum_pg_largeobject_data - 1] = true;
 			newtup = heap_modify_tuple(oldtuple, RelationGetDescr(lo_heap_r),
-									  values, nulls, replace);
+									   values, nulls, replace);
 			simple_heap_update(lo_heap_r, &newtup->t_self, newtup);
 			CatalogIndexInsert(indstate, newtup);
 			heap_freetuple(newtup);
@@ -706,10 +740,10 @@ inv_write(LargeObjectDesc *obj_desc, const char *buf, int nbytes)
 }
 
 void
-inv_truncate(LargeObjectDesc *obj_desc, int len)
+inv_truncate(LargeObjectDesc *obj_desc, int64 len)
 {
 	int32		pageno = (int32) (len / LOBLKSIZE);
-	int			off;
+	int32		off;
 	ScanKeyData skey[2];
 	SysScanDesc sd;
 	HeapTuple	oldtuple;
@@ -730,16 +764,25 @@ inv_truncate(LargeObjectDesc *obj_desc, int len)
 	Assert(PointerIsValid(obj_desc));
 
 	/* enforce writability because snapshot is probably wrong otherwise */
-	if ((obj_desc->flags & IFS_WRLOCK) == 0)
+	Assert(obj_desc->flags & IFS_WRLOCK);
+
+	/*
+	 * use errmsg_internal here because we don't want to expose INT64_FORMAT
+	 * in translatable strings; doing better is not worth the trouble
+	 */
+	if (len < 0 || len > MAX_LARGE_OBJECT_SIZE)
 		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("large object %u was not opened for writing",
-						obj_desc->id)));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg_internal("invalid large object truncation target: " INT64_FORMAT,
+								 len)));
 
 	open_lo_relation();
 
 	indstate = CatalogOpenIndexes(lo_heap_r);
 
+	/*
+	 * Set up to find all pages with desired loid and pageno >= target
+	 */
 	ScanKeyInit(&skey[0],
 				Anum_pg_largeobject_loid,
 				BTEqualStrategyNumber, F_OIDEQ,
@@ -768,25 +811,17 @@ inv_truncate(LargeObjectDesc *obj_desc, int len)
 
 	/*
 	 * If we found the page of the truncation point we need to truncate the
-	 * data in it.	Otherwise if we're in a hole, we need to create a page to
+	 * data in it.  Otherwise if we're in a hole, we need to create a page to
 	 * mark the end of data.
 	 */
 	if (olddata != NULL && olddata->pageno == pageno)
 	{
 		/* First, load old data into workbuf */
-		bytea	   *datafield = &(olddata->data);		/* see note at top of
-														 * file */
-		bool		pfreeit = false;
+		bytea	   *datafield;
 		int			pagelen;
+		bool		pfreeit;
 
-		if (VARATT_IS_EXTENDED(datafield))
-		{
-			datafield = (bytea *)
-				heap_tuple_untoast_attr((struct varlena *) datafield);
-			pfreeit = true;
-		}
-		pagelen = getbytealen(datafield);
-		Assert(pagelen <= LOBLKSIZE);
+		getdatafield(olddata, &datafield, &pagelen, &pfreeit);
 		memcpy(workb, VARDATA(datafield), pagelen);
 		if (pfreeit)
 			pfree(datafield);
@@ -810,7 +845,7 @@ inv_truncate(LargeObjectDesc *obj_desc, int len)
 		values[Anum_pg_largeobject_data - 1] = PointerGetDatum(&workbuf);
 		replace[Anum_pg_largeobject_data - 1] = true;
 		newtup = heap_modify_tuple(oldtuple, RelationGetDescr(lo_heap_r),
-								  values, nulls, replace);
+								   values, nulls, replace);
 		simple_heap_update(lo_heap_r, &newtup->t_self, newtup);
 		CatalogIndexInsert(indstate, newtup);
 		heap_freetuple(newtup);
@@ -819,10 +854,14 @@ inv_truncate(LargeObjectDesc *obj_desc, int len)
 	{
 		/*
 		 * If the first page we found was after the truncation point, we're in
-		 * a hole that we'll fill, but we need to delete the later page.
+		 * a hole that we'll fill, but we need to delete the later page
+		 * because the loop below won't visit it again.
 		 */
-		if (olddata != NULL && olddata->pageno > pageno)
+		if (olddata != NULL)
+		{
+			Assert(olddata->pageno > pageno);
 			simple_heap_delete(lo_heap_r, &oldtuple->t_self);
+		}
 
 		/*
 		 * Write a brand new page.
@@ -851,11 +890,15 @@ inv_truncate(LargeObjectDesc *obj_desc, int len)
 	}
 
 	/*
-	 * Delete any pages after the truncation point
+	 * Delete any pages after the truncation point.  If the initial search
+	 * didn't find a page, then of course there's nothing more to do.
 	 */
-	while ((oldtuple = systable_getnext_ordered(sd, ForwardScanDirection)) != NULL)
+	if (olddata != NULL)
 	{
-		simple_heap_delete(lo_heap_r, &oldtuple->t_self);
+		while ((oldtuple = systable_getnext_ordered(sd, ForwardScanDirection)) != NULL)
+		{
+			simple_heap_delete(lo_heap_r, &oldtuple->t_self);
+		}
 	}
 
 	systable_endscan_ordered(sd);

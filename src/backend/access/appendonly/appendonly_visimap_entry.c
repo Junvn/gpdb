@@ -42,12 +42,11 @@ AppendOnlyVisimapEntry_Finish(
 
 /*
  * Inits the visimap entry data structure.
- ;
+ *
  * Assumes a zero-allocated visimap entry data structure.
  *
  * Until appendonly_visimap_copyout or appendonly_visimap_clear is called,
- * the data structure
- * is not usable for visibility checks or updates.
+ * the data structure is not usable for visibility checks or updates.
  */
 void
 AppendOnlyVisimapEntry_Init(
@@ -147,7 +146,7 @@ AppendOnlyVisiMapEnty_ReadData(
 
 	if (BitmapDecompress_HasError(&decompressState))
 	{
-		elog(ERROR, "error occured during visimap bitmap decompression");
+		elog(ERROR, "error occurred during visimap bitmap decompression");
 	}
 
 	bms_free(visiMapEntry->bitmap);
@@ -390,7 +389,7 @@ AppendOnlyVisimapEntry_CoversTuple(
 								   AppendOnlyVisimapEntry *visiMapEntry,
 								   AOTupleId *tupleId)
 {
-	int			rowNum;
+	int64			rowNum;
 
 	Assert(visiMapEntry);
 	Assert(tupleId);
@@ -419,7 +418,7 @@ AppendOnlyVisimapEntry_GetFirstRowNum(
 									  AOTupleId *tupleId)
 {
 	(void) visiMapEntry;
-	int			rowNum;
+	int64			rowNum;
 
 	rowNum = AOTupleIdGet_rowNum(tupleId);
 	return (rowNum / APPENDONLY_VISIMAP_MAX_RANGE) * APPENDONLY_VISIMAP_MAX_RANGE;
@@ -622,20 +621,13 @@ AppendOnlyVisimapEntry_GetNextInvisible(
 											   AOTupleIdGet_rowNum(tupleId),
 											   &currentBitmapOffset);
 	}
-	currentBitmapOffset++;
 
-	offset = bms_first_from(visiMapEntry->bitmap,
-							currentBitmapOffset);
+	offset = bms_next_member(visiMapEntry->bitmap,
+							 currentBitmapOffset);
 	if (offset >= 0)
 	{
 		rowNum = visiMapEntry->firstRowNum + offset;
-		AOTupleIdInit_Init(tupleId);
-		AOTupleIdInit_segmentFileNum(
-									 tupleId,
-									 visiMapEntry->segmentFileNum);
-		AOTupleIdInit_rowNum(
-							 tupleId,
-							 rowNum);
+		AOTupleIdInit(tupleId, visiMapEntry->segmentFileNum, rowNum);
 		return true;
 	}
 	else

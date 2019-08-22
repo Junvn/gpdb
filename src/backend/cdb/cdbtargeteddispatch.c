@@ -28,7 +28,7 @@
 #include "utils/syscache.h"
 
 #include "cdb/cdbdisp_query.h"
-#include "cdb/cdbhash.h"		/* isGreenplumDbHashable() */
+#include "cdb/cdbhash.h"
 #include "cdb/cdbllize.h"
 #include "cdb/cdbmutate.h"
 #include "cdb/cdbplan.h"
@@ -110,24 +110,6 @@ typedef struct ContentIdAssignmentData
 static bool AssignContentIdsToPlanData_Walker(Node *node, void *context);
 
 /**
- * Add the given constant to the given hash, properly checking for null and
- *   using the constant's type and value otherwise
- */
-static
-void
-CdbHashConstValue(CdbHash *h, Const *c)
-{
-	if (c->constisnull)
-	{
-		cdbhashnull(h);
-	}
-	else
-	{
-		cdbhash(h, c->constvalue, typeIsArrayType(c->consttype) ? ANYARRAYOID : c->consttype);
-	}
-}
-
-/**
  * Initialize a DirectDispatchCalculationInfo.
  */
 static void
@@ -162,12 +144,11 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 
 	DirectDispatchCalculationInfo result;
 	RangeTblEntry *rte;
+	Relation	relation = NULL;
 
 	InitDirectDispatchCalculationInfo(&result);
 
-	if (nodeTag((Node *) plan) == T_BitmapHeapScan ||
-		nodeTag((Node *) plan) == T_BitmapAppendOnlyScan ||
-		nodeTag((Node *) plan) == T_BitmapTableScan)
+	if (nodeTag((Node *) plan) == T_BitmapHeapScan)
 	{
 		/*
 		 * do not assert for bitmap heap scan --> it can have a child which is
@@ -186,39 +167,33 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 	Assert(plan->righttree == NULL);
 
 	/* open and get relation info */
+	rte = rt_fetch(rangeTableIndex, rtable);
+	if (rte->rtekind == RTE_RELATION)
 	{
-		Relation	relation;
+		/* Get a copy of the rel's GpPolicy from the relcache. */
+		relation = relation_open(rte->relid, NoLock);
+		policy = relation->rd_cdbpolicy;
 
-		rte = rt_fetch(rangeTableIndex, rtable);
-		if (rte->rtekind == RTE_RELATION)
+		if (policy != NULL)
 		{
-			/* Get a copy of the rel's GpPolicy from the relcache. */
-			relation = relation_open(rte->relid, NoLock);
-			policy = RelationGetPartitioningKey(relation);
-
-			if (policy != NULL)
+			parts = (PartitionKeyInfo *) palloc(policy->nattrs * sizeof(PartitionKeyInfo));
+			for (i = 0; i < policy->nattrs; i++)
 			{
-				parts = (PartitionKeyInfo *) palloc(policy->nattrs * sizeof(PartitionKeyInfo));
-				for (i = 0; i < policy->nattrs; i++)
-				{
-					parts[i].attr = relation->rd_att->attrs[policy->attrs[i] - 1];
-					parts[i].values = NULL;
-					parts[i].numValues = 0;
-					parts[i].counter = 0;
-				}
+				parts[i].attr = relation->rd_att->attrs[policy->attrs[i] - 1];
+				parts[i].values = NULL;
+				parts[i].numValues = 0;
+				parts[i].counter = 0;
 			}
-			relation_close(relation, NoLock);
 		}
-		else
-		{
-			/* fall through, policy will be NULL so we won't direct dispatch */
-		}
+	}
+	else
+	{
+		/* fall through, policy will be NULL so we won't direct dispatch */
 	}
 
 	if (rte->forceDistRandom ||
 		policy == NULL ||
-		policy->nattrs == 0 ||
-		policy->ptype != POLICYTYPE_PARTITIONED)
+		!GpPolicyIsHashPartitioned(policy))
 	{
 		result.dd.isDirectDispatch = false;
 	}
@@ -226,13 +201,20 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 	{
 		long		totalCombinations = 1;
 
+		Assert(parts != NULL);
+
 		/* calculate possible value set for each partitioning attribute */
 		for (i = 0; i < policy->nattrs; i++)
 		{
 			Var		   *var;
 			PossibleValueSet pvs;
 
-			var = makeVar(rangeTableIndex, policy->attrs[i], parts[i].attr->atttypid, parts[i].attr->atttypmod, 0);
+			var = makeVar(rangeTableIndex,
+						  policy->attrs[i],
+						  parts[i].attr->atttypid,
+						  parts[i].attr->atttypmod,
+						  parts[i].attr->attcollation,
+						  0);
 
 			/**
 			 * Note that right now we only examine the given qual.  This is okay because if there are other
@@ -276,10 +258,12 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 		}
 		else if (totalCombinations > 0 &&
 			/* don't bother for ones which will likely hash to many segments */
-				 totalCombinations < GpIdentity.numsegments * 3)
+				 totalCombinations < policy->numsegments * 3)
 		{
-			CdbHash    *h = makeCdbHash(GpIdentity.numsegments);
-			long		index = 0;
+			CdbHash    *h;
+			long		index;
+
+			h = makeCdbHashForRelation(relation);
 
 			result.dd.isDirectDispatch = true;
 			result.dd.contentIds = NULL;
@@ -301,7 +285,9 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 
 					if (IsA(val, Const))
 					{
-						CdbHashConstValue(h, (Const *) val);
+						Const		*c = (Const *) val;
+
+						cdbhash(h, i + 1, c->constvalue, c->constisnull);
 					}
 					else
 					{
@@ -316,16 +302,7 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 
 				hashCode = cdbhashreduce(h);
 
-				/*
-				 * right now we only allow ONE contentid
-				 */
-				if (result.dd.contentIds == NULL)
-					result.dd.contentIds = list_make1_int(hashCode);
-				else if (linitial_int(result.dd.contentIds) != hashCode)
-				{
-					result.dd.isDirectDispatch = false;
-					break;
-				}
+				result.dd.contentIds = list_append_unique_int(result.dd.contentIds, hashCode);
 			}
 		}
 		else
@@ -334,6 +311,9 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 			result.dd.isDirectDispatch = false;
 		}
 	}
+
+	if (rte->rtekind == RTE_RELATION)
+		relation_close(relation, NoLock);
 
 	result.haveProcessedAnyCalculations = true;
 	return result;
@@ -365,20 +345,10 @@ MergeDirectDispatchCalculationInfo(DirectDispatchCalculationInfo *to, DirectDisp
 		/* to didn't even think it needed to run so accept from */
 		to->dd.contentIds = from->dd.contentIds;
 	}
-	else if (linitial_int(to->dd.contentIds) != linitial_int(from->dd.contentIds))
-	{
-		/*
-		 * we only support dispatch to single segment or all segments, so
-		 * can't support this right now
-		 */
-		/* but this needs to be a union of the segments */
-		to->dd.isDirectDispatch = false;
-	}
 	else
 	{
-		/* they matched -- no merge required! */
-
-		Assert(list_length(to->dd.contentIds) == list_length(from->dd.contentIds));
+		/* union to with from */
+		to->dd.contentIds = list_union_int(to->dd.contentIds, from->dd.contentIds);
 	}
 
 	to->haveProcessedAnyCalculations = true;
@@ -429,7 +399,10 @@ FinalizeDirectDispatchDataForSlice(Node *node, ContentIdAssignmentData *data, bo
 
 				if (ddcr->dd.contentIds == NULL)
 				{
-					ddcr->dd.contentIds = list_make1_int(cdb_randint(GpIdentity.numsegments - 1, 0));
+					int			random_segno;
+
+					random_segno = cdbhashrandomseg(getgpsegmentCount());
+					ddcr->dd.contentIds = list_make1_int(random_segno);
 					if (ShouldPrintTestMessages())
 						elog(INFO, "DDCR learned no content dispatch is required");
 				}
@@ -485,6 +458,11 @@ AssignContentIdsToPlanData_Walker(Node *node, void *context)
 				/* no change to dispatchInfo --> just iterate children */
 				break;
 			case T_Append:
+			case T_MergeAppend:
+				/* no change to dispatchInfo --> just iterate children */
+				break;
+			case T_LockRows:
+			case T_ModifyTable:
 				/* no change to dispatchInfo --> just iterate children */
 				break;
 			case T_BitmapAnd:
@@ -492,20 +470,18 @@ AssignContentIdsToPlanData_Walker(Node *node, void *context)
 				/* no change to dispatchInfo --> just iterate children */
 				break;
 			case T_BitmapHeapScan:
-			case T_BitmapAppendOnlyScan:
-			case T_BitmapTableScan:
 				/* no change to dispatchInfo --> just iterate children */
 				break;
 			case T_SeqScan:
-			case T_AppendOnlyScan:
-			case T_AOCSScan:
 
 				/*
 				 * we can determine the dispatch data to merge by looking at
 				 * the relation begin scanned
 				 */
-				dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable, (Plan *) node, ((Scan *) node)->scanrelid,
-																	  (Node *) ((Plan *) node)->qual);
+				dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable,
+																	 (Plan *) node,
+																	 ((Scan *) node)->scanrelid,
+																	 (Node *) ((Plan *) node)->qual);
 				break;
 
 			case T_ExternalScan:
@@ -522,11 +498,30 @@ AssignContentIdsToPlanData_Walker(Node *node, void *context)
 					 * we can determine the dispatch data to merge by looking
 					 * at the relation begin scanned
 					 */
-					dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable, (Plan *) node, ((Scan *) node)->scanrelid,
-																		  (Node *) indexScan->indexqualorig);
+					dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable,
+																		 (Plan *) node,
+																		 ((Scan *) node)->scanrelid,
+																		 (Node *) indexScan->indexqualorig);
 					/* must use _orig_ qual ! */
 				}
 				break;
+
+			case T_IndexOnlyScan:
+				{
+					IndexOnlyScan  *indexOnlyScan = (IndexOnlyScan *) node;
+
+					/*
+					 * we can determine the dispatch data to merge by looking
+					 * at the relation begin scanned
+					 */
+					dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable,
+																		 (Plan *) node,
+																		 ((Scan *) node)->scanrelid,
+																		 (Node *) indexOnlyScan->indexqualorig);
+					/* must use _orig_ qual ! */
+				}
+				break;
+
 			case T_BitmapIndexScan:
 				{
 					BitmapIndexScan *bitmapScan = (BitmapIndexScan *) node;
@@ -535,8 +530,10 @@ AssignContentIdsToPlanData_Walker(Node *node, void *context)
 					 * we can determine the dispatch data to merge by looking
 					 * at the relation begin scanned
 					 */
-					dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable, (Plan *) node, ((Scan *) node)->scanrelid,
-																		  (Node *) bitmapScan->indexqualorig);
+					dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable,
+																		 (Plan *) node,
+																		 ((Scan *) node)->scanrelid,
+																		 (Node *) bitmapScan->indexqualorig);
 					/* must use original qual ! */
 				}
 				break;
@@ -622,6 +619,13 @@ AssignContentIdsToPlanData_Walker(Node *node, void *context)
 					pushNewDirectDispatchInfo = true;
 					break;
 				}
+			case T_ForeignScan:
+				DisableTargetedDispatch(&dispatchInfo); /* not sure about
+														 * foreign tables ...
+														 * so disable */
+				break;
+			case T_SplitUpdate:
+				break;
 			default:
 				elog(ERROR, "Invalid plan node %d", nodeTag(node));
 				break;
@@ -668,23 +672,33 @@ AssignContentIdsToPlanData_Walker(Node *node, void *context)
 	return result;
 }
 
-/**
- * Update the plan and its descendants with markings telling which subsets of content the node can run on.
- *
+/*
+ * Update the plan and its descendants with markings telling which subsets of
+ * content the node can run on.
  */
 void
 AssignContentIdsToPlanData(Query *query, Plan *plan, PlannerInfo *root)
 {
 	ContentIdAssignmentData data;
+	DirectDispatchCalculationInfo *ddcr;
+	MemoryContext		old_context;
+	MemoryContext		new_context;
+
+	new_context = AllocSetContextCreate(CurrentMemoryContext,
+										"AssignContentIdsToPlanData",
+										ALLOCSET_DEFAULT_MINSIZE,
+										ALLOCSET_DEFAULT_INITSIZE,
+										ALLOCSET_DEFAULT_MAXSIZE);
+
+	old_context = MemoryContextSwitchTo(new_context);
 
 	/* setup */
-	SwitchedMemoryContext mem = AllocSetCreateDefaultContextInCurrentAndSwitchTo("AssignContentIdsToPlanData");
-	DirectDispatchCalculationInfo *ddcr = palloc(sizeof(DirectDispatchCalculationInfo));
+	ddcr = palloc(sizeof(DirectDispatchCalculationInfo));
 
 	InitDirectDispatchCalculationInfo(ddcr);
 
 	planner_init_plan_tree_base(&data.base, root);
-	data.memoryContextForOutput = mem.oldContext;
+	data.memoryContextForOutput = old_context;
 	data.sliceStack = list_make1(ddcr);
 	data.rtable = root->glob->finalrtable;
 	data.allSlices = NULL;
@@ -720,5 +734,6 @@ AssignContentIdsToPlanData(Query *query, Plan *plan, PlannerInfo *root)
 		}
 	}
 
-	DeleteAndRestoreSwitchedMemoryContext(mem);
+	MemoryContextSwitchTo(old_context);
+	MemoryContextDelete(new_context);
 }

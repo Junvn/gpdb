@@ -3,11 +3,11 @@
  * ts_parse.c
  *		main parse functions for tsearch
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tsearch/ts_parse.c,v 1.9 2008/10/17 18:05:19 teodor Exp $
+ *	  src/backend/tsearch/ts_parse.c
  *
  *-------------------------------------------------------------------------
  */
@@ -15,7 +15,6 @@
 #include "postgres.h"
 
 #include "tsearch/ts_cache.h"
-#include "tsearch/ts_public.h"
 #include "tsearch/ts_utils.h"
 
 #define IGNORE_LONGLEXEME	1
@@ -29,7 +28,6 @@ typedef struct ParsedLex
 	int			type;
 	char	   *lemm;
 	int			lenlemm;
-	bool		resfollow;
 	struct ParsedLex *next;
 } ParsedLex;
 
@@ -181,13 +179,15 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 	if (ld->curDictId == InvalidOid)
 	{
 		/*
-		 * usial mode: dictionary wants only one word, but we should keep in
+		 * usual mode: dictionary wants only one word, but we should keep in
 		 * mind that we should go through all stack
 		 */
 
 		while (ld->towork.head)
 		{
 			ParsedLex  *curVal = ld->towork.head;
+			char	   *curValLemm = curVal->lemm;
+			int			curValLenLemm = curVal->lenlemm;
 
 			map = ld->cfg->map + curVal->type;
 
@@ -203,12 +203,12 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 				dict = lookup_ts_dictionary_cache(map->dictIds[i]);
 
 				ld->dictState.isend = ld->dictState.getnext = false;
-				ld->dictState.private = NULL;
+				ld->dictState.private_state = NULL;
 				res = (TSLexeme *) DatumGetPointer(FunctionCall4(
 															 &(dict->lexize),
 											 PointerGetDatum(dict->dictData),
-											   PointerGetDatum(curVal->lemm),
-											  Int32GetDatum(curVal->lenlemm),
+												 PointerGetDatum(curValLemm),
+												Int32GetDatum(curValLenLemm),
 											  PointerGetDatum(&ld->dictState)
 																 ));
 
@@ -229,6 +229,13 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 
 				if (!res)		/* dictionary doesn't know this lexeme */
 					continue;
+
+				if (res->flags & TSL_FILTER)
+				{
+					curValLemm = res->lexeme;
+					curValLenLemm = strlen(res->lexeme);
+					continue;
+				}
 
 				RemoveHead(ld);
 				setCorrLex(ld, correspondLexem);
@@ -265,7 +272,7 @@ LexizeExec(LexizeData *ld, ParsedLex **correspondLexem)
 
 				/*
 				 * We should be sure that current type of lexeme is recognized
-				 * by our dictinonary: we just check is it exist in list of
+				 * by our dictionary: we just check is it exist in list of
 				 * dictionaries ?
 				 */
 				for (i = 0; i < map->len && !dictExists; i++)
@@ -463,18 +470,18 @@ hlfinditem(HeadlineParsedText *prs, TSQuery query, char *buf, int buflen)
 	for (i = 0; i < query->size; i++)
 	{
 		if (item->type == QI_VAL &&
-			tsCompareString( GETOPERAND(query) + item->operand.distance, item->operand.length,
-							 buf, buflen, item->operand.prefix ) == 0 )
+			tsCompareString(GETOPERAND(query) + item->qoperand.distance, item->qoperand.length,
+							buf, buflen, item->qoperand.prefix) == 0)
 		{
 			if (word->item)
 			{
 				memcpy(&(prs->words[prs->curwords]), word, sizeof(HeadlineWordEntry));
-				prs->words[prs->curwords].item = &item->operand;
+				prs->words[prs->curwords].item = &item->qoperand;
 				prs->words[prs->curwords].repeated = 1;
 				prs->curwords++;
 			}
 			else
-				word->item = &item->operand;
+				word->item = &item->qoperand;
 		}
 		item++;
 	}
@@ -583,9 +590,9 @@ generateHeadline(HeadlineParsedText *prs)
 {
 	text	   *out;
 	char	   *ptr;
-	int			len          = 128;
-	int	   		numfragments = 0;
-	int2	   		infrag       = 0;
+	int			len = 128;
+	int			numfragments = 0;
+	int16		infrag = 0;
 
 	HeadlineWordEntry *wrd = prs->words;
 
@@ -610,15 +617,15 @@ generateHeadline(HeadlineParsedText *prs)
 
 				/* start of a new fragment */
 				infrag = 1;
-				numfragments ++;
-				/* add a fragment delimitor if this is after the first one */ 
+				numfragments++;
+				/* add a fragment delimiter if this is after the first one */
 				if (numfragments > 1)
 				{
 					memcpy(ptr, prs->fragdelim, prs->fragdelimlen);
 					ptr += prs->fragdelimlen;
-				}	
+				}
 
-			}	
+			}
 			if (wrd->replace)
 			{
 				*ptr = ' ';
@@ -645,7 +652,7 @@ generateHeadline(HeadlineParsedText *prs)
 			if (infrag)
 				infrag = 0;
 			pfree(wrd->word);
-		}	
+		}
 
 		wrd++;
 	}

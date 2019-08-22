@@ -15,17 +15,49 @@
 #   hitting max_connections limit on segments.
 #
 
-test: gp_metadata variadic_parameters default_parameters function_extensions spi gp_xml pgoptions shared_scan null
+# gp_toolkit performs a vacuum and checks that it truncated the relation. That
+# might not happen if other backends are holding transactions open, preventing
+# vacuum from removing dead tuples. And run gp_toolkit early to make some log
+# file related tests (like gp_log_system, etc) faster.
+test: gp_toolkit
 
-test: leastsquares opr_sanity_gp decode_expr bitmapscan bitmapscan_ao case_gp limit_gp notin percentile join_gp union_gp gpcopy gp_create_table gp_create_view window_views
-test: filter gpctas gpdist matrix toast sublink table_functions olap_setup complex opclass_ddl information_schema guc_env_var guc_gp gp_explain
-test: bitmap_index gp_dump_query_oids analyze gp_owner_permission
-test: indexjoin as_alias regex_gp gpparams with_clause transient_types gp_rules
+# enable query metrics cluster GUC
+test: instr_in_shmem_setup
+# run separately - because slot counter may influenced by other parallel queries
+test: instr_in_shmem
+
+test: createdb
+test: gp_tablespace gp_aggregates gp_metadata variadic_parameters default_parameters function_extensions spi gp_xml shared_scan update_gp returning_gp resource_queue_with_rule gp_types gp_index
+test: spi_processed64bit
+test: python_processed64bit
+test: gp_tablespace_with_faults
+
+test: temp_tablespaces
+test: default_tablespace
+
+test: leastsquares opr_sanity_gp decode_expr bitmapscan bitmapscan_ao case_gp limit_gp notin percentile join_gp union_gp gpcopy gpcopy_encoding gp_create_table gp_create_view window_views namespace_gp replication_slots create_table_like_gp
+
+test: filter gpctas gpdist gpdist_opclasses gpdist_legacy_opclasses matrix toast sublink table_functions olap_setup complex opclass_ddl information_schema guc_env_var guc_gp gp_explain distributed_transactions explain_format
+
+# test gpdb internal and segment connections
+test: gp_connections
+
+# bitmap_index triggers recovery, run it seperately
+test: bitmap_index
+test: gp_dump_query_oids analyze gp_owner_permission incremental_analyze
+test: indexjoin as_alias regex_gp gpparams with_clause transient_types gp_rules dispatch_encoding
 # dispatch should always run seperately from other cases.
 test: dispatch
 
+# interconnect tests
+test: icudp/gp_interconnect_queue_depth icudp/gp_interconnect_queue_depth_longtime icudp/gp_interconnect_snd_queue_depth icudp/gp_interconnect_snd_queue_depth_longtime icudp/gp_interconnect_min_retries_before_timeout icudp/gp_interconnect_transmit_timeout icudp/gp_interconnect_cache_future_packets icudp/gp_interconnect_default_rtt icudp/gp_interconnect_fc_method icudp/gp_interconnect_min_rto icudp/gp_interconnect_timer_checking_period icudp/gp_interconnect_timer_period icudp/queue_depth_combination_loss icudp/queue_depth_combination_capacity
+
+# event triggers cannot run concurrently with any test that runs DDL
+test: event_trigger_gp
+
 # deadlock tests run separately - because we don't know which one gets stuck.
 test: deadlock
+test: deadlock2
 
 # test workfiles
 test: workfile/hashagg_spill workfile/hashjoin_spill workfile/materialize_spill workfile/sisc_mat_sort workfile/sisc_sort_spill workfile/sort_spill workfile/spilltodisk
@@ -33,24 +65,39 @@ test: workfile/hashagg_spill workfile/hashjoin_spill workfile/materialize_spill 
 # 'zlib' utilizes fault injectors so it needs to be in a group by itself
 test: zlib
 
+# Check for shmem leak for instrumentation slots before gpdb restart
+test: instr_in_shmem_verify
+
+test: workfile_limits
 # This test will change the gp_workfile_limit_per_segment and will need to restart the DB.
 # It will also use faultinjector - so it needs to be in a group by itself.
 test: segspace_setup
 test: segspace
 test: segspace_cleanup
+
 test: cursor
 
 # 'query_finish_pending' sets QueryFinishPending flag to true during query execution using fault injectors
 # so it needs to be in a group by itself
 test: query_finish_pending
 
-test: gpdiffcheck gptokencheck gp_hashagg sequence_gp tidscan co_nestloop_idxscan dml_in_udf
+test: gpdiffcheck gptokencheck gp_hashagg sequence_gp tidscan co_nestloop_idxscan dml_in_udf gpdtm_plpgsql
 
-test: rangefuncs_cdb gp_dqa subselect_gp subselect_gp2 distributed_transactions olap_group olap_window_seq sirv_functions appendonly create_table_distpol alter_distpol_dropped query_finish
+# The test must be run by itself as it injects a fault on QE to fail
+# at the 2nd phase of 2PC.
+test: dtm_retry
+
+# The appendonly test cannot be run concurrently with tests that have
+# serializable transactions (may conflict with AO vacuum operations).
+test: rangefuncs_cdb gp_dqa subselect_gp subselect_gp2 gp_transactions olap_group olap_window_seq sirv_functions appendonly create_table_distpol alter_distpol_dropped query_finish subselect_gp_indexes
+
+test: partial_table
 
 # 'partition' runs for a long time, so try to keep it together with other
 # long-running tests.
-test: partition partition1 partition_indexing parruleord partition_storage partition_ddl
+test: partition partition1 partition_indexing parruleord partition_storage partition_ddl partition_with_user_defined_function partition_unlogged partition_subquery partition_with_user_defined_function_that_truncates
+
+test: index_constraint_naming index_constraint_naming_partition index_constraint_naming_upgrade
 # 'partition_locking' gets confused if other backends run concurrently and
 # hold locks.
 test: partition_locking
@@ -62,27 +109,28 @@ test: sreh
 #test: olap_window
 #test: tpch500GB
 
+test: db_size_functions
+
 # FIXME: These tests no longer work, because they try to set
 # gp_interconnect_type, which doesn't work:
 # ERROR:  parameter "gp_interconnect_type" cannot be set after connection start
 
 ignore: gp_portal_error
-test: external_table external_table_create_privs column_compression eagerfree gpdtm_plpgsql alter_table_aocs alter_table_aocs2 alter_distribution_policy ic aoco_privileges aocs
-test: alter_table_set alter_table_gp alter_table_ao ao_create_alter_valid_table subtransaction_visibility oid_consistency udf_exception_blocks
-ignore: icudp_full
+test: external_table external_table_create_privs column_compression eagerfree alter_table_aocs alter_table_aocs2 alter_distribution_policy aoco_privileges aocs
+test: alter_table_set alter_table_gp alter_table_ao subtransaction_visibility oid_consistency udf_exception_blocks
+test: ic
 
 test: resource_queue
 test: resource_queue_function
+test: resource_queue_stat
 test: resource_group
+test: resource_group_cpuset
+test: resource_group_gucs
 test: wrkloadadmin
 
-# gp_toolkit performs a vacuum and checks that it truncated the relation. That
-# might not happen if other backends are holding transactions open, preventing
-# vacuum from removing dead tuples.
-test: gp_toolkit
-
-test: gp_toolkit_ao_funcs filespace trig auth_constraint role portals_updatable plpgsql_cache timeseries pg_stat_last_operation gp_numeric_agg partindex_test partition_pruning runtime_stats
-test: rle rle_delta dsp
+# expand_table tests may affect the result of 'gp_explain', keep them below that
+test: gp_toolkit_ao_funcs trig auth_constraint role portals_updatable plpgsql_cache timeseries pg_stat_last_operation pg_stat_last_shoperation gp_numeric_agg partindex_test partition_pruning runtime_stats expand_table expand_table_ao expand_table_aoco expand_table_regression
+test: rle rle_delta dsp not_out_of_shmem_exit_slots
 
 # direct dispatch tests
 test: direct_dispatch bfv_dd bfv_dd_multicolumn bfv_dd_types
@@ -100,6 +148,8 @@ test: direct_dispatch bfv_dd bfv_dd_multicolumn bfv_dd_types
 test: catalog
 
 test: bfv_catalog bfv_index bfv_olap bfv_aggregate bfv_partition bfv_partition_plans DML_over_joins gporca bfv_statistic
+# NOTE: gporca_faults uses gp_fault_injector - so do not add to a parallel group
+test: gporca_faults
  
 test: aggregate_with_groupingsets 
 
@@ -107,6 +157,8 @@ test: nested_case_null sort bb_mpph
 test: bb_memory_quota memconsumption
 
 test: tuple_serialization
+# Tests for replicated table
+test: rpt rpt_joins rpt_tpch rpt_returning
 
 # NOTE: The bfv_temp test assumes that there are no temporary tables in
 # other sessions. Therefore the other tests in this group mustn't create
@@ -115,19 +167,20 @@ test: bfv_cte bfv_joins bfv_subquery bfv_planner bfv_legacy bfv_temp bfv_dml
 
 test: qp_olap_mdqa qp_misc gp_recursive_cte qp_dml_joins qp_dml_oids trigger_sets_oid
 
-test: qp_misc_jiras qp_with_clause qp_executor qp_olap_windowerr qp_olap_window qp_derived_table qp_bitmapscan session_level_memory_consumption qp_dropped_cols
+test: qp_misc_jiras qp_with_clause qp_executor qp_olap_windowerr qp_olap_window qp_derived_table qp_bitmapscan qp_dropped_cols
 test: qp_with_functional_inlining qp_with_functional_noinlining
-test: qp_functions qp_misc_rio_join_small qp_misc_rio qp_correlated_query qp_targeted_dispatch qp_gist_indexes2 qp_gist_indexes3 qp_gist_indexes4 qp_query_execution
-
-test: dpe qp_dpe qp_subquery qp_left_anti_semi_join qp_union_intersect qp_functions_idf qp_regexp qp_resource_queue qp_orca_fallback planner_fallback
-
 test: qp_functions_in_contexts_setup
-test: qp_functions_in_from qp_functions_in_select qp_functions_in_subquery qp_functions_in_subquery_constant qp_functions_in_with
+test: qp_misc_rio_join_small qp_misc_rio qp_correlated_query qp_targeted_dispatch qp_gist_indexes2 qp_gist_indexes3 qp_gist_indexes4 qp_query_execution qp_functions_in_from qp_functions_in_select qp_functions_in_subquery qp_functions_in_subquery_column qp_functions_in_subquery_constant qp_functions_in_with
+
+test: dpe qp_dpe qp_subquery qp_left_anti_semi_join qp_union_intersect qp_functions qp_functions_idf qp_regexp qp_resource_queue qp_orca_fallback
 
 test: olap_setup
 test: qp_olap_group qp_olap_group2
 
 test: hooktest partition_rank
+
+# Test query_info_collect_hook are called in expected sequence on normal query, query error/abort
+test: query_info_hook_test
 
 ignore: tpch500GB_orca
 
@@ -180,10 +233,32 @@ test: vacuum_full_freeze_heap
 test: vacuum_full_heap
 test: vacuum_full_heap_bitmapindex
 
-test: ao_checksum_corruption AOCO_Compression2 table_statistics
-test: metadata_track
+test: ao_checksum_corruption AOCO_Compression AORO_Compression table_statistics fts_error
 test: workfile_mgr_test
+test: session_reset
 
-test: psql_gp_commands pg_resetxlog
+test: psql_gp_commands pg_resetxlog dropdb_check_shared_buffer_cache gp_upgrade_cornercases
+
+# Check for shmem leak for instrumentation slots
+test: instr_in_shmem_verify
+
+test: temp_relation
+test: alter_db_set_tablespace
+
+# This cannot run in parallel because other tests could increment the Oid
+# counters and make the Oid counter observations hardcoded in the answer file
+# incorrect.
+test: oid_wraparound
+
+# fts_recovery_in_progresss uses fault injectors to simulate FTS fault states,
+# hence it should be run in isolation.
+test: fts_recovery_in_progress
+test: autovacuum-template0
+
+# gpexpand introduce the partial tables, check them if they can run correctly
+test: gangsize gang_reuse
+
+# some utilities do not work while doing gpexpand, check them can print correct message
+test: run_utility_gpexpand_phase1
 
 # end of tests

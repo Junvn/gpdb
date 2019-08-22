@@ -3,10 +3,10 @@
  * snapshot.h
  *	  POSTGRES snapshot definition
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/utils/snapshot.h,v 1.3 2008/05/12 20:02:02 alvherre Exp $
+ * src/include/utils/snapshot.h
  *
  *-------------------------------------------------------------------------
  */
@@ -30,9 +30,25 @@ typedef struct SnapshotData *Snapshot;
  * The specific semantics of a snapshot are encoded by the "satisfies"
  * function.
  */
-typedef bool (*SnapshotSatisfiesFunc) (Relation relation, HeapTupleHeader tuple,
-									   Snapshot snapshot, Buffer buffer);
+typedef bool (*SnapshotSatisfiesFunc) (Relation relation, HeapTuple htup,
+										   Snapshot snapshot, Buffer buffer);
 
+/*
+ * Struct representing all kind of possible snapshots.
+ *
+ * There are several different kinds of snapshots:
+ * * Normal MVCC snapshots
+ * * MVCC snapshots taken during recovery (in Hot-Standby mode)
+ * * Historic MVCC snapshots used during logical decoding
+ * * snapshots passed to HeapTupleSatisfiesDirty()
+ * * snapshots used for SatisfiesAny, Toast, Self where no members are
+ *	 accessed.
+ *
+ * TODO: It's probably a good idea to split this struct using a NodeTag
+ * similar to how parser and executor nodes are handled, with one type for
+ * each different kind of snapshot to avoid overloading the meaning of
+ * individual fields.
+ */
 typedef struct SnapshotData
 {
 	SnapshotSatisfiesFunc satisfies;	/* tuple test function */
@@ -49,11 +65,29 @@ typedef struct SnapshotData
 	 */
 	TransactionId xmin;			/* all XID < xmin are visible to me */
 	TransactionId xmax;			/* all XID >= xmax are invisible to me */
+
+	/*
+	 * For normal MVCC snapshot this contains the all xact IDs that are in
+	 * progress, unless the snapshot was taken during recovery in which case
+	 * it's empty. For historic MVCC snapshots, the meaning is inverted, i.e.
+	 * it contains *committed* transactions between xmin and xmax.
+	 */
+	TransactionId *xip;
 	uint32		xcnt;			/* # of xact ids in xip[] */
-	TransactionId *xip;			/* array of xact IDs in progress */
 	/* note: all ids in xip[] satisfy xmin <= xip[i] < xmax */
-	int32		subxcnt;		/* # of xact ids in subxip[], -1 if overflow */
-	TransactionId *subxip;		/* array of subxact IDs in progress */
+	int32		subxcnt;		/* # of xact ids in subxip[] */
+
+	/*
+	 * For non-historic MVCC snapshots, this contains subxact IDs that are in
+	 * progress (and other transactions that are in progress if taken during
+	 * recovery). For historic snapshot it contains *all* xids assigned to the
+	 * replayed transaction, including the toplevel xid.
+	 */
+	TransactionId *subxip;
+	bool		suboverflowed;	/* has the subxip array overflowed? */
+	bool		takenDuringRecovery;	/* recovery-shaped snapshot? */
+	bool		copied;			/* false if it's a static snapshot */
+	bool		haveDistribSnapshot; /* True if this snapshot is distributed. */
 
 	/*
 	 * note: all ids in subxip[] are >= xmin, but we don't bother filtering
@@ -62,9 +96,6 @@ typedef struct SnapshotData
 	CommandId	curcid;			/* in my xact, CID < curcid are visible */
 	uint32		active_count;	/* refcount on ActiveSnapshot stack */
 	uint32		regd_count;		/* refcount on RegisteredSnapshotList */
-	bool		copied;			/* false if it's a static snapshot */
-
-	bool		haveDistribSnapshot; /* True if this snapshot is distributed. */
 
 	/*
 	 * GP: Global information about which transactions are visible for a
@@ -87,4 +118,4 @@ typedef enum
 	HeapTupleBeingUpdated
 } HTSU_Result;
 
-#endif /* SNAPSHOT_H */
+#endif   /* SNAPSHOT_H */

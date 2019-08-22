@@ -2,9 +2,9 @@
 #
 # Makefile for backend/tsearch
 #
-# Copyright (c) 2006-2008, PostgreSQL Global Development Group
+# Copyright (c) 2006-2014, PostgreSQL Global Development Group
 #
-# $PostgreSQL: pgsql/src/backend/tsearch/Makefile,v 1.8 2008/09/19 19:03:40 tgl Exp $
+# src/backend/tsearch/Makefile
 #
 #-------------------------------------------------------------------------
 subdir = src/backend/tsearch
@@ -25,15 +25,11 @@ include $(top_srcdir)/src/backend/common.mk
 
 .PHONY: install-data
 install-data: $(DICTFILES) installdirs
-	for i in $(DICTFILES); \
-		do $(INSTALL_DATA) $(srcdir)/$$i '$(DESTDIR)$(datadir)/$(DICTDIR)/'$$i || exit; \
-	done
+	$(INSTALL_DATA) $(addprefix $(srcdir)/,$(DICTFILES)) '$(DESTDIR)$(datadir)/$(DICTDIR)/'
 
 installdirs:
-	$(mkinstalldirs) '$(DESTDIR)$(datadir)' '$(DESTDIR)$(datadir)/$(DICTDIR)'
+	$(MKDIR_P) '$(DESTDIR)$(datadir)' '$(DESTDIR)$(datadir)/$(DICTDIR)'
 
 .PHONY: uninstall-data
 uninstall-data:
-	for i in $(DICTFILES); \
-		do rm -rf '$(DESTDIR)$(datadir)/$(DICTDIR)/'$$i || exit; \
-	done
+	rm -rf $(addprefix '$(DESTDIR)$(datadir)/$(DICTDIR)/',$(DICTFILES))

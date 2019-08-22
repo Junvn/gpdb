@@ -23,7 +23,9 @@
 #include "catalog/indexing.h"
 #include "catalog/oid_dispatch.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_resourcetype.h"
 #include "catalog/pg_resqueue.h"
+#include "catalog/pg_resqueuecapability.h"
 #include "nodes/makefuncs.h"
 #include "cdb/cdbvars.h"
 #include "cdb/cdbdisp_query.h"
@@ -34,11 +36,11 @@
 #include "miscadmin.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
-#include "utils/flatfiles.h"
 #include "utils/fmgroids.h"
 #include "utils/formatting.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/resource_manager.h"
 #include "executor/execdesc.h"
 #include "utils/resscheduler.h"
 #include "utils/syscache.h"
@@ -85,7 +87,7 @@ GetResourceTypeByName(char *pNameIn, int *pTypeOut, Oid *pOidOut)
 				BTEqualStrategyNumber, F_NAMEEQ,
 				CStringGetDatum(pNameIn));
 	sscan = systable_beginscan(pg_resourcetype, ResourceTypeResnameIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	tuple = systable_getnext(sscan);
 	if (HeapTupleIsValid(tuple))
@@ -351,7 +353,7 @@ AlterResqueueCapabilityEntry(Oid queueid,
 						Int16GetDatum(resTypeInt));
 
 			sscan = systable_beginscan(rel, ResourceTypeRestypidIndexId,
-									   true, SnapshotNow, 1, &scankey);
+									   true, NULL, 1, &scankey);
 
 			while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
 			{
@@ -456,7 +458,7 @@ AlterResqueueCapabilityEntry(Oid queueid,
 
 		/* Note: key is empty - scan entire table */
 
-		sscan = systable_beginscan(rel, InvalidOid, false, SnapshotNow, 0, NULL);
+		sscan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 		while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
 		{
 			List	   *pentry;
@@ -543,7 +545,7 @@ AlterResqueueCapabilityEntry(Oid queueid,
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(queueid));
 		sscan = systable_beginscan(rel, ResQueueCapabilityResqueueidIndexId, true,
-								   SnapshotNow, 1, &skey);
+								   NULL, 1, &skey);
 
 		ii = 0;
 		while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
@@ -612,7 +614,7 @@ AlterResqueueCapabilityEntry(Oid queueid,
 		scan = systable_beginscan(rel,
 								  ResQueueCapabilityResqueueidIndexId,
 								  /* XXX XXX XXX XXX : snapshotnow ? */
-								  true, SnapshotNow, 1, key);
+								  true, NULL, 1, key);
 
 		ii = 0;
 
@@ -647,6 +649,8 @@ GetResqueueCapabilityEntry(Oid  queueid)
 	Relation	 rel;
 	TupleDesc	 tupdesc;
 
+	Assert(IsTransactionState());
+
 	/* SELECT * FROM pg_resqueuecapability WHERE resqueueid = :1 */
 	rel = heap_open(ResQueueCapabilityRelationId, AccessShareLock);
 
@@ -657,7 +661,7 @@ GetResqueueCapabilityEntry(Oid  queueid)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(queueid));
 	sscan = systable_beginscan(rel, ResQueueCapabilityResqueueidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
 	{
@@ -878,7 +882,7 @@ CreateQueue(CreateQueueStmt *stmt)
 				CStringGetDatum(stmt->queue));
 
 	sscan = systable_beginscan(pg_resqueue_rel, ResQueueRsqnameIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	if (systable_getnext(sscan))
 		ereport(ERROR,
@@ -1153,7 +1157,7 @@ AlterQueue(AlterQueueStmt *stmt)
 	}
 	else
 	{
-		char *tempo = str_toupper(alter_subtype, strlen(alter_subtype));
+		char *tempo = asc_toupper(alter_subtype, strlen(alter_subtype));
 
 		alter_subtype = tempo;
 	}
@@ -1231,7 +1235,7 @@ AlterQueue(AlterQueueStmt *stmt)
 				BTEqualStrategyNumber, F_NAMEEQ,
 				CStringGetDatum(stmt->queue));
 	sscan = systable_beginscan(pg_resqueue_rel, ResQueueRsqnameIndexId,
-							   true, SnapshotNow, 1, &scankey);
+							   true, NULL, 1, &scankey);
 	tuple = systable_getnext(sscan);
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
@@ -1443,7 +1447,7 @@ DropQueue(DropQueueStmt *stmt)
 				CStringGetDatum(stmt->queue));
 
 	sscan = systable_beginscan(pg_resqueue_rel, ResQueueRsqnameIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	tuple = systable_getnext(sscan);
 	if (!HeapTupleIsValid(tuple))
@@ -1468,7 +1472,7 @@ DropQueue(DropQueueStmt *stmt)
 				ObjectIdGetDatum(queueid));
 
 	authid_scan = systable_beginscan(authIdRel, AuthIdRolResQueueIndexId, true,
-							   SnapshotNow, 1, &authid_scankey);
+							   NULL, 1, &authid_scankey);
 
 	if (systable_getnext(authid_scan) != NULL)
 		ereport(ERROR,
@@ -1545,7 +1549,7 @@ DropQueue(DropQueueStmt *stmt)
 				ObjectIdGetDatum(queueid));
 
 	sscan = systable_beginscan(resqueueCapabilityRel, ResQueueCapabilityResqueueidIndexId,
-							   true, SnapshotNow, 1, &scankey);
+							   true, NULL, 1, &scankey);
 
 	while ((tuple = systable_getnext(sscan)) != NULL)
 		simple_heap_delete(resqueueCapabilityRel, &tuple->t_self);
@@ -1556,6 +1560,40 @@ DropQueue(DropQueueStmt *stmt)
 	heap_close(resqueueCapabilityRel, NoLock);
 
 	heap_close(pg_resqueue_rel, NoLock);
+}
+
+Oid
+get_resqueue_oid(const char *queuename, bool missing_ok)
+{
+	Relation	rel;
+	ScanKeyData	scankey;
+	SysScanDesc	scan;
+	HeapTuple	tuple;
+	Oid			oid;
+
+	rel = heap_open(ResQueueRelationId, AccessShareLock);
+	ScanKeyInit(&scankey, Anum_pg_resqueue_rsqname,
+				BTEqualStrategyNumber, F_NAMEEQ,
+				CStringGetDatum(queuename));
+	scan = systable_beginscan(rel, ResQueueRsqnameIndexId, true,
+							  NULL, 1, &scankey);
+	tuple = systable_getnext(scan);
+
+	if (HeapTupleIsValid(tuple))
+		oid = HeapTupleGetOid(tuple);
+	else
+		oid = InvalidOid;
+
+	systable_endscan(scan);
+	heap_close(rel, AccessShareLock);
+
+	if (!OidIsValid(oid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("resource queue \"%s\" does not exist",
+						queuename)));
+
+	return oid;
 }
 
 /*
@@ -1581,7 +1619,7 @@ GetResqueueName(Oid resqueueOid)
 				ObjectIdGetDatum(resqueueOid));
 
 	sscan = systable_beginscan(rel, ResQueueOidIndexId, true,
-							   SnapshotNow, 1, &scankey);
+							   NULL, 1, &scankey);
 
 	tuple = systable_getnext(sscan);
 

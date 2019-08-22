@@ -3,11 +3,11 @@
  * dict_synonym.c
  *		Synonym dictionary: replace word by its synonym
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tsearch/dict_synonym.c,v 1.9 2008/06/18 20:55:42 tgl Exp $
+ *	  src/backend/tsearch/dict_synonym.c
  *
  *-------------------------------------------------------------------------
  */
@@ -15,14 +15,14 @@
 
 #include "commands/defrem.h"
 #include "tsearch/ts_locale.h"
-#include "tsearch/ts_public.h"
 #include "tsearch/ts_utils.h"
-#include "utils/builtins.h"
 
 typedef struct
 {
 	char	   *in;
 	char	   *out;
+	int			outlen;
+	uint16		flags;
 } Syn;
 
 typedef struct
@@ -36,11 +36,14 @@ typedef struct
  * Finds the next whitespace-delimited word within the 'in' string.
  * Returns a pointer to the first character of the word, and a pointer
  * to the next byte after the last character in the word (in *end).
+ * Character '*' at the end of word will not be threated as word
+ * charater if flags is not null.
  */
 static char *
-findwrd(char *in, char **end)
+findwrd(char *in, char **end, uint16 *flags)
 {
 	char	   *start;
+	char	   *lastchar;
 
 	/* Skip leading spaces */
 	while (*in && t_isspace(in))
@@ -53,20 +56,34 @@ findwrd(char *in, char **end)
 		return NULL;
 	}
 
-	start = in;
+	lastchar = start = in;
 
 	/* Find end of word */
 	while (*in && !t_isspace(in))
+	{
+		lastchar = in;
 		in += pg_mblen(in);
+	}
 
-	*end = in;
+	if (in - lastchar == 1 && t_iseq(lastchar, '*') && flags)
+	{
+		*flags = TSL_PREFIX;
+		*end = lastchar;
+	}
+	else
+	{
+		if (flags)
+			*flags = 0;
+		*end = in;
+	}
+
 	return start;
 }
 
 static int
 compareSyn(const void *a, const void *b)
 {
-	return strcmp(((Syn *) a)->in, ((Syn *) b)->in);
+	return strcmp(((const Syn *) a)->in, ((const Syn *) b)->in);
 }
 
 
@@ -84,6 +101,7 @@ dsynonym_init(PG_FUNCTION_ARGS)
 			   *end = NULL;
 	int			cur = 0;
 	char	   *line = NULL;
+	uint16		flags = 0;
 
 	foreach(l, dictoptions)
 	{
@@ -117,7 +135,7 @@ dsynonym_init(PG_FUNCTION_ARGS)
 
 	while ((line = tsearch_readline(&trst)) != NULL)
 	{
-		starti = findwrd(line, &end);
+		starti = findwrd(line, &end, NULL);
 		if (!starti)
 		{
 			/* Empty line */
@@ -130,7 +148,7 @@ dsynonym_init(PG_FUNCTION_ARGS)
 		}
 		*end = '\0';
 
-		starto = findwrd(end + 1, &end);
+		starto = findwrd(end + 1, &end, &flags);
 		if (!starto)
 		{
 			/* A line with only one word (+whitespace). Ignore silently. */
@@ -167,6 +185,9 @@ dsynonym_init(PG_FUNCTION_ARGS)
 			d->syn[cur].in = lowerstr(starti);
 			d->syn[cur].out = lowerstr(starto);
 		}
+
+		d->syn[cur].outlen = strlen(starto);
+		d->syn[cur].flags = flags;
 
 		cur++;
 
@@ -212,7 +233,8 @@ dsynonym_lexize(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(NULL);
 
 	res = palloc0(sizeof(TSLexeme) * 2);
-	res[0].lexeme = pstrdup(found->out);
+	res[0].lexeme = pnstrdup(found->out, found->outlen);
+	res[0].flags = found->flags;
 
 	PG_RETURN_POINTER(res);
 }

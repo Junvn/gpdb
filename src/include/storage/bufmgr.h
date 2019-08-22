@@ -4,17 +4,16 @@
  *	  POSTGRES buffer manager definitions.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/storage/bufmgr.h,v 1.118 2008/11/19 10:34:52 heikki Exp $
+ * src/include/storage/bufmgr.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef BUFMGR_H
 #define BUFMGR_H
 
-#include "cdb/cdbfilerepprimary.h"
 #include "miscadmin.h"
 #include "storage/block.h"
 #include "storage/buf.h"
@@ -39,25 +38,28 @@ typedef enum BufferAccessStrategyType
 /* Possible modes for ReadBufferExtended() */
 typedef enum
 {
-	RBM_NORMAL,			/* Normal read */
-	RBM_ZERO,			/* Don't read from disk, caller will initialize */
-	RBM_ZERO_ON_ERROR	/* Read, but return an all-zeros page on error */
+	RBM_NORMAL,					/* Normal read */
+	RBM_DO_NOT_USE,				/* This used to be RBM_ZERO. Only kept for
+								 * binary compatibility with 3rd party
+								 * extensions. */
+	RBM_ZERO_ON_ERROR,			/* Read, but return an all-zeros page on error */
+	RBM_NORMAL_NO_LOG,			/* Don't log page as invalid during WAL
+								 * replay; otherwise same as RBM_NORMAL */
+	RBM_ZERO_AND_LOCK,			/* Don't read from disk, caller will
+								 * initialize. Also locks the page. */
+	RBM_ZERO_AND_CLEANUP_LOCK	/* Like RBM_ZERO_AND_LOCK, but locks the page
+								 * in "cleanup" mode */
 } ReadBufferMode;
 
 /* in globals.c ... this duplicates miscadmin.h */
 extern PGDLLIMPORT int NBuffers;
 
 /* in bufmgr.c */
-
-/* should not be accessed directly.  Use ShouldMemoryProtectBufferPool() instead */
-extern bool memory_protect_buffer_pool;
 extern bool zero_damaged_pages;
 extern int	bgwriter_lru_maxpages;
 extern double bgwriter_lru_multiplier;
-extern bool bgwriter_flush_all_buffers;
-
-extern PGDLLIMPORT bool IsUnderPostmaster; /* from utils/init/globals.c */
-#define ShouldMemoryProtectBufferPool() (memory_protect_buffer_pool && IsUnderPostmaster)
+extern bool track_io_timing;
+extern int	target_prefetch_pages;
 
 /* in buf_init.c */
 extern PGDLLIMPORT char *BufferBlocks;
@@ -87,20 +89,24 @@ extern PGDLLIMPORT int32 *LocalRefCount;
  *		True iff the given buffer number is valid (either as a shared
  *		or local buffer).
  *
- * This is not quite the inverse of the BufferIsInvalid() macro, since this
- * adds sanity rangechecks on the buffer number.
- *
  * Note: For a long time this was defined the same as BufferIsPinned,
  * that is it would say False if you didn't hold a pin on the buffer.
  * I believe this was bogus and served only to mask logic errors.
  * Code should always know whether it has a buffer reference,
  * independently of the pin state.
+ *
+ * Note: For a further long time this was not quite the inverse of the
+ * BufferIsInvalid() macro, in that it also did sanity checks to verify
+ * that the buffer number was in range.  Most likely, this macro was
+ * originally intended only to be used in assertions, but its use has
+ * since expanded quite a bit, and the overhead of making those checks
+ * even in non-assert-enabled builds can be significant.  Thus, we've
+ * now demoted the range checks to assertions within the macro itself.
  */
 #define BufferIsValid(bufnum) \
 ( \
-	(bufnum) != InvalidBuffer && \
-	(bufnum) >= -NLocBuffer && \
-	(bufnum) <= NBuffers \
+	AssertMacro((bufnum) <= NBuffers && (bufnum) >= -NLocBuffer), \
+	(bufnum) != InvalidBuffer  \
 )
 
 /*
@@ -137,179 +143,6 @@ extern PGDLLIMPORT int32 *LocalRefCount;
 		(Block) (BufferBlocks + ((Size) ((buffer) - 1)) * BLCKSZ) \
 )
 
-// Helper DEFINEs for MirroredLock within Buffer Pool Manager ONLY.
-#ifdef USE_ASSERT_CHECKING
-
-typedef struct MirroredLockBufMgrLocalVars
-{
-	bool mirroredLockIsHeldByMe;
-
-	bool specialResyncManagerFlag;
-
-	bool mirroredVariablesSet;
-} MirroredLockBufMgrLocalVars;
-
-#define MIRROREDLOCK_BUFMGR_DECLARE \
-	MirroredLockBufMgrLocalVars mirroredLockBufMgrLocalVars = {false, false, false};
-#else
-
-typedef struct MirroredLockBufMgrLocalVars
-{
-	bool mirroredLockIsHeldByMe;
-
-	bool specialResyncManagerFlag;
-} MirroredLockBufMgrLocalVars;
-
-#define MIRROREDLOCK_BUFMGR_DECLARE \
-	MirroredLockBufMgrLocalVars mirroredLockBufMgrLocalVars = {false, false};
-#endif
-
-#ifdef USE_ASSERT_CHECKING
-#define MIRROREDLOCK_BUFMGR_LOCK \
-	{ \
-		mirroredLockBufMgrLocalVars.mirroredLockIsHeldByMe = LWLockHeldByMe(MirroredLock); \
-		mirroredLockBufMgrLocalVars.specialResyncManagerFlag = FileRepPrimary_IsResyncManagerOrWorker(); \
-		mirroredLockBufMgrLocalVars.mirroredVariablesSet = true; \
-		\
-		if (!mirroredLockBufMgrLocalVars.mirroredLockIsHeldByMe) \
-		{ \
-			if (!mirroredLockBufMgrLocalVars.specialResyncManagerFlag) \
-			{ \
-				LWLockAcquire(MirroredLock , LW_SHARED); \
-			} \
-			else \
-			{ \
-				HOLD_INTERRUPTS(); \
-			} \
-		} \
-		\
-		Assert(InterruptHoldoffCount > 0); \
-	}
-#else
-#define MIRROREDLOCK_BUFMGR_LOCK \
-	{ \
-		mirroredLockBufMgrLocalVars.mirroredLockIsHeldByMe = LWLockHeldByMe(MirroredLock); \
-		mirroredLockBufMgrLocalVars.specialResyncManagerFlag = FileRepPrimary_IsResyncManagerOrWorker(); \
-		\
-		if (!mirroredLockBufMgrLocalVars.mirroredLockIsHeldByMe) \
-		{ \
-			if (!mirroredLockBufMgrLocalVars.specialResyncManagerFlag) \
-			{ \
-				LWLockAcquire(MirroredLock , LW_SHARED); \
-			} \
-			else \
-			{ \
-				HOLD_INTERRUPTS(); \
-			} \
-		} \
-	}
-#endif
-
-#ifdef USE_ASSERT_CHECKING
-#define MIRROREDLOCK_BUFMGR_UNLOCK \
-	{ \
-		Assert(mirroredLockBufMgrLocalVars.mirroredVariablesSet); \
-		Assert(InterruptHoldoffCount > 0); \
-		\
-		if (!mirroredLockBufMgrLocalVars.mirroredLockIsHeldByMe) \
-		{ \
-			if (!mirroredLockBufMgrLocalVars.specialResyncManagerFlag) \
-			{ \
-				LWLockRelease(MirroredLock); \
-			} \
-			else \
-			{ \
-				RESUME_INTERRUPTS(); \
-			} \
-		} \
-	}
-#else
-#define MIRROREDLOCK_BUFMGR_UNLOCK \
-	{ \
-		if (!mirroredLockBufMgrLocalVars.mirroredLockIsHeldByMe) \
-		{ \
-			if (!mirroredLockBufMgrLocalVars.specialResyncManagerFlag) \
-			{ \
-				LWLockRelease(MirroredLock); \
-			} \
-			else \
-			{ \
-				RESUME_INTERRUPTS(); \
-			} \
-		} \
-	}
-#endif
-
-
-#define MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD \
-	{ \
-		bool alreadyMirroredLockIsHeldByMe; \
-		bool alreadySpecialResyncManagerFlag; \
-		\
-		alreadyMirroredLockIsHeldByMe = LWLockHeldByMe(MirroredLock); \
-		alreadySpecialResyncManagerFlag = FileRepPrimary_IsResyncManagerOrWorker(); \
-		if (!alreadyMirroredLockIsHeldByMe && !alreadySpecialResyncManagerFlag) \
-			elog(ERROR, "Mirrored lock must already be held"); \
-	}
-
-#define MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD_BUF(buf) \
-	{ \
-		if (!BufferIsLocal(buf)) \
-		{ \
-			volatile BufferDesc *bufHdr; \
-			bufHdr = &BufferDescriptors[buffer - 1]; \
-			if (bufHdr->tag.forkNum == MAIN_FORKNUM) \
-				MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD; \
-		} \
-	}
-
-#ifdef USE_ASSERT_CHECKING
-#define MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE \
-	bool verifyMirroredLockIsHeldByMe = false; \
-	bool verifyMirroredVariablesSet = false;
-#else
-#define MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_DECLARE \
-	bool verifyMirroredLockIsHeldByMe = false;
-#endif
-
-#ifdef USE_ASSERT_CHECKING
-#define MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER \
-	{ \
-		verifyMirroredLockIsHeldByMe = LWLockHeldByMe(MirroredLock); \
-		verifyMirroredVariablesSet = true; \
-	}
-#else
-#define MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_ENTER \
-	{ \
-		verifyMirroredLockIsHeldByMe = LWLockHeldByMe(MirroredLock); \
-	}
-#endif
-
-#ifdef USE_ASSERT_CHECKING
-#define MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT \
-	{ \
-		bool currentMirroredLockIsHeldByMe; \
-		\
-		Assert(verifyMirroredVariablesSet); \
-		currentMirroredLockIsHeldByMe = LWLockHeldByMe(MirroredLock); \
-		if (verifyMirroredLockIsHeldByMe != currentMirroredLockIsHeldByMe) \
-			elog(ERROR, "Exiting with mirrored lock held / not held different (enter %s, exit %s)", \
-				 (verifyMirroredLockIsHeldByMe ? "true" : "false"), \
-				 (currentMirroredLockIsHeldByMe ? "true" : "false")); \
-	}
-#else
-#define MIRROREDLOCK_BUFMGR_VERIFY_NO_LOCK_LEAK_EXIT \
-	{ \
-		bool currentMirroredLockIsHeldByMe; \
-		\
-		currentMirroredLockIsHeldByMe = LWLockHeldByMe(MirroredLock); \
-		if (verifyMirroredLockIsHeldByMe != currentMirroredLockIsHeldByMe) \
-			elog(ERROR, "Exiting with mirrored lock held / not held different (enter %s, exit %s)", \
-				 (verifyMirroredLockIsHeldByMe ? "true" : "false"), \
-				 (currentMirroredLockIsHeldByMe ? "true" : "false")); \
-	}
-#endif
-
 /*
  * BufferGetPageSize
  *		Returns the page size within a buffer.
@@ -336,56 +169,66 @@ typedef struct MirroredLockBufMgrLocalVars
 /*
  * prototypes for functions in bufmgr.c
  */
+extern void PrefetchBuffer(Relation reln, ForkNumber forkNum,
+			   BlockNumber blockNum);
 extern Buffer ReadBuffer(Relation reln, BlockNumber blockNum);
 extern Buffer ReadBufferExtended(Relation reln, ForkNumber forkNum,
-								 BlockNumber blockNum, ReadBufferMode mode,
-								 BufferAccessStrategy strategy);
-extern Buffer ReadBuffer_Resync(SMgrRelation reln, BlockNumber blockNum);
-extern Buffer ReadBufferWithoutRelcache(RelFileNode rnode, bool isLocalBuf,
-						ForkNumber forkNum, BlockNumber blockNum,
-						ReadBufferMode mode, BufferAccessStrategy strategy);
+				   BlockNumber blockNum, ReadBufferMode mode,
+				   BufferAccessStrategy strategy);
+extern Buffer ReadBufferWithoutRelcache(RelFileNode rnode,
+						  ForkNumber forkNum, BlockNumber blockNum,
+						  ReadBufferMode mode, BufferAccessStrategy strategy);
 extern void ReleaseBuffer(Buffer buffer);
 extern void UnlockReleaseBuffer(Buffer buffer);
 extern void MarkBufferDirty(Buffer buffer);
 extern void IncrBufferRefCount(Buffer buffer);
 extern Buffer ReleaseAndReadBuffer(Buffer buffer, Relation relation,
 					 BlockNumber blockNum);
+
 extern void InitBufferPool(void);
 extern void InitBufferPoolAccess(void);
 extern void InitBufferPoolBackend(void);
-extern char *ShowBufferUsage(void);
-extern void ResetBufferUsage(void);
 extern void AtEOXact_Buffers(bool isCommit);
 extern void PrintBufferLeakWarning(Buffer buffer);
 extern void CheckPointBuffers(int flags);
 extern BlockNumber BufferGetBlockNumber(Buffer buffer);
-extern BlockNumber RelationGetNumberOfBlocks(Relation relation);
+extern BlockNumber RelationGetNumberOfBlocksInFork(Relation relation,
+								ForkNumber forkNum);
+extern void FlushOneBuffer(Buffer buffer);
 extern void FlushRelationBuffers(Relation rel);
 extern void FlushDatabaseBuffers(Oid dbid);
-extern void DropRelFileNodeBuffers(RelFileNode rnode, ForkNumber forkNum,
-					   bool istemp, BlockNumber firstDelBlock);
-extern void DropDatabaseBuffers(Oid tbpoid, Oid dbid);
+extern void DropRelFileNodeBuffers(RelFileNodeBackend rnode,
+					   ForkNumber forkNum, BlockNumber firstDelBlock);
+extern void DropRelFileNodesAllBuffers(RelFileNodeBackend *rnodes, int nnodes);
+extern void DropDatabaseBuffers(Oid dbid);
+extern XLogRecPtr BufferGetLSNAtomic(Buffer buffer);
+
+#define RelationGetNumberOfBlocks(reln) \
+	RelationGetNumberOfBlocksInFork(reln, MAIN_FORKNUM)
+
+extern bool BufferIsPermanent(Buffer buffer);
 extern XLogRecPtr BufferGetLSNAtomic(Buffer buffer);
 
 #ifdef NOT_USED
 extern void PrintPinnedBufs(void);
 #endif
 extern Size BufferShmemSize(void);
-extern void BufferGetTag(Buffer buffer, RelFileNode *rnode, 
-						 ForkNumber *forknum, BlockNumber *blknum);
+extern void BufferGetTag(Buffer buffer, RelFileNode *rnode,
+			 ForkNumber *forknum, BlockNumber *blknum);
 
-extern void MarkBufferDirtyHint(Buffer buffer, Relation relation);
+extern void MarkBufferDirtyHint(Buffer buffer, bool buffer_std);
 
 extern void UnlockBuffers(void);
 extern void LockBuffer(Buffer buffer, int mode);
 extern bool ConditionalLockBuffer(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
+extern bool HoldingBufferPinThatDelaysRecovery(void);
 
 extern void AbortBufferIO(void);
 
 extern void BufmgrCommit(void);
-extern void BgBufferSync(void);
+extern bool BgBufferSync(void);
 
 extern void AtProcExit_LocalBuffers(void);
 

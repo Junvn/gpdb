@@ -10,12 +10,12 @@
  *
  * Portions Copyright (c) 2006-2010, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Copyright (c) 2002-2008, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2014, PostgreSQL Global Development Group
  *
- * $PostgreSQL: pgsql/src/include/catalog/pg_cast.h,v 1.40 2008/10/31 08:39:22 heikki Exp $
+ * src/include/catalog/pg_cast.h
  *
  * NOTES
- *	  the genbki.sh script reads this file and generates .bki
+ *	  the genbki.pl script reads this file and generates .bki
  *	  information from the DATA() statements.
  *
  *-------------------------------------------------------------------------
@@ -66,14 +66,14 @@ typedef enum CoercionCodes
 
 /*
  * The allowable values for pg_cast.castmethod are specified by this enum.
- * Since castcontext is stored as a "char", we use ASCII codes for human
+ * Since castmethod is stored as a "char", we use ASCII codes for human
  * convenience in reading the table.
  */
 typedef enum CoercionMethod
 {
 	COERCION_METHOD_FUNCTION = 'f',		/* use a function */
 	COERCION_METHOD_BINARY = 'b',		/* types are binary-compatible */
-	COERCION_METHOD_INOUT = 'i'			/* use input/output functions */
+	COERCION_METHOD_INOUT = 'i' /* use input/output functions */
 } CoercionMethod;
 
 
@@ -131,6 +131,10 @@ DATA(insert ( 1700	 21 1783 a f ));
 DATA(insert ( 1700	 23 1744 a f ));
 DATA(insert ( 1700	700 1745 i f ));
 DATA(insert ( 1700	701 1746 i f ));
+DATA(insert (  790 1700 3823 a f ));
+DATA(insert ( 1700	790 3824 a f ));
+DATA(insert ( 23	790 3811 a f ));
+DATA(insert ( 20	790 3812 a f ));
 
 /* Allow explicit coercions between int4 and bool */
 DATA(insert (	23	16	2557 e f ));
@@ -239,6 +243,9 @@ DATA(insert ( 1043	 19 1400 i f ));
 /* Allow explicit coercions between int4 and "char" */
 DATA(insert (	18	 23   77 e f ));
 DATA(insert (	23	 18   78 e f ));
+
+/* pg_node_tree can be coerced to, but not from, text */
+DATA(insert (  194	 25    0 i b ));
 
 /*
  * Datetime category
@@ -359,23 +366,18 @@ DATA(insert ( 1560 1560 1685 i f ));
 DATA(insert ( 1562 1562 1687 i f ));
 DATA(insert ( 1700 1700 1703 i f ));
 
+/* json to/from jsonb */
+DATA(insert ( 114 3802 0 e i ));
+DATA(insert ( 3802 114 0 e i ));
+
 /* complex type */
-DATA(insert OID=9069 (701  195 3584 i f));
-DATA(insert OID=9070 (700  195 3585 i f));
-DATA(insert OID=9088 (20   195 3586 i f));
-DATA(insert OID=9089 (23   195 3587 i f));
-DATA(insert OID=9090 (21   195 3588 i f));
-DATA(insert OID=9091 (600  195 0 e b));
-DATA(insert OID=9092 (195  600 0 e b));
-DATA(insert OID=9093 (1700 195 3592 i f));
-
-/*
- * CDB: Allow explicit cast from tid to int8
- */
-DATA(insert (   27   20 6021 e f ));
-
-/* GP: Allow explicit cast between tid and aotid. */
-DATA(insert (	27 3300    0 e b ));
-DATA(insert ( 3300	 27    0 e b ));
+DATA(insert (701  7198 3584 i f));
+DATA(insert (700  7198 3585 i f));
+DATA(insert (20   7198 3586 i f));
+DATA(insert (23   7198 3587 i f));
+DATA(insert (21   7198 3588 i f));
+DATA(insert (600  7198 0 e b));
+DATA(insert (7198  600 0 e b));
+DATA(insert (1700 7198 7597 i f));
 
 #endif   /* PG_CAST_H */

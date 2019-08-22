@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/alter_operator.sgml,v 1.4 2008/11/14 10:22:45 petere Exp $
+doc/src/sgml/ref/alter_operator.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTEROPERATOR">
+ <indexterm zone="sql-alteroperator">
+  <primary>ALTER OPERATOR</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-ALTEROPERATOR-TITLE">ALTER OPERATOR</refentrytitle>
+  <refentrytitle>ALTER OPERATOR</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -13,18 +17,15 @@ PostgreSQL documentation
  <refnamediv>
   <refname>ALTER OPERATOR</refname>
   <refpurpose>change the definition of an operator</refpurpose>
- </refnamediv>  
-  
- <indexterm zone="sql-alteroperator">
-  <primary>ALTER OPERATOR</primary>
- </indexterm>
+ </refnamediv>
 
  <refsynopsisdiv>
 <synopsis>
-ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>lefttype</replaceable> | NONE } , { <replaceable>righttype</replaceable> | NONE } ) OWNER TO <replaceable>newowner</replaceable>
+ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>left_type</replaceable> | NONE } , { <replaceable>right_type</replaceable> | NONE } ) OWNER TO <replaceable>new_owner</replaceable>
+ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>left_type</replaceable> | NONE } , { <replaceable>right_type</replaceable> | NONE } ) SET SCHEMA <replaceable>new_schema</replaceable>
 </synopsis>
  </refsynopsisdiv>
-  
+
  <refsect1>
   <title>Description</title>
 
@@ -43,7 +44,7 @@ ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>lefttype</replac
    However, a superuser can alter ownership of any operator anyway.)
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -58,7 +59,7 @@ ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>lefttype</replac
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">lefttype</replaceable></term>
+    <term><replaceable class="parameter">left_type</replaceable></term>
     <listitem>
      <para>
       The data type of the operator's left operand; write
@@ -68,7 +69,7 @@ ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>lefttype</replac
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">righttype</replaceable></term>
+    <term><replaceable class="parameter">right_type</replaceable></term>
     <listitem>
      <para>
       The data type of the operator's right operand; write
@@ -78,10 +79,19 @@ ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>lefttype</replac
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">newowner</replaceable></term>
+    <term><replaceable class="parameter">new_owner</replaceable></term>
     <listitem>
      <para>
       The new owner of the operator.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">new_schema</replaceable></term>
+    <listitem>
+     <para>
+      The new schema for the operator.
      </para>
     </listitem>
    </varlistentry>
@@ -95,10 +105,9 @@ ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>lefttype</replac
    Change the owner of a custom operator <literal>a @@ b</literal> for type <type>text</type>:
 <programlisting>
 ALTER OPERATOR @@ (text, text) OWNER TO joe;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
 
@@ -112,8 +121,8 @@ ALTER OPERATOR @@ (text, text) OWNER TO joe;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createoperator" endterm="sql-createoperator-title"></member>
-   <member><xref linkend="sql-dropoperator" endterm="sql-dropoperator-title"></member>
+   <member><xref linkend="sql-createoperator"></member>
+   <member><xref linkend="sql-dropoperator"></member>
   </simplelist>
  </refsect1>
 </refentry>

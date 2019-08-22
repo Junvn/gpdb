@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/create_domain.sgml,v 1.32 2008/11/14 10:22:46 petere Exp $
+doc/src/sgml/ref/create_domain.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-CREATEDOMAIN">
+ <indexterm zone="sql-createdomain">
+  <primary>CREATE DOMAIN</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-createdomain-title">CREATE DOMAIN</refentrytitle>
+  <refentrytitle>CREATE DOMAIN</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -15,17 +19,14 @@ PostgreSQL documentation
   <refpurpose>define a new domain</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-createdomain">
-  <primary>CREATE DOMAIN</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 CREATE DOMAIN <replaceable class="parameter">name</replaceable> [ AS ] <replaceable class="parameter">data_type</replaceable>
+    [ COLLATE <replaceable>collation</replaceable> ]
     [ DEFAULT <replaceable>expression</replaceable> ]
     [ <replaceable class="PARAMETER">constraint</replaceable> [ ... ] ]
 
-where <replaceable class="PARAMETER">constraint</replaceable> is:
+<phrase>where <replaceable class="PARAMETER">constraint</replaceable> is:</phrase>
 
 [ CONSTRAINT <replaceable class="PARAMETER">constraint_name</replaceable> ]
 { NOT NULL | NULL | CHECK (<replaceable class="PARAMETER">expression</replaceable>) }
@@ -58,6 +59,11 @@ where <replaceable class="PARAMETER">constraint</replaceable> is:
    Define a domain rather than setting up each table's constraint
    individually.
   </para>
+
+  <para>
+   To be able to create a domain, you must have <literal>USAGE</literal>
+   privilege on the underlying type.
+  </para>
  </refsect1>
 
  <refsect1>
@@ -79,6 +85,18 @@ where <replaceable class="PARAMETER">constraint</replaceable> is:
        <para>
         The underlying data type of the domain. This can include array
         specifiers.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><replaceable>collation</replaceable></term>
+      <listitem>
+       <para>
+        An optional collation for the domain.  If no collation is
+        specified, the underlying data type's default collation is used.
+        The underlying type must be collatable if <literal>COLLATE</>
+        is specified.
        </para>
       </listitem>
      </varlistentry>
@@ -121,7 +139,12 @@ where <replaceable class="PARAMETER">constraint</replaceable> is:
       <term><literal>NOT NULL</literal></term>
       <listitem>
        <para>
-        Values of this domain are not allowed to be null.
+        Values of this domain are normally prevented from being null.
+        However, it is still possible for a domain with this constraint
+        to take a null value if it is assigned a matching domain type
+        that has become null, e.g. via a LEFT OUTER JOIN, or
+        <command>INSERT INTO tab (domcol) VALUES ((SELECT domcol FROM
+        tab WHERE false))</command>.
        </para>
       </listitem>
      </varlistentry>
@@ -144,8 +167,7 @@ where <replaceable class="PARAMETER">constraint</replaceable> is:
    <varlistentry>
     <term><literal>CHECK (<replaceable class="PARAMETER">expression</replaceable>)</literal></term>
     <listitem>
-     <para>
-      <literal>CHECK</literal> clauses specify integrity constraints or tests
+     <para><literal>CHECK</> clauses specify integrity constraints or tests
       which values of the domain must satisfy.
       Each constraint must be an expression
       producing a Boolean result.  It should use the key word <literal>VALUE</literal>
@@ -172,8 +194,8 @@ where <replaceable class="PARAMETER">constraint</replaceable> is:
 <programlisting>
 CREATE DOMAIN us_postal_code AS TEXT
 CHECK(
-   VALUE ~ '^\\d{5}$'
-OR VALUE ~ '^\\d{5}-\\d{4}$'
+   VALUE ~ '^\d{5}$'
+OR VALUE ~ '^\d{5}-\d{4}$'
 );
 
 CREATE TABLE us_snail_addy (
@@ -184,8 +206,7 @@ CREATE TABLE us_snail_addy (
   city TEXT NOT NULL,
   postal us_postal_code NOT NULL
 );
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1 id="SQL-CREATEDOMAIN-compatibility">
@@ -201,8 +222,8 @@ CREATE TABLE us_snail_addy (
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-alterdomain" endterm="sql-alterdomain-title"></member>
-   <member><xref linkend="sql-dropdomain" endterm="sql-dropdomain-title"></member>
+   <member><xref linkend="sql-alterdomain"></member>
+   <member><xref linkend="sql-dropdomain"></member>
   </simplelist>
  </refsect1>
 

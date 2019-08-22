@@ -6,15 +6,12 @@
  * NB - this file is also used by ECPG and several frontend programs in
  * src/bin/ including pg_dump and psql
  *
- * Note that this file expects that the ScanKeywords array is defined
- * and that LastScanKeyword points to its element one past the last.
- *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/parser/kwlookup.c,v 2.2 2009/03/08 16:53:30 alvherre Exp $
+ *	  src/backend/parser/kwlookup.c
  *
  *-------------------------------------------------------------------------
  */
@@ -39,14 +36,9 @@
  * receive a different case-normalization mapping.
  */
 const ScanKeyword *
-ScanKeywordLookup(const char *text)
-{
-	return ScanKeywordLookupExt(text, ScanKeywords, LastScanKeyword);
-}
-
-const ScanKeyword *
-ScanKeywordLookupExt(const char *text, const ScanKeyword scanKeywords[],
-					 const ScanKeyword *lastScanKeyword)
+ScanKeywordLookup(const char *text,
+				  const ScanKeyword *keywords,
+				  int num_keywords)
 {
 	int			len,
 				i;
@@ -60,7 +52,7 @@ ScanKeywordLookupExt(const char *text, const ScanKeyword scanKeywords[],
 		return NULL;
 
 	/*
-	 * Apply an ASCII-only downcasing.	We must not use tolower() since it may
+	 * Apply an ASCII-only downcasing.  We must not use tolower() since it may
 	 * produce the wrong translation in some locales (eg, Turkish).
 	 */
 	for (i = 0; i < len; i++)
@@ -76,8 +68,8 @@ ScanKeywordLookupExt(const char *text, const ScanKeyword scanKeywords[],
 	/*
 	 * Now do a binary search using plain strcmp() comparison.
 	 */
-	low = &scanKeywords[0];
-	high = lastScanKeyword - 1;
+	low = keywords;
+	high = keywords + (num_keywords - 1);
 	while (low <= high)
 	{
 		const ScanKeyword *middle;

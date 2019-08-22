@@ -3,13 +3,13 @@
  * pg_foreign_server.h
  *	  definition of the system "foreign server" relation (pg_foreign_server)
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/catalog/pg_foreign_server.h,v 1.1 2008/12/19 16:25:18 petere Exp $
+ * src/include/catalog/pg_foreign_server.h
  *
  * NOTES
- *	  the genbki.sh script reads this file and generates .bki
+ *	  the genbki.pl script reads this file and generates .bki
  *	  information from the DATA() statements.
  *
  *-------------------------------------------------------------------------
@@ -24,7 +24,7 @@
  *		typedef struct FormData_pg_foreign_server
  * ----------------
  */
-#define ForeignServerRelationId	1417
+#define ForeignServerRelationId 1417
 
 CATALOG(pg_foreign_server,1417)
 {
@@ -32,13 +32,12 @@ CATALOG(pg_foreign_server,1417)
 	Oid			srvowner;		/* server owner */
 	Oid			srvfdw;			/* server FDW */
 
-	/*
-	 * VARIABLE LENGTH FIELDS start here.  These fields may be NULL, too.
-	 */
+#ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	text		srvtype;
 	text		srvversion;
 	aclitem		srvacl[1];		/* access permissions */
 	text		srvoptions[1];	/* FDW-specific options */
+#endif
 } FormData_pg_foreign_server;
 
 /* ----------------

@@ -28,6 +28,7 @@
 #include "commands/tablecmds.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "utils/builtins.h"
 #include "utils/inval.h"
 #include "utils/syscache.h"
@@ -68,7 +69,6 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	DefElem    *dencoding = NULL;
 	ListCell   *option;
 	Oid			reloid = 0;
-	Oid			fmtErrTblOid = InvalidOid;
 	Datum		formatOptStr;
 	Datum		optionsStr;
 	Datum		locationUris = 0;
@@ -80,6 +80,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	int			rejectlimit = -1;
 	int			encoding = -1;
 	bool		issreh = false; /* is single row error handling requested? */
+	bool 		logerrors = false;
 	bool		iswritable = createExtStmt->iswritable;
 	bool		isweb = createExtStmt->isweb;
 	bool		shouldDispatch = (Gp_role == GP_ROLE_DISPATCH &&
@@ -96,7 +97,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	createStmt->options = NIL;
 	createStmt->oncommit = ONCOMMIT_NOOP;
 	createStmt->tablespacename = NULL;
-	createStmt->policy = createExtStmt->policy; /* policy was set in transform */
+	createStmt->distributedBy = createExtStmt->distributedBy; /* policy was set in transform */
 
 	switch (exttypeDesc->exttabletype)
 	{
@@ -115,13 +116,12 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 			if (strlen(commandString) == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("Invalid EXECUTE clause. Found an empty command string")));
+						 errmsg("invalid EXECUTE clause, command string is empty")));
 			break;
 
 		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_GP_INTERNAL_ERROR),
-					 errmsg("Internal error: unknown external table type")));
+			elog(ERROR, "internal error: unknown external table type: %i",
+				 exttypeDesc->exttabletype);
 	}
 
 	/*----------
@@ -167,8 +167,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 				Oid			userid = GetUserId();
 				HeapTuple	tuple;
 
-				tuple = SearchSysCache1(AUTHOID,
-										ObjectIdGetDatum(userid));
+				tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(userid));
 				if (!HeapTupleIsValid(tuple))
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -205,37 +204,6 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 								(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 								 errmsg("permission denied: no privilege to create a readable gpfdist(s) external table")));
 				}
-				else if (uri->protocol == URI_GPHDFS && iswritable)
-				{
-					Datum		d_wexthdfs;
-					bool		createwexthdfs;
-
-					d_wexthdfs = SysCacheGetAttr(AUTHOID, tuple,
-												 Anum_pg_authid_rolcreatewexthdfs,
-												 &isnull);
-					createwexthdfs = (isnull ? false : DatumGetBool(d_wexthdfs));
-
-					if (!createwexthdfs)
-						ereport(ERROR,
-								(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-								 errmsg("permission denied: no privilege to create a writable gphdfs external table")));
-				}
-				else if (uri->protocol == URI_GPHDFS && !iswritable)
-				{
-					Datum		d_rexthdfs;
-					bool		createrexthdfs;
-
-					d_rexthdfs = SysCacheGetAttr(AUTHOID, tuple,
-												 Anum_pg_authid_rolcreaterexthdfs,
-												 &isnull);
-					createrexthdfs = (isnull ? false : DatumGetBool(d_rexthdfs));
-
-					if (!createrexthdfs)
-						ereport(ERROR,
-								(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-								 errmsg("permission denied: no privilege to create a readable gphdfs external table")));
-
-				}
 				else if (uri->protocol == URI_HTTP && !iswritable)
 				{
 					Datum		d_exthttp;
@@ -255,7 +223,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 				{
 					Oid			ownerId = GetUserId();
 					char	   *protname = uri->customprotocol;
-					Oid			ptcId = LookupExtProtocolOid(protname, false);
+					Oid			ptcId = get_extprotocol_oid(protname, false);
 					AclResult	aclresult;
 
 					/* Check we have the right permissions on this protocol */
@@ -270,13 +238,11 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 					}
 				}
 				else
-				{
 					ereport(ERROR,
 							(errcode(ERRCODE_INTERNAL_ERROR),
-						  errmsg("internal error in DefineExternalRelation. "
-								 "protocol is %d, writable is %d",
-								 uri->protocol, iswritable)));
-				}
+							 errmsg("internal error in DefineExternalRelation"),
+							 errdetail("Protocol is %d, writable is %d.",
+									   uri->protocol, iswritable)));
 
 				ReleaseSysCache(tuple);
 			}
@@ -314,6 +280,8 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 
 		issreh = true;
 
+		logerrors = singlerowerrorDesc->into_file;
+
 		/* get reject limit, and reject limit type */
 		rejectlimit = singlerowerrorDesc->rejectlimit;
 		rejectlimittype = (singlerowerrorDesc->is_limit_in_rows ? 'r' : 'p');
@@ -332,7 +300,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 		if (dencoding)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("conflicting or redundant ENCODING specification")));
+					 errmsg("conflicting or redundant ENCODING specification")));
 		dencoding = defel;
 	}
 
@@ -348,8 +316,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 				pg_valid_client_encoding(encoding_name) < 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("%d is not a valid encoding code",
-								encoding)));
+						 errmsg("%d is not a valid encoding code", encoding)));
 		}
 		else if (IsA(dencoding->arg, String))
 		{
@@ -393,9 +360,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 							 errmsg("number of locations (%d) exceeds the number of segments (%d)",
 									list_length(exttypeDesc->location_list),
 									getgpsegmentCount()),
-							 errhint("The table cannot be queried until cluster "
-									 "is expanded so that there are at least as "
-									 "many segments as locations.")));
+							 errhint("The table cannot be queried until cluster is expanded so that there are at least as many segments as locations.")));
 			}
 		}
 	}
@@ -406,7 +371,8 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	 * QEs.
 	 */
 	if (Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY)
-		reloid = DefineRelation(createStmt, RELKIND_RELATION, RELSTORAGE_EXTERNAL, true);
+		reloid = DefineRelation(createStmt, RELKIND_RELATION, InvalidOid,
+								RELSTORAGE_EXTERNAL, true, true, NULL);
 
 	/*
 	 * Now we take care of pg_exttable.
@@ -418,27 +384,19 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	if (Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY)
 		Assert(reloid != InvalidOid);
 	else
-		reloid = RangeVarGetRelid(createExtStmt->relation, true);
-
-	/*
-	 * In the case of error log file, set fmtErrorTblOid to the external table
-	 * itself.
-	 */
-	if (issreh)
-		fmtErrTblOid = reloid;
+		reloid = RangeVarGetRelid(createExtStmt->relation, NoLock, true);
 
 	/*
 	 * create a pg_exttable entry for this external table.
 	 */
 	InsertExtTableEntry(reloid,
 						iswritable,
-						isweb,
 						issreh,
 						formattype,
 						rejectlimittype,
 						commandString,
 						rejectlimit,
-						fmtErrTblOid,
+						logerrors,
 						encoding,
 						formatOptStr,
 						optionsStr,
@@ -548,16 +506,6 @@ transformLocationUris(List *locs, bool isweb, bool iswritable)
 		}
 
 		/*
-		 * check for various errors
-		 */
-		if (!first_uri && uri->protocol == URI_GPHDFS)
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("GPHDFS can only have one location list"),
-				 errhint("Combine multiple HDFS files into a single file")));
-
-
-		/*
 		 * If a custom protocol is used, validate its existence. If it exists,
 		 * and a custom protocol url validator exists as well, invoke it now.
 		 */
@@ -586,8 +534,8 @@ transformLocationUris(List *locs, bool isweb, bool iswritable)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			   errmsg("URI protocols must be the same for all data sources"),
-					 errhint("Available protocols are 'http', 'file', 'gphdfs', 'gpfdist' and 'gpfdists'")));
+					 errmsg("URI protocols must be the same for all data sources"),
+					 errhint("Available protocols are 'http', 'file', 'gpfdist' and 'gpfdists'.")));
 
 		}
 
@@ -600,7 +548,7 @@ transformLocationUris(List *locs, bool isweb, bool iswritable)
 		if (uri->protocol == URI_HTTP && !isweb)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-			 errmsg("http URI\'s can only be used in an external web table"),
+					 errmsg("http URI\'s can only be used in an external web table"),
 					 errhint("Use CREATE EXTERNAL WEB TABLE instead.")));
 
 		if (iswritable && (uri->protocol == URI_HTTP || uri->protocol == URI_FILE))
@@ -608,20 +556,20 @@ transformLocationUris(List *locs, bool isweb, bool iswritable)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("unsupported URI protocol \'%s\' for writable external table",
 							(uri->protocol == URI_HTTP ? "http" : "file")),
-					 errhint("Writable external tables may use \'gpfdist\', \'gpfdists\' or \'gphdfs\' URIs only.")));
+					 errhint("Writable external tables may use \'gpfdist\' or \'gpfdists\' URIs only.")));
 
 		if (uri->protocol != URI_CUSTOM && iswritable && strchr(uri->path, '*'))
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("Unsupported use of wildcard in a writable external web table definition: "
-							"\'%s\'", uri_str_final),
+					 errmsg("unsupported use of wildcard in a writable external web table definition: \'%s\'",
+							uri_str_final),
 					 errhint("Specify the explicit path and file name to write into.")));
 
 		if ((uri->protocol == URI_GPFDIST || uri->protocol == URI_GPFDISTS) && iswritable && uri->path[strlen(uri->path) - 1] == '/')
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("Unsupported use of a directory name in a writable gpfdist(s) external table : "
-							"\'%s\'", uri_str_final),
+					 errmsg("unsupported use of a directory name in a writable gpfdist(s) external table : \'%s\'",
+							uri_str_final),
 					 errhint("Specify the explicit path and file name to write into.")));
 
 		astate = accumArrayResult(astate,
@@ -668,7 +616,7 @@ transformExecOnClause(List *on_clause)
 			if (exec_location_str)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("ON clause must not have more than one element.")));
+						 errmsg("ON clause must not have more than one element")));
 
 			if (strcmp(defel->defname, "all") == 0)
 			{
@@ -703,8 +651,8 @@ transformExecOnClause(List *on_clause)
 			else
 			{
 				ereport(ERROR,
-						(errcode(ERRCODE_GP_INTERNAL_ERROR),
-						 errmsg("Unknown location code for EXECUTE in tablecmds.")));
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("unknown location code for EXECUTE in tablecmds")));
 			}
 		}
 	}
@@ -734,16 +682,11 @@ transformFormatType(char *formatname)
 		result = 'c';
 	else if (pg_strcasecmp(formatname, "custom") == 0)
 		result = 'b';
-	else if (pg_strcasecmp(formatname, "avro") == 0)
-		result = 'a';
-	else if (pg_strcasecmp(formatname, "parquet") == 0)
-		result = 'p';
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("unsupported format '%s'", formatname),
-			   errhint("Available formats for external tables are \"text\", "
-					   "\"csv\", \"avro\", \"parquet\" and \"custom\"")));
+				 errhint("Available formats for external tables are \"text\", \"csv\" and \"custom\".")));
 
 	return result;
 }
@@ -792,25 +735,14 @@ transformFormatOpts(char formattype, List *formatOpts, int numcols, bool iswrita
 	ListCell   *option;
 	Datum		result;
 	char	   *format_str;
-	char	   *delim = NULL;
-	char	   *null_print = NULL;
-	char	   *quote = NULL;
-	char	   *escape = NULL;
-	char	   *eol_str = NULL;
 	char	   *formatter = NULL;
-	bool		header_line = false;
-	bool		fill_missing = false;
-	List	   *force_notnull = NIL;
-	List	   *force_quote = NIL;
-	StringInfoData fnn,
-				fq,
-				nl;
+	StringInfoData cfbuf;
+
+	CopyState cstate = palloc0(sizeof(CopyStateData));
 
 	Assert(fmttype_is_custom(formattype) ||
 		   fmttype_is_text(formattype) ||
-		   fmttype_is_csv(formattype) ||
-		   fmttype_is_avro(formattype) ||
-		   fmttype_is_parquet(formattype));
+		   fmttype_is_csv(formattype));
 
 	/* Extract options from the statement node tree */
 	if (fmttype_is_text(formattype) || fmttype_is_csv(formattype))
@@ -819,126 +751,79 @@ transformFormatOpts(char formattype, List *formatOpts, int numcols, bool iswrita
 		{
 			DefElem    *defel = (DefElem *) lfirst(option);
 
-			if (strcmp(defel->defname, "delimiter") == 0)
+			if (strcmp(defel->defname, "delimiter") == 0 ||
+				strcmp(defel->defname, "null") == 0 ||
+				strcmp(defel->defname, "header") == 0 ||
+				strcmp(defel->defname, "quote") == 0 ||
+				strcmp(defel->defname, "escape") == 0 ||
+				strcmp(defel->defname, "force_not_null") == 0 ||
+				strcmp(defel->defname, "force_quote") == 0 ||
+				strcmp(defel->defname, "fill_missing_fields") == 0 ||
+				strcmp(defel->defname, "newline") == 0)
 			{
-				if (delim)
-					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting or redundant options")));
-				delim = strVal(defel->arg);
-			}
-			else if (strcmp(defel->defname, "null") == 0)
-			{
-				if (null_print)
-					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting or redundant options")));
-				null_print = strVal(defel->arg);
-			}
-			else if (strcmp(defel->defname, "header") == 0)
-			{
-				if (header_line)
-					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting or redundant options")));
-				header_line = intVal(defel->arg);
-			}
-			else if (strcmp(defel->defname, "quote") == 0)
-			{
-				if (quote)
-					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting or redundant options")));
-				quote = strVal(defel->arg);
-			}
-			else if (strcmp(defel->defname, "escape") == 0)
-			{
-				if (escape)
-					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting or redundant options")));
-				escape = strVal(defel->arg);
-			}
-			else if (strcmp(defel->defname, "force_notnull") == 0)
-			{
-				if (force_notnull)
-					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting or redundant options")));
-				force_notnull = (List *) defel->arg;
-			}
-			else if (strcmp(defel->defname, "force_quote") == 0)
-			{
-				if (force_quote)
-					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting or redundant options")));
-				force_quote = (List *) defel->arg;
-			}
-			else if (strcmp(defel->defname, "fill_missing_fields") == 0)
-			{
-				if (fill_missing)
-					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting or redundant options")));
-				fill_missing = intVal(defel->arg);
-			}
-			else if (strcmp(defel->defname, "newline") == 0)
-			{
-				if (eol_str)
-					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting or redundant options")));
-				eol_str = strVal(defel->arg);
+				/* ok */
 			}
 			else if (strcmp(defel->defname, "formatter") == 0)
 			{
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-				errmsg("formatter option only valid for custom formatters")));
+						 errmsg("formatter option only valid for custom formatters")));
 			}
 			else
 				elog(ERROR, "option \"%s\" not recognized",
 					 defel->defname);
 		}
 
-		/*
-		 * Set defaults
-		 */
-		if (!delim)
-			delim = fmttype_is_csv(formattype) ? "," : "\t";
-
-		if (!null_print)
-			null_print = fmttype_is_csv(formattype) ? "" : "\\N";
-
+		/* If CSV format was chosen, make it visible to ProcessCopyOptions. */
 		if (fmttype_is_csv(formattype))
 		{
-			if (!quote)
-				quote = "\"";
-			if (!escape)
-				escape = quote;
+			formatOpts = list_copy(formatOpts);
+			formatOpts = lappend(formatOpts, makeDefElem("format", (Node *)makeString("csv")));
 		}
 
-		if (!fmttype_is_csv(formattype) && !escape)
-			escape = "\\";		/* default escape for text mode */
+		/* verify all user supplied control char combinations are legal */
+		ProcessCopyOptions(cstate,
+						   !iswritable, /* is_from */
+						   formatOpts,
+						   numcols,
+						   false /* is_copy */);
+
+		/*
+		 * Build the format option string that will get stored in the catalog.
+		 *
+		 * NOTE: These are intentionally not escaped "correctly"! For
+		 * historical reasons, these options are stored in a weird format
+		 * that looks like they're SQL literals, but the escaping is
+		 * different. See comments in escape_fmtopts_string(), in
+		 * src/bin/pg_dump/dumputils.c.
+		 */
+		initStringInfo(&cfbuf);
+		appendStringInfo(&cfbuf, "delimiter '%s'", cstate->delim);
+		appendStringInfo(&cfbuf, " null '%s'", cstate->null_print);
+		appendStringInfo(&cfbuf, " escape '%s'", cstate->escape);
+		if (fmttype_is_csv(formattype))
+			appendStringInfo(&cfbuf, " quote '%s'", cstate->quote);
+		if (cstate->header_line)
+			appendStringInfo(&cfbuf, " header");
+		if (cstate->fill_missing)
+			appendStringInfo(&cfbuf, " fill missing fields");
 
 		/*
 		 * re-construct the FORCE NOT NULL list string. TODO: is there no
 		 * existing util function that does this? can't find.
 		 */
-		if (force_notnull)
+		if (cstate->force_notnull)
 		{
 			ListCell   *l;
 			bool		is_first_col = true;
 
-			initStringInfo(&fnn);
-			appendStringInfo(&fnn, " force not null");
+			appendStringInfo(&cfbuf, " force not null");
 
-			foreach(l, force_notnull)
+			foreach(l, cstate->force_notnull)
 			{
 				const char *col_name = strVal(lfirst(l));
 
-				appendStringInfo(&fnn, (is_first_col ? " %s" : ",%s"),
+				appendStringInfo(&cfbuf, (is_first_col ? " %s" : ",%s"),
 								 quote_identifier(col_name));
 				is_first_col = false;
 			}
@@ -947,85 +832,30 @@ transformFormatOpts(char formattype, List *formatOpts, int numcols, bool iswrita
 		/*
 		 * re-construct the FORCE QUOTE list string.
 		 */
-		if (force_quote)
+		if (cstate->force_quote)
 		{
 			ListCell   *l;
 			bool		is_first_col = true;
 
-			initStringInfo(&fq);
-			appendStringInfo(&fq, " force quote");
+			appendStringInfo(&cfbuf, " force quote");
 
-			foreach(l, force_quote)
+			foreach(l, cstate->force_quote)
 			{
 				const char *col_name = strVal(lfirst(l));
 
-				appendStringInfo(&fq, (is_first_col ? " %s" : ",%s"),
+				appendStringInfo(&cfbuf, (is_first_col ? " %s" : ",%s"),
 								 quote_identifier(col_name));
 				is_first_col = false;
 			}
 		}
 
-		if (eol_str)
-		{
-			initStringInfo(&nl);
-			appendStringInfo(&nl, " newline '%s'", eol_str);
-		}
+		if (cstate->force_quote_all)
+			appendStringInfo(&cfbuf, " force quote *");
 
-		/* verify all user supplied control char combinations are legal */
-		ValidateControlChars(false,
-							 !iswritable,
-							 fmttype_is_csv(formattype),
-							 delim,
-							 null_print,
-							 quote,
-							 escape,
-							 force_quote,
-							 force_notnull,
-							 header_line,
-							 fill_missing,
-							 eol_str,
-							 numcols);
+		if (cstate->eol_str)
+			appendStringInfo(&cfbuf, " newline '%s'", cstate->eol_str);
 
-		/*
-		 * build the format option string that will get stored in the catalog.
-		 */
-		/* +1 leaves room for sprintf's trailing null */
-		if (fmttype_is_text(formattype))
-		{
-			format_str = psprintf("delimiter '%s' null '%s' escape '%s'%s%s%s",
-					delim, null_print, escape, (header_line ? " header" : ""),
-					(fill_missing ? " fill missing fields" : ""), (eol_str ? nl.data : ""));
-		}
-		else if (fmttype_is_csv(formattype))
-		{
-			format_str = psprintf("delimiter '%s' null '%s' escape '%s' quote '%s'%s%s%s%s%s",
-			delim, null_print, escape, quote, (header_line ? " header" : ""),
-					(fill_missing ? " fill missing fields" : ""),
-			   (force_notnull ? fnn.data : ""), (force_quote ? fq.data : ""),
-					(eol_str ? nl.data : ""));
-		}
-		else
-		{
-			/* should never happen */
-			elog(ERROR, "unrecognized format type: %c", formattype);
-			format_str = NULL;
-		}
-
-	}
-	else if (fmttype_is_avro(formattype) || fmttype_is_parquet(formattype))
-	{
-		/*
-		 * avro format, add "formatter 'gphdfs_import’ " directly, user
-		 * don't need to set this value
-		 */
-		char	   *val;
-
-		if (iswritable)
-			val = "gphdfs_export";
-		else
-			val = "gphdfs_import";
-
-		format_str = psprintf("formatter '%s' ", val);
+		format_str = cfbuf.data;
 	}
 	else
 	{
@@ -1078,12 +908,6 @@ transformFormatOpts(char formattype, List *formatOpts, int numcols, bool iswrita
 
 	/* clean up */
 	pfree(format_str);
-	if (force_notnull)
-		pfree(fnn.data);
-	if (force_quote)
-		pfree(fq.data);
-	if (eol_str)
-		pfree(nl.data);
 
 	return result;
 
@@ -1109,6 +933,7 @@ InvokeProtocolValidation(Oid procOid, char *procName, bool iswritable, List *loc
 	InitFunctionCallInfoData( /* FunctionCallInfoData */ fcinfo,
 							  /* FmgrInfo */ validator_udf,
 							  /* nArgs */ 0,
+							  /* Collation */ InvalidOid, 
 							  /* Call Context */ (Node *) validator_data,
 							  /* ResultSetInfo */ NULL);
 

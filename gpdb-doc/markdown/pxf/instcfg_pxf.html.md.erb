@@ -1,13 +1,22 @@
 ---
-title: Installing and Configuring PXF
+title: Configuring PXF
 ---
 
-The Greenplum Platform Extension Framework (PXF) provides connectors to Hadoop, Hive, and HBase data stores. To use these PXF connectors, you must install Hadoop, Hive, and HBase clients on each Greenplum Database segment host as described in this one-time installation and configuration procedure:
+Your Greenplum Database deployment consists of a master node and multiple segment hosts. When you initialize and configure the Greenplum Platform Extension Framework (PXF), you start a single PXF JVM process on each Greenplum Database segment host.
 
-- **[Installing and Configuring Hadoop Clients for PXF](client_instcfg.html)**
+PXF provides connectors to Hadoop, Hive, HBase, object stores, and external SQL data stores. You must configure PXF to support the connectors that you plan to use.
 
+To configure PXF, you must:
 
-You must also configure and initialize PXF itself, and start the PXF service on each segment host:
+1. Install Java packages on each Greenplum Database segment host as described in [Installing Java for PXF](install_java.html).
 
-- **[Configuring, Initializing, and Managing PXF](cfginitstart_pxf.html)**
+2. [Initialize the PXF Service](init_pxf.html).
+
+3. If you plan to use the Hadoop, Hive, or HBase PXF connectors, you must perform the configuration procedure described in [Configuring PXF Hadoop Connectors](client_instcfg.html).
+
+3. If you plan to use the PXF connectors to access the Azure, Google Cloud Storage, Minio, or S3 object store(s), you must perform the configuration procedure described in [Configuring Connectors to Azure, Google Cloud Storage, Minio, and S3 Object Stores](objstore_cfg.html).
+
+3. If you plan to use the PXF JDBC Connector to access an external SQL database, perform the configuration procedure described in [Configuring the JDBC Connector](jdbc_cfg.html).
+
+4. [Start PXF](cfginitstart_pxf.html).
 

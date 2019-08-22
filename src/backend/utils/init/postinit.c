@@ -3,32 +3,42 @@
  * postinit.c
  *	  postgres initialization utilities
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/init/postinit.c,v 1.186 2008/09/23 09:20:36 heikki Exp $
+ *	  src/backend/utils/init/postinit.c
  *
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/sysattr.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/indexing.h"
+#include "catalog/storage_tablespace.h"
+#include "commands/tablespace.h"
+
 #include "libpq/auth.h"
 #include "libpq/hba.h"
 #include "libpq/libpq-be.h"
+#include "cdb/cdbtm.h"
 #include "cdb/cdbvars.h"
 #include "cdb/cdbutil.h"
 #include "mb/pg_wchar.h"
@@ -43,17 +53,19 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
-#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
+#include "storage/proc.h"
 #include "storage/sinvaladt.h"
 #include "storage/smgr.h"
+#include "tcop/tcopprot.h"
+#include "tcop/idle_resource_cleaner.h"
 #include "utils/acl.h"
 #include "utils/backend_cancel.h"
-#include "utils/flatfiles.h"
+#include "utils/faultinjector.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
-#include "utils/plancache.h"
+#include "utils/pg_locale.h"
 #include "utils/portal.h"
 #include "utils/ps_status.h"
 #include "utils/relcache.h"
@@ -61,21 +73,24 @@
 #include "utils/sharedsnapshot.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/timeout.h"
 #include "utils/tqual.h"
 
+#include "utils/resource_manager.h"
 #include "utils/session_state.h"
-#include "codegen/codegen_wrapper.h"
 
 
 static HeapTuple GetDatabaseTuple(const char *dbname);
 static HeapTuple GetDatabaseTupleByOid(Oid dboid);
 static void PerformAuthentication(Port *port);
 static void CheckMyDatabase(const char *name, bool am_superuser);
-static void ProcessRoleGUC(void);
 static void InitCommunication(void);
 static void ShutdownPostgres(int code, Datum arg);
+static void StatementTimeoutHandler(void);
+static void LockTimeoutHandler(void);
 static bool ThereIsAtLeastOneRole(void);
 static void process_startup_options(Port *port, bool am_superuser);
+static void process_settings(Oid databaseid, Oid roleid);
 
 #ifdef USE_ORCA
 extern void InitGPOPT();
@@ -119,7 +134,7 @@ FindMyDatabase(const char *dbname, Oid *db_id, Oid *db_tablespace)
  * GetDatabaseTuple -- fetch the pg_database row for a database
  *
  * This is used during backend startup when we don't yet have any access to
- * system catalogs in general.	In the worst case, we can seqscan pg_database
+ * system catalogs in general.  In the worst case, we can seqscan pg_database
  * using nothing but the hard-wired descriptor that relcache.c creates for
  * pg_database.  In more typical cases, relcache.c was able to load
  * descriptors for both pg_database and its indexes from the shared relcache
@@ -143,14 +158,14 @@ GetDatabaseTuple(const char *dbname)
 				CStringGetDatum(dbname));
 
 	/*
-	 * Open pg_database and fetch a tuple.	Force heap scan if we haven't yet
+	 * Open pg_database and fetch a tuple.  Force heap scan if we haven't yet
 	 * built the critical shared relcache entries (i.e., we're starting up
 	 * without a shared relcache cache file).
 	 */
 	relation = heap_open(DatabaseRelationId, AccessShareLock);
 	scan = systable_beginscan(relation, DatabaseNameIndexId,
 							  criticalSharedRelcachesBuilt,
-							  SnapshotNow,
+							  NULL,
 							  1, key);
 
 	tuple = systable_getnext(scan);
@@ -186,14 +201,14 @@ GetDatabaseTupleByOid(Oid dboid)
 				ObjectIdGetDatum(dboid));
 
 	/*
-	 * Open pg_database and fetch a tuple.	Force heap scan if we haven't yet
+	 * Open pg_database and fetch a tuple.  Force heap scan if we haven't yet
 	 * built the critical shared relcache entries (i.e., we're starting up
 	 * without a shared relcache cache file).
 	 */
 	relation = heap_open(DatabaseRelationId, AccessShareLock);
 	scan = systable_beginscan(relation, DatabaseOidIndexId,
 							  criticalSharedRelcachesBuilt,
-							  SnapshotNow,
+							  NULL,
 							  1, key);
 
 	tuple = systable_getnext(scan);
@@ -223,11 +238,9 @@ PerformAuthentication(Port *port)
 
 	/*
 	 * In EXEC_BACKEND case, we didn't inherit the contents of pg_hba.conf
-	 * etcetera from the postmaster, and have to load them ourselves.  Note we
-	 * are loading them into the startup transaction's memory context, not
-	 * PostmasterContext, but that shouldn't matter.
+	 * etcetera from the postmaster, and have to load them ourselves.
 	 *
-	 * FIXME: [fork/exec] Ugh.	Is there a way around this overhead?
+	 * FIXME: [fork/exec] Ugh.  Is there a way around this overhead?
 	 */
 #ifdef EXEC_BACKEND
 	if (!load_hba())
@@ -239,7 +252,16 @@ PerformAuthentication(Port *port)
 		ereport(FATAL,
 				(errmsg("could not load pg_hba.conf")));
 	}
-	load_ident();
+
+	if (!load_ident())
+	{
+		/*
+		 * It is ok to continue if we fail to load the IDENT file, although it
+		 * means that you cannot log in using any of the authentication
+		 * methods that need a user name mapping. load_ident() already logged
+		 * the details of error to the log.
+		 */
+	}
 #endif
 
 	/*
@@ -247,8 +269,7 @@ PerformAuthentication(Port *port)
 	 * during authentication.  Since we're inside a transaction and might do
 	 * database access, we have to use the statement_timeout infrastructure.
 	 */
-	if (!enable_sig_alarm(AuthenticationTimeout * 1000, true))
-		elog(FATAL, "could not set timer for authorization timeout");
+	enable_timeout_after(STATEMENT_TIMEOUT, AuthenticationTimeout * 1000);
 
 	/*
 	 * Now perform authentication exchange.
@@ -258,19 +279,38 @@ PerformAuthentication(Port *port)
 	/*
 	 * Done with authentication.  Disable the timeout, and log if needed.
 	 */
-	if (!disable_sig_alarm(true))
-		elog(FATAL, "could not disable timer for authorization timeout");
+	disable_timeout(STATEMENT_TIMEOUT, false);
 
 	if (Log_connections)
 	{
 		if (am_walsender)
-			ereport(LOG,
-					(errmsg("replication connection authorized: user=%s",
-							port->user_name)));
+		{
+#ifdef USE_SSL
+			if (port->ssl)
+				ereport(LOG,
+						(errmsg("replication connection authorized: user=%s SSL enabled (protocol=%s, cipher=%s, compression=%s)",
+								port->user_name, SSL_get_version(port->ssl), SSL_get_cipher(port->ssl),
+								SSL_get_current_compression(port->ssl) ? _("on") : _("off"))));
+			else
+#endif
+				ereport(LOG,
+						(errmsg("replication connection authorized: user=%s",
+								port->user_name)));
+		}
 		else
-			ereport(LOG,
-					(errmsg("connection authorized: user=%s database=%s",
-							port->user_name, port->database_name)));
+		{
+#ifdef USE_SSL
+			if (port->ssl)
+				ereport(LOG,
+						(errmsg("connection authorized: user=%s database=%s SSL enabled (protocol=%s, cipher=%s, compression=%s)",
+								port->user_name, port->database_name, SSL_get_version(port->ssl), SSL_get_cipher(port->ssl),
+								SSL_get_current_compression(port->ssl) ? _("on") : _("off"))));
+			else
+#endif
+				ereport(LOG,
+						(errmsg("connection authorized: user=%s database=%s",
+								port->user_name, port->database_name)));
+		}
 	}
 
 	set_ps_display("startup", false);
@@ -278,52 +318,6 @@ PerformAuthentication(Port *port)
 	ClientAuthInProgress = false;		/* client_min_messages is active now */
 }
 
-
-/*
- * ProcessRoleGUC --
- * We now process pg_authid.rolconfig separately from InitializeSessionUserId,
- * since it's too early to access toast table before initializing all
- * relcaches in phase3.
- */
-static void
-ProcessRoleGUC(void)
-{
-	Oid			roleId;
-	HeapTuple	roleTup;
-	Datum		datum;
-	bool		isnull;
-
-	/* This should have been set by now */
-	roleId = GetUserId();
-	Assert(OidIsValid(roleId));
-
-	roleTup = SearchSysCache1(AUTHOID,
-							  ObjectIdGetDatum(roleId));
-	if (!HeapTupleIsValid(roleTup))
-		ereport(FATAL,
-				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-				 errmsg("role %u does not exist", roleId), errSendAlert(false)));
-
-	/*
-	 * Set up user-specific configuration variables.  This is a good place to
-	 * do it so we don't have to read pg_authid twice during session startup.
-	 */
-	datum = SysCacheGetAttr(AUTHOID, roleTup,
-							Anum_pg_authid_rolconfig, &isnull);
-	if (!isnull)
-	{
-		ArrayType  *a = DatumGetArrayTypeP(datum);
-
-		/*
-		 * We process all the options at SUSET level.  We assume that the
-		 * right to insert an option into pg_authid was checked when it was
-		 * inserted.
-		 */
-		ProcessGUCArray(a, PGC_SUSET, PGC_S_USER, GUC_ACTION_SET);
-	}
-
-	ReleaseSysCache(roleTup);
-}
 
 /*
  * CheckMyDatabase -- fetch information from the pg_database entry for our DB
@@ -337,9 +331,7 @@ CheckMyDatabase(const char *name, bool am_superuser)
 	char	   *ctype;
 
 	/* Fetch our pg_database row normally, via syscache */
-	tup = SearchSysCache(DATABASEOID,
-						 ObjectIdGetDatum(MyDatabaseId),
-						 0, 0, 0);
+	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
 	dbform = (Form_pg_database) GETSTRUCT(tup);
@@ -360,7 +352,7 @@ CheckMyDatabase(const char *name, bool am_superuser)
 	 * a way to recover from disabling all access to all databases, for
 	 * example "UPDATE pg_database SET datallowconn = false;".
 	 *
-	 * We do not enforce them for the autovacuum worker processes either.
+	 * We do not enforce them for autovacuum worker processes either.
 	 */
 	if (IsUnderPostmaster && !IsAutoVacuumWorkerProcess())
 	{
@@ -374,7 +366,7 @@ CheckMyDatabase(const char *name, bool am_superuser)
 					name)));
 
 		/*
-		 * Check privilege to connect to the database.	(The am_superuser test
+		 * Check privilege to connect to the database.  (The am_superuser test
 		 * is redundant, but since we have the flag, might as well check it
 		 * and save a few cycles.)
 		 */
@@ -390,7 +382,7 @@ CheckMyDatabase(const char *name, bool am_superuser)
 		 * Check connection limit for this database.
 		 *
 		 * There is a race condition here --- we create our PGPROC before
-		 * checking for other PGPROCs.	If two backends did this at about the
+		 * checking for other PGPROCs.  If two backends did this at about the
 		 * same time, they might both think they were over the limit, while
 		 * ideally one should succeed and one fail.  Getting that to work
 		 * exactly seems more trouble than it is worth, however; instead we
@@ -415,57 +407,29 @@ CheckMyDatabase(const char *name, bool am_superuser)
 					PGC_INTERNAL, PGC_S_OVERRIDE);
 	/* If we have no other source of client_encoding, use server encoding */
 	SetConfigOption("client_encoding", GetDatabaseEncodingName(),
-					PGC_BACKEND, PGC_S_DEFAULT);
-	
-	/* assign locale variables */ 
+					PGC_BACKEND, PGC_S_DYNAMIC_DEFAULT);
+
+	/* assign locale variables */
 	collate = NameStr(dbform->datcollate);
 	ctype = NameStr(dbform->datctype);
-					
-	if (setlocale(LC_COLLATE, collate) == NULL)
-		ereport(FATAL, 
+
+	if (pg_perm_setlocale(LC_COLLATE, collate) == NULL)
+		ereport(FATAL,
 			(errmsg("database locale is incompatible with operating system"),
-			errdetail("The database was initialized with LC_COLLATE \"%s\", "
-						" which is not recognized by setlocale().", collate),
-			errhint("Recreate the database with another locale or install the missing locale.")));
-			
-	if (setlocale(LC_CTYPE, ctype) == NULL)
-		ereport(FATAL, 
+			 errdetail("The database was initialized with LC_COLLATE \"%s\", "
+					   " which is not recognized by setlocale().", collate),
+			 errhint("Recreate the database with another locale or install the missing locale.")));
+
+	if (pg_perm_setlocale(LC_CTYPE, ctype) == NULL)
+		ereport(FATAL,
 			(errmsg("database locale is incompatible with operating system"),
-			errdetail("The database was initialized with LC_CTYPE \"%s\", "
-						" which is not recognized by setlocale().", ctype),
-			errhint("Recreate the database with another locale or install the missing locale.")));
-			
+			 errdetail("The database was initialized with LC_CTYPE \"%s\", "
+					   " which is not recognized by setlocale().", ctype),
+			 errhint("Recreate the database with another locale or install the missing locale.")));
+
 	/* Make the locale settings visible as GUC variables, too */
 	SetConfigOption("lc_collate", collate, PGC_INTERNAL, PGC_S_OVERRIDE);
 	SetConfigOption("lc_ctype", ctype, PGC_INTERNAL, PGC_S_OVERRIDE);
-
-	/* Use the right encoding in translated messages */
-#ifdef ENABLE_NLS
-	pg_bind_textdomain_codeset(textdomain(NULL));
-#endif
-
-	/*
-	 * Lastly, set up any database-specific configuration variables.
-	 */
-	if (IsUnderPostmaster)
-	{
-		Datum		datum;
-		bool		isnull;
-
-		datum = SysCacheGetAttr(DATABASEOID, tup, Anum_pg_database_datconfig,
-								&isnull);
-		if (!isnull)
-		{
-			ArrayType  *a = DatumGetArrayTypeP(datum);
-
-			/*
-			 * We process all the options at SUSET level.  We assume that the
-			 * right to insert an option into pg_database was checked when it
-			 * was inserted.
-			 */
-			ProcessGUCArray(a, PGC_SUSET, PGC_S_DATABASE, GUC_ACTION_SET);
-		}
-	}
 
 	ReleaseSysCache(tup);
 }
@@ -495,12 +459,13 @@ InitCommunication(void)
 	}
 }
 
+
 /*
  * pg_split_opts -- split a string of options and append it to an argv array
  *
- * The caller is responsible for ensuring the argv array is large enough.  The
- * maximum possible number of arguments added by this routine is
- * (strlen(optstr) + 1) / 2.
+ * NB: the input string is destructively modified!	Also, caller is responsible
+ * for ensuring the argv array is large enough.  The maximum possible number
+ * of arguments added by this routine is (strlen(optstr) + 1) / 2.
  *
  * Because some option values can contain spaces we allow escaping using
  * backslashes, with \\ representing a literal backslash.
@@ -551,16 +516,39 @@ pg_split_opts(char **argv, int *argcp, char *optstr)
 	resetStringInfo(&s);
 }
 
+/*
+ * Initialize MaxBackends value from config options.
+ *
+ * This must be called after modules have had the chance to register background
+ * workers in shared_preload_libraries, and before shared memory size is
+ * determined.
+ *
+ * Note that in EXEC_BACKEND environment, the value is passed down from
+ * postmaster to subprocesses via BackendParameters in SubPostmasterMain; only
+ * postmaster itself and processes not under postmaster control should call
+ * this.
+ */
+void
+InitializeMaxBackends(void)
+{
+	Assert(MaxBackends == 0);
+
+	/* the extra unit accounts for the autovacuum launcher */
+	MaxBackends = MaxConnections + autovacuum_max_workers + 1 +
+		max_worker_processes;
+
+	/* internal error because the values were all checked previously */
+	if (MaxBackends > MAX_BACKENDS)
+		elog(ERROR, "too many backends configured");
+}
 
 /*
  * Early initialization of a backend (either standalone or under postmaster).
  * This happens even before InitPostgres.
  *
- * If you're wondering why this is separate from InitPostgres at all:
- * the critical distinction is that this stuff has to happen before we can
- * run XLOG-related initialization, which is done before InitPostgres --- in
- * fact, for cases such as the background writer process, InitPostgres may
- * never be done at all.
+ * This is separate from InitPostgres because it is also called by auxiliary
+ * processes, such as the background writer process, which may not call
+ * InitPostgres at all.
  */
 void
 BaseInit(void)
@@ -577,8 +565,13 @@ BaseInit(void)
 	smgrinit();
 	InitBufferPoolAccess();
 
-	/* Initialize llvm library if USE_CODEGEN is defined */
-	init_codegen();
+	/* 
+	 * Initialize catalog tablespace storage component
+	 * with knowledge of how to perform unlink.
+	 * 
+	 * Needed for xlog replay and normal operations.
+	 */
+	TablespaceStorageInit(UnlinkTablespaceDirectory);
 }
 
 /*
@@ -592,8 +585,7 @@ static void check_superuser_connection_limit()
 				(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 						errmsg("connection limit exceeded for superusers (need "
 									   "at least %d connections reserved for FTS handler)",
-							   RESERVED_FTS_CONNECTIONS),
-						errSendAlert(true)));
+							   RESERVED_FTS_CONNECTIONS)));
 }
 
 /* --------------------------------
@@ -601,18 +593,17 @@ static void check_superuser_connection_limit()
  *		Initialize POSTGRES.
  *
  * The database can be specified by name, using the in_dbname parameter, or by
- * OID, using the dboid parameter.	In the latter case, the actual database
+ * OID, using the dboid parameter.  In the latter case, the actual database
  * name can be returned to the caller in out_dbname.  If out_dbname isn't
  * NULL, it must point to a buffer of size NAMEDATALEN.
  *
- * In bootstrap mode no parameters are used.
- *
- * The return value indicates whether the userID is a superuser.  (That
- * can only be tested inside a transaction, so we want to do it during
- * the startup transaction rather than doing a separate one in postgres.c.)
+ * In bootstrap mode no parameters are used.  The autovacuum launcher process
+ * doesn't use any parameters either, because it only goes far enough to be
+ * able to read pg_database; it doesn't connect to any particular database.
+ * In walsender mode only username is used.
  *
  * As of PostgreSQL 8.2, we expect InitProcess() was already called, so we
- * already have a PGPROC struct ... but it's not filled in yet.
+ * already have a PGPROC struct ... but it's not completely filled in yet.
  *
  * Note:
  *		Be very careful with the order of calls in the InitPostgres function.
@@ -623,10 +614,11 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 			 char *out_dbname)
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
-	bool		autovacuum = IsAutoVacuumWorkerProcess();
 	bool		am_superuser;
 	char	   *fullpath;
 	char		dbname[NAMEDATALEN];
+
+	elog(DEBUG3, "InitPostgres");
 
 	/*
 	 * Add my PGPROC struct to the ProcArray.
@@ -660,10 +652,22 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	SharedInvalBackendInit(false);
 
 	if (MyBackendId > MaxBackends || MyBackendId <= 0)
-		elog(FATAL, "bad backend id: %d", MyBackendId);
+		elog(FATAL, "bad backend ID: %d", MyBackendId);
 
 	/* Now that we have a BackendId, we can participate in ProcSignal */
 	ProcSignalInit(MyBackendId);
+
+	/*
+	 * Also set up timeout handlers needed for backend operation.  We need
+	 * these in every case except bootstrap.
+	 */
+	if (!bootstrap)
+	{
+		RegisterTimeout(DEADLOCK_TIMEOUT, CheckDeadLock);
+		RegisterTimeout(STATEMENT_TIMEOUT, StatementTimeoutHandler);
+		RegisterTimeout(LOCK_TIMEOUT, LockTimeoutHandler);
+		RegisterTimeout(GANG_TIMEOUT, IdleGangTimeoutHandler);
+	}
 
 	/*
 	 * bufmgr needs another initialization call too
@@ -671,11 +675,28 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	InitBufferPoolBackend();
 
 	/*
-	 * Initialize local process's access to XLOG.  In bootstrap case we may
-	 * skip this since StartupXLOG() was run instead.
+	 * Initialize local process's access to XLOG.
 	 */
-	if (!bootstrap)
-		InitXLOGAccess();
+	if (IsUnderPostmaster)
+	{
+		/*
+		 * The postmaster already started the XLOG machinery, but we need to
+		 * call InitXLOGAccess(), if the system isn't in hot-standby mode.
+		 * This is handled by calling RecoveryInProgress and ignoring the
+		 * result.
+		 */
+		(void) RecoveryInProgress();
+	}
+	else
+	{
+		/*
+		 * We are either a bootstrap process or a standalone backend. Either
+		 * way, start up the XLOG machinery, and register to have it closed
+		 * down at exit.
+		 */
+		StartupXLOG();
+		on_shmem_exit(ShutdownXLOG, 0);
+	}
 
 	/*
 	 * Initialize the relation cache and the system catalog caches.  Note that
@@ -701,36 +722,57 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	RelationCacheInitializePhase2();
 
 	/*
-	 * Set up process-exit callback to do pre-shutdown cleanup.  This has to
-	 * be after we've initialized all the low-level modules like the buffer
-	 * manager, because during shutdown this has to run before the low-level
-	 * modules start to close down.  On the other hand, we want it in place
-	 * before we begin our first transaction --- if we fail during the
-	 * initialization transaction, as is entirely possible, we need the
-	 * AbortTransaction call to clean up.
+	 * Set up process-exit callback to do pre-shutdown cleanup.  This is the
+	 * first before_shmem_exit callback we register; thus, this will be the
+	 * last thing we do before low-level modules like the buffer manager begin
+	 * to close down.  We need to have this in place before we begin our first
+	 * transaction --- if we fail during the initialization transaction, as is
+	 * entirely possible, we need the AbortTransaction call to clean up.
 	 */
-	on_shmem_exit(ShutdownPostgres, 0);
+	before_shmem_exit(ShutdownPostgres, 0);
 
-	/* TODO: autovacuum launcher should be done here? */
+	/* The autovacuum launcher is done here */
+	if (IsAutoVacuumLauncherProcess())
+		return;
 
 	/*
 	 * Start a new transaction here before first access to db, and get a
 	 * snapshot.  We don't have a use for the snapshot itself, but we're
-	 * interested in the secondary effect that it sets RecentGlobalXmin.
+	 * interested in the secondary effect that it sets RecentGlobalXmin. (This
+	 * is critical for anything that reads heap pages, because HOT may decide
+	 * to prune them even if the process doesn't attempt to modify any
+	 * tuples.)
+	 *
+	 * Skip these steps if we are responding to a FTS message on mirror.
+	 * Mirror operates in standby mode and is not ready to start a
+	 * transaction or create a snapshot.  Neither are they required to
+	 * respond to a FTS message.
 	 */
-	if (!bootstrap)
+	if (!bootstrap && !am_mirror)
 	{
+		/* statement_timestamp must be set for timeouts to work correctly */
+		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
+
+		/*
+		 * transaction_isolation will have been set to the default by the
+		 * above.  If the default is "serializable", and we are in hot
+		 * standby, we will fail if we don't change it to something lower.
+		 * Fortunately, "read committed" is plenty good enough.
+		 */
+		XactIsoLevel = XACT_READ_COMMITTED;
+
 		(void) GetTransactionSnapshot();
 	}
 
 	/*
-	 * Figure out our postgres user id, and see if we are a superuser.
+	 * Perform client authentication if necessary, then figure out our
+	 * postgres user ID, and see if we are a superuser.
 	 *
-	 * In standalone mode and in the autovacuum process, we use a fixed id,
-	 * otherwise we figure it out from the authenticated user name.
+	 * In standalone mode and in autovacuum worker processes, we use a fixed
+	 * ID, otherwise we figure it out from the authenticated user name.
 	 */
-	if (bootstrap || autovacuum)
+	if (bootstrap || IsAutoVacuumWorkerProcess())
 	{
 		InitializeSessionUserIdStandalone();
 		am_superuser = true;
@@ -743,8 +785,33 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 			ereport(WARNING,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("no roles are defined in this database system"),
-					 errhint("You should immediately run CREATE USER \"%s\" CREATEUSER;.",
+					 errhint("You should immediately run CREATE USER \"%s\" SUPERUSER;.",
 							 username)));
+	}
+	else if (IsBackgroundWorker)
+	{
+		if (username == NULL)
+		{
+			InitializeSessionUserIdStandalone();
+			am_superuser = true;
+		}
+		else
+		{
+			InitializeSessionUserId(username);
+			am_superuser = superuser();
+		}
+	}
+	else if (am_mirror)
+	{
+		Assert(am_ftshandler || IsFaultHandler);
+		/*
+		 * A mirror must receive and act upon FTS messages.  Performing proper
+		 * authentication involves reading pg_authid.  Heap access is not
+		 * possible on mirror, which is in standby mode.
+		 */
+		FakeClientAuthentication(MyProcPort);
+		InitializeSessionUserIdStandalone();
+		am_superuser = true;
 	}
 	else
 	{
@@ -757,56 +824,88 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	}
 
 	/*
+	 * If we're trying to shut down, only superusers can connect, and new
+	 * replication connections are not allowed.
+	 */
+	if ((!am_superuser || am_walsender) &&
+		MyProcPort != NULL &&
+		MyProcPort->canAcceptConnections == CAC_WAITBACKUP)
+	{
+		if (am_walsender)
+			ereport(FATAL,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("new replication connections are not allowed during database shutdown")));
+		else
+			ereport(FATAL,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			errmsg("must be superuser to connect during database shutdown")));
+	}
+
+	/*
 	 * Binary upgrades only allowed super-user connections
 	 */
 	if (IsBinaryUpgrade && !am_superuser)
 	{
 		ereport(FATAL,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to connect in binary upgrade mode")));
+			 errmsg("must be superuser to connect in binary upgrade mode")));
 	}
 
 	/*
-	 * If we're trying to shut down, only superusers can connect.
+	 * The last few connections slots are reserved for superusers. Although
+	 * replication connections currently require superuser privileges, we
+	 * don't allow them to consume the reserved slots, which are intended for
+	 * interactive use.
+	 *
+	 * In Greenplum, there is a concept of restricted mode where
+	 * superuser_reserved_connections is set equal to max_connections making
+	 * it so only superusers can connect. Changes made in restricted mode need
+	 * to be replicated to the standby master. We currently only support one
+	 * walsender anyways so we should allow the connection to happen. This may
+	 * need to be reviewed later when we start supporting multiple mirrors.
 	 */
-	if (!am_superuser &&
-		MyProcPort != NULL &&
-		MyProcPort->canAcceptConnections == CAC_WAITBACKUP)
-		ereport(FATAL,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to connect during database shutdown")));
-
-	/*
-	 * Check a normal user hasn't connected to a superuser reserved slot.
-	 */
-	if (!am_superuser &&
+	if ((!am_superuser /* || am_walsender */) &&
 		ReservedBackends > 0 &&
 		!HaveNFreeProcs(ReservedBackends))
 		ereport(FATAL,
 				(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
-				 errmsg("connection limit exceeded for non-superusers"),
-				 errSendAlert(true)));
+				 errmsg("remaining connection slots are reserved for non-replication superuser connections")));
 
 	if (am_superuser)
 		check_superuser_connection_limit();
 
-	/*
-	 * If walsender or fts handler, we don't want to connect to any particular
-	 * database. Just finish the backend startup by processing any options from
-	 * the startup packet, and we're done.
-	 */
-	if (am_walsender || am_ftshandler)
+	/* Check replication permissions needed for walsender processes. */
+	if (am_walsender)
 	{
 		Assert(!bootstrap);
 
 		/*
-		 * We don't have replication role, which existed in postgres.
+		 * must have authenticated as a replication role
+		 *
+		 * In Greenplum, this code path is overloaded for handling FTS messages
+		 * on primary as well as mirror.
+		 * has_rolreplication() performs a syscache lookup,
+		 * which cannot happen on mirror/standby.
 		 */
-		if (!superuser())
+		if (am_walsender && !superuser() && !has_rolreplication(GetUserId()))
 			ereport(FATAL,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser role to start walsender")));
+					 errmsg("must be superuser or replication role to start walsender")));
+	}
 
+	if ((am_ftshandler || IsFaultHandler) && !am_superuser)
+		ereport(FATAL,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser role to handle FTS request")));
+
+	/*
+	 * If this is a plain walsender only supporting physical replication, we
+	 * don't want to connect to any particular database. Just finish the
+	 * backend startup by processing any options from the startup packet, and
+	 * we're done.
+	 */
+	if ((am_walsender && !am_db_walsender) || am_ftshandler || IsFaultHandler)
+	{
 		/* process any options passed in the startup packet */
 		if (MyProcPort != NULL)
 			process_startup_options(MyProcPort, am_superuser);
@@ -822,17 +921,18 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		pgstat_bestart();
 
 		/* close the transaction we started above */
-		CommitTransactionCommand();
+		if (!am_mirror)
+			CommitTransactionCommand();
 
 		return;
 	}
 
 	/*
-	 * Set up the global variables holding database id and path.  But note we
-	 * won't actually try to touch the database just yet.
+	 * Set up the global variables holding database id and default tablespace.
+	 * But note we won't actually try to touch the database just yet.
 	 *
 	 * We take a shortcut in the bootstrap case, otherwise we have to look up
-	 * the db name in pg_database.
+	 * the db's entry in pg_database.
 	 */
 	if (bootstrap)
 	{
@@ -854,9 +954,8 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		MyDatabaseTableSpace = dbform->dattablespace;
 		/* take database name from the caller, just for paranoia */
 		strlcpy(dbname, in_dbname, sizeof(dbname));
-		pfree(tuple);
 	}
-	else
+	else if (OidIsValid(dboid))
 	{
 		/* caller specified database by OID */
 		HeapTuple	tuple;
@@ -875,12 +974,19 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		/* pass the database name back to the caller */
 		if (out_dbname)
 			strcpy(out_dbname, dbname);
-		pfree(tuple);
 	}
-
-	/* Now we can mark our PGPROC entry with the database ID */
-	/* (We assume this is an atomic store so no lock is needed) */
-	MyProc->databaseId = MyDatabaseId;
+	else
+	{
+		/*
+		 * If this is a background worker not bound to any particular
+		 * database, we're done now.  Everything that follows only makes
+		 * sense if we are bound to a specific database.  We do need to
+		 * close the transaction we started before returning.
+		 */
+		if (!bootstrap)
+			CommitTransactionCommand();
+		return;
+	}
 
 	/*
 	 * Now, take a writer's lock on the database we are trying to connect to.
@@ -889,9 +995,13 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 * pg_database).
 	 *
 	 * Note that the lock is not held long, only until the end of this startup
-	 * transaction.  This is OK since we are already advertising our use of
-	 * the database in the PGPROC array; anyone trying a DROP DATABASE after
-	 * this point will see us there.
+	 * transaction.  This is OK since we will advertise our use of the
+	 * database in the ProcArray before dropping the lock (in fact, that's the
+	 * next thing to do).  Anyone trying a DROP DATABASE after this point will
+	 * see us in the array once they have the lock.  Ordering is important for
+	 * this because we don't want to advertise ourselves as being in this
+	 * database until we have the lock; otherwise we create what amounts to a
+	 * deadlock with CountOtherDBBackends().
 	 *
 	 * Note: use of RowExclusiveLock here is reasonable because we envision
 	 * our session as being a concurrent writer of the database.  If we had a
@@ -902,6 +1012,28 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	if (!bootstrap)
 		LockSharedObject(DatabaseRelationId, MyDatabaseId, 0,
 						 RowExclusiveLock);
+
+	/*
+	 * Now we can mark our PGPROC entry with the database ID.
+	 *
+	 * We assume this is an atomic store so no lock is needed; though actually
+	 * things would work fine even if it weren't atomic.  Anyone searching the
+	 * ProcArray for this database's ID should hold the database lock, so they
+	 * would not be executing concurrently with this store.  A process looking
+	 * for another database's ID could in theory see a chance match if it read
+	 * a partially-updated databaseId value; but as long as all such searches
+	 * wait and retry, as in CountOtherDBBackends(), they will certainly see
+	 * the correct value on their next try.
+	 */
+	MyProc->databaseId = MyDatabaseId;
+
+	/*
+	 * We established a catalog snapshot while reading pg_authid and/or
+	 * pg_database; but until we have set up MyDatabaseId, we won't react to
+	 * incoming sinval messages for unshared catalogs, so we won't realize it
+	 * if the snapshot has been invalidated.  Assume it's no good anymore.
+	 */
+	InvalidateCatalogSnapshot();
 
 	/*
 	 * Recheck pg_database to make sure the target database hasn't gone away.
@@ -922,6 +1054,10 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 			   errdetail("It seems to have just been dropped or renamed.")));
 	}
 
+	/*
+	 * Now we should be able to access the database directory safely. Verify
+	 * it's there and looks reasonable.
+	 */
 	fullpath = GetDatabasePath(MyDatabaseId, MyDatabaseTableSpace);
 
 	if (!bootstrap)
@@ -955,14 +1091,6 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 */
 	RelationCacheInitializePhase3();
 
-	/*
-	 * Now we have full access to catalog including toast tables,
-	 * we can process pg_authid.rolconfig.  This ought to come before
-	 * processing startup options so that it can override the settings.
-	 */
-	if (!bootstrap)
-		ProcessRoleGUC();
-
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
 	initialize_acl();
 
@@ -977,7 +1105,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 
 	/*
 	 * Now process any command-line switches and any additional GUC variable
-	 * settings passed in the startup packet.	We couldn't do this before
+	 * settings passed in the startup packet.   We couldn't do this before
 	 * because we didn't know if client is a superuser.
 	 */
 	if (MyProcPort != NULL)
@@ -989,11 +1117,10 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 * process_startup_options parses the GUC.
 	 */
 	if (gp_maintenance_mode && Gp_role == GP_ROLE_DISPATCH &&
-		!(superuser() && gp_maintenance_conn))
+		!(am_superuser && gp_maintenance_conn))
 		ereport(FATAL,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("maintenance mode: connected by superuser only"),
-				 errSendAlert(false)));
+				 errmsg("maintenance mode: connected by superuser only")));
 
 	/*
 	 * MPP:  If we were started in utility mode then we only want to allow
@@ -1002,16 +1129,33 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 * protect ourselves from normal clients who might be trying to connect to
 	 * the system while we startup.
 	 */
-	if ((Gp_role == GP_ROLE_UTILITY) && (Gp_session_role != GP_ROLE_UTILITY))
+	if ((Gp_role == GP_ROLE_UTILITY) && (Gp_session_role != GP_ROLE_UTILITY) &&
+		!IsAutoVacuumWorkerProcess())
 	{
 		ereport(FATAL,
 				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
 				 errmsg("System was started in master-only utility mode - only utility mode connections are allowed")));
 	}
+	else if ((Gp_session_role == GP_ROLE_DISPATCH) && !IS_QUERY_DISPATCHER())
+	{
+		ereport(FATAL,
+				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+				 errmsg("connections to primary segments are not allowed"),
+				 errdetail("This database instance is running as a primary segment in a Greenplum cluster and does not permit direct connections."),
+				 errhint("To force a connection anyway (dangerous!), use utility mode.")));
+	}
+
+	/* Process pg_db_role_setting options */
+	process_settings(MyDatabaseId, GetSessionUserId());
 
 	/* Apply PostAuthDelay as soon as we've read all options */
 	if (PostAuthDelay > 0)
 		pg_usleep(PostAuthDelay * 1000000L);
+
+	/*
+	 * Initialize various default states that can't be set up until we've
+	 * selected the active user and gotten the right GUC settings.
+	 */
 
 	/* set default namespace search path */
 	InitializeSearchPath();
@@ -1019,14 +1163,17 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	/* initialize client encoding */
 	InitializeClientEncoding();
 
-	/* report this backend in the PgBackendStatus array */
-	if (!bootstrap)
+	/*
+	 * report this backend in the PgBackendStatus array, meanwhile, we do not
+	 * want users to see auxiliary background worker like fts in pg_stat_* views.
+	 */
+	if (!bootstrap && !amAuxiliaryBgWorker())
 		pgstat_bestart();
 		
 	/* 
      * MPP package setup 
      *
-     * Primary function is to establish connctions to the qExecs.
+     * Primary function is to establish connections to the qExecs.
      * This is SKIPPED when the database is in bootstrap mode or 
      * Is not UnderPostmaster.
      */
@@ -1043,7 +1190,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	{
 		addSharedSnapshot("Query Dispatcher", gp_session_id);
 	}
-    else if (Gp_segment == -1 && Gp_role == GP_ROLE_EXECUTE && !Gp_is_writer)
+    else if (IS_QUERY_DISPATCHER() && Gp_role == GP_ROLE_EXECUTE && !Gp_is_writer)
     {
 		/* 
 		 * Entry db singleton QE is a user of the shared snapshot -- not a creator.
@@ -1068,11 +1215,14 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		}
 	}
 
+	/*
+	 * Initialize resource manager.
+	 */
+	InitResManager();
+
 	/* close the transaction we started above */
 	if (!bootstrap)
 		CommitTransactionCommand();
-
-	return;
 }
 
 /*
@@ -1109,6 +1259,7 @@ process_startup_options(Port *port, bool am_superuser)
 
 		av[ac++] = "postgres";
 
+		/* Note this mangles port->cmdline_options */
 		pg_split_opts(av, &ac, port->cmdline_options);
 
 		av[ac] = NULL;
@@ -1136,6 +1287,36 @@ process_startup_options(Port *port, bool am_superuser)
 
 		SetConfigOption(name, value, gucctx, PGC_S_CLIENT);
 	}
+}
+
+/*
+ * Load GUC settings from pg_db_role_setting.
+ *
+ * We try specific settings for the database/role combination, as well as
+ * general for this database and for this user.
+ */
+static void
+process_settings(Oid databaseid, Oid roleid)
+{
+	Relation	relsetting;
+	Snapshot	snapshot;
+
+	if (!IsUnderPostmaster)
+		return;
+
+	relsetting = heap_open(DbRoleSettingRelationId, AccessShareLock);
+
+	/* read all the settings under the same snapshot for efficiency */
+	snapshot = RegisterSnapshot(GetCatalogSnapshot(DbRoleSettingRelationId));
+
+	/* Later settings are ignored if set earlier. */
+	ApplySetting(snapshot, databaseid, roleid, relsetting, PGC_S_DATABASE_USER);
+	ApplySetting(snapshot, InvalidOid, roleid, relsetting, PGC_S_USER);
+	ApplySetting(snapshot, databaseid, InvalidOid, relsetting, PGC_S_DATABASE);
+	ApplySetting(snapshot, InvalidOid, InvalidOid, relsetting, PGC_S_GLOBAL);
+
+	UnregisterSnapshot(snapshot);
+	heap_close(relsetting, AccessShareLock);
 }
 
 /*
@@ -1182,6 +1363,36 @@ ShutdownPostgres(int code, Datum arg)
 
 
 /*
+ * STATEMENT_TIMEOUT handler: trigger a query-cancel interrupt.
+ */
+static void
+StatementTimeoutHandler(void)
+{
+#ifdef HAVE_SETSID
+	/* try to signal whole process group */
+	kill(-MyProcPid, SIGINT);
+#endif
+	kill(MyProcPid, SIGINT);
+}
+
+/*
+ * LOCK_TIMEOUT handler: trigger a query-cancel interrupt.
+ *
+ * This is identical to StatementTimeoutHandler, but since it's so short,
+ * we might as well keep the two functions separate for clarity.
+ */
+static void
+LockTimeoutHandler(void)
+{
+#ifdef HAVE_SETSID
+	/* try to signal whole process group */
+	kill(-MyProcPid, SIGINT);
+#endif
+	kill(MyProcPid, SIGINT);
+}
+
+
+/*
  * Returns true if at least one role is defined in this database cluster.
  */
 static bool
@@ -1193,7 +1404,7 @@ ThereIsAtLeastOneRole(void)
 
 	pg_authid_rel = heap_open(AuthIdRelationId, AccessShareLock);
 
-	scan = heap_beginscan(pg_authid_rel, SnapshotNow, 0, NULL);
+	scan = heap_beginscan_catalog(pg_authid_rel, 0, NULL);
 	result = (heap_getnext(scan, ForwardScanDirection) != NULL);
 
 	heap_endscan(scan);

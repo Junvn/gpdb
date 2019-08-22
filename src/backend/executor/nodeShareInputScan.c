@@ -15,8 +15,7 @@
  */
 
 /*
- * INTERFACE ROUNTINES
- * 	ExecCountSlotsShareInputScan
+ * INTERFACE ROUTINES
  *	ExecInitShareInputScan
  * 	ExecShareInputScan
  * 	ExecEndShareInputScan
@@ -32,7 +31,6 @@
 #include "executor/executor.h"
 #include "executor/nodeShareInputScan.h"
 #include "miscadmin.h"
-#include "postmaster/primary_mirror_mode.h"
 #include "utils/faultinjector.h"
 #include "utils/gp_alloc.h"
 #include "utils/tuplesort.h"
@@ -49,17 +47,9 @@ typedef struct ShareInput_Lk_Context
 	char lkname_done[MAXPGPATH];
 } ShareInput_Lk_Context;
 
-static TupleTableSlot *ShareInputNext(ShareInputScanState *node);
 static void writer_wait_for_acks(ShareInput_Lk_Context *pctxt, int share_id, int xslice);
 
-/* ------------------------------------------------------------------
- * 	ExecShareInputScan 
- * ------------------------------------------------------------------
- */
-TupleTableSlot *ExecShareInputScan(ShareInputScanState *node)
-{
-	return ExecScan(&node->ss, (ExecScanAccessMtd) ShareInputNext);
-}
+static void ExecEagerFreeShareInputScan(ShareInputScanState *node);
 
 /*
  * init_tuplestore_state
@@ -119,11 +109,16 @@ init_tuplestore_state(ShareInputScanState *node)
 
 		node->ts_state->sortstore = tuplesort_begin_heap_file_readerwriter(
 			&node->ss,
-			rwfile_prefix, false,
-			NULL,
-			0, NULL,
-			NULL, NULL,
-			PlanStateOperatorMemKB((PlanState *) node), true);
+			rwfile_prefix,
+			false, /* isWriter */
+			NULL, /* tupDesc */
+			0, /* nkeys */
+			NULL, /* attNums */
+			NULL, /* sortOperators */
+			NULL, /* sortCollations */
+			NULL, /* nullsFirstFlags */
+			PlanStateOperatorMemKB((PlanState *) node),
+			true /* randomAccess */);
 
 		tuplesort_begin_pos(node->ts_state->sortstore, (TuplesortPos **)(&node->ts_pos));
 		tuplesort_rescan_pos(node->ts_state->sortstore, (TuplesortPos *)node->ts_pos);
@@ -145,12 +140,12 @@ init_tuplestore_state(ShareInputScanState *node)
 
 
 /* ------------------------------------------------------------------
- * ShareInputNext
+ * 	ExecShareInputScan
  * 	Retrieve a tuple from the ShareInputScan
  * ------------------------------------------------------------------
  */
-TupleTableSlot * 
-ShareInputNext(ShareInputScanState *node)
+TupleTableSlot *
+ExecShareInputScan(ShareInputScanState *node)
 {
 	EState *estate;
 	ScanDirection dir;
@@ -196,7 +191,7 @@ ShareInputNext(ShareInputScanState *node)
 		if(!gotOK)
 			return NULL;
 
-		SIMPLE_FAULT_INJECTOR(ExecShareInputNext);
+		SIMPLE_FAULT_INJECTOR("execshare_input_next");
 
 		return slot;
 	}
@@ -304,18 +299,6 @@ ExecSliceDependencyShareInputScan(ShareInputScanState *node)
 }
 
 /* ------------------------------------------------------------------
- * 	ExecCountSlotsShareInputScan 
- * ------------------------------------------------------------------
- */
-int 
-ExecCountSlotsShareInputScan(ShareInputScan* node)
-{
-#define SHAREINPUT_NSLOTS 2
-	return ExecCountSlotsNode(outerPlan((Plan *) node)) 
-		+ SHAREINPUT_NSLOTS;
-}
-
-/* ------------------------------------------------------------------
  * 	ExecEndShareInputScan
  * ------------------------------------------------------------------
  */
@@ -343,10 +326,11 @@ void ExecEndShareInputScan(ShareInputScanState *node)
 }
 
 /* ------------------------------------------------------------------
- * 	ExecShareInputScanReScan
+ * 	ExecReScanShareInputScan
  * ------------------------------------------------------------------
  */
-void ExecShareInputScanReScan(ShareInputScanState *node, ExprContext *exprCtxt)
+void
+ExecReScanShareInputScan(ShareInputScanState *node)
 {
 	/* if first time call, need to initialize the tuplestore state */
 	if(node->ts_state == NULL)
@@ -408,26 +392,27 @@ void ExecShareInputScanReScan(ShareInputScanState *node, ExprContext *exprCtxt)
 
 void shareinput_create_bufname_prefix(char* p, int size, int share_id)
 {
-	snprintf(p, size, "%s_SIRW_%d_%d_%d", 
-            PG_TEMP_FILE_PREFIX, 
+	snprintf(p, size, "SIRW_%d_%d_%d",
             gp_session_id, gp_command_count, share_id);
 }
 
 /* Here we use the absolute path name as the lock name.  See fd.c 
  * for how the name is created (GP_TEMP_FILE_DIR and make_database_relative).
  */
-static void sisc_lockname(char* p, int size, int share_id, const char* name)
+static void
+sisc_lockname(char *p, int size, int share_id, const char* name)
 {
-	if (snprintf(p, size,
-			"%s/%s/%s_gpcdb2.sisc_%d_%d_%d_%d_%s",
-			getCurrentTempFilePath, PG_TEMP_FILES_DIR, PG_TEMP_FILE_PREFIX, 
-			Gp_segment, gp_session_id, gp_command_count, share_id, name
-			) > size)
-	{
-		ereport(ERROR, (errmsg("cannot generate path %s/%s/%s_gpcdb2.sisc_%d_%d_%d_%d_%s",
-                        getCurrentTempFilePath, PG_TEMP_FILES_DIR, PG_TEMP_FILE_PREFIX,
-                        Gp_segment, gp_session_id, gp_command_count, share_id, name)));
-	}
+	char		filename[MAXPGPATH];
+	char	   *path;
+
+	snprintf(filename, sizeof(filename),
+			 "gpcdb2.sisc_%d_%d_%d_%d_%s",
+			 GpIdentity.segindex, gp_session_id, gp_command_count, share_id, name);
+
+	path = GetTempFilePath(filename, true);
+	if (strlen(path) >= size)
+		elog(ERROR, "path to temporary file too long: %s", path);
+	strcpy(p, path);
 }
 
 static void shareinput_clean_lk_ctxt(ShareInput_Lk_Context *lk_ctxt)
@@ -480,28 +465,15 @@ static void XCallBack_ShareInput_FIFO(XactEvent ev, void* vp)
 	shareinput_clean_lk_ctxt(lk_ctxt);
 }
 
-static void create_tmp_fifo(const char *fifoname)
+static void
+create_tmp_fifo(const char *fifoname)
 {
 #ifdef WIN32
 	elog(ERROR, "mkfifo not supported on win32");
 #else
 	int err = mkfifo(fifoname, 0600);
-	if(err < 0)
-	{
-		/* first try may be due to pgsql_tmp dir is not created yet. */
-		char tmpdir[MAXPGPATH];
-		if (snprintf(tmpdir, MAXPGPATH, "%s/%s", getCurrentTempFilePath, PG_TEMP_FILES_DIR) > MAXPGPATH)
-		{
-			ereport(ERROR, (errmsg("cannot create dir path %s/%s", getCurrentTempFilePath, PG_TEMP_FILES_DIR)));
-		}
-		mkdir(tmpdir, S_IRWXU);
-
-		/* then try it again */
-		err = mkfifo(fifoname, 0600);
-
-		if(err < 0 && errno != EEXIST)
-			elog(ERROR, "could not create temporary fifo \"%s\": %m", fifoname);
-	}
+	if (err < 0 && errno != EEXIST)
+		elog(ERROR, "could not create temporary fifo \"%s\": %m", fifoname);
 #endif
 }
 
@@ -587,7 +559,6 @@ shareinput_reader_waitready(int share_id, PlanGenerator planGen)
 	struct timeval tval;
 	int n;
 	char a;
-
 	ShareInput_Lk_Context *pctxt = gp_malloc(sizeof(ShareInput_Lk_Context));
 
 	if(!pctxt)
@@ -823,7 +794,7 @@ shareinput_reader_notifydone(void *ctxt, int share_id)
 /*
  * shareinput_writer_waitdone
  *
- *  Called by the writer (producer) to wait for the "done" notfication from
+ *  Called by the writer (producer) to wait for the "done" notification from
  *  all readers (consumers).
  *
  *  This is a blocking operation.
@@ -894,10 +865,9 @@ shareinput_writer_waitdone(void *ctxt, int share_id, int nsharer_xslice)
  * inter-slice share nodes have their own pointer to the buffer and
  * there is not way to tell this reference over Motions anyway.
  */
-void
+static void
 ExecEagerFreeShareInputScan(ShareInputScanState *node)
 {
-
 	/*
 	 * no need to call tuplestore end.  Underlying ShareInput will take
 	 * care of releasing tuplestore resources
@@ -922,6 +892,14 @@ ExecEagerFreeShareInputScan(ShareInputScanState *node)
 			{
 				ntuplestore_destroy(node->ts_state->matstore);
 			}
+		}
+	}
+	if (sisc->share_type == SHARE_SORT_XSLICE)
+	{
+		if (NULL != node->ts_state && NULL != node->ts_state->sortstore)
+		{
+			tuplesort_end(node->ts_state->sortstore);
+			node->ts_state->sortstore = NULL;
 		}
 	}
 
@@ -949,4 +927,44 @@ ExecEagerFreeShareInputScan(ShareInputScanState *node)
 		snEntry->refcount--;
 	}
 	node->freed = true;
+}
+
+void
+ExecSquelchShareInputScan(ShareInputScanState *node)
+{
+	ShareType share_type = ((ShareInputScan *) node->ss.ps.plan)->share_type;
+	bool isWriter = outerPlanState(node) != NULL;
+	bool tuplestoreInitialized = node->ts_state != NULL;
+
+	/*
+	 * If this SharedInputScan is shared within the same slice then its
+	 * subtree may still need to be executed and the motions in the subtree
+	 * cannot yet be stopped. Thus, don't recurse in this case.
+	 *
+	 * In squelching a cross-slice SharedInputScan writer, we need to ensure
+	 * we don't block any reader on other slices as a result of not
+	 * materializing the shared plan.
+	 *
+	 * Note that we emphatically can't "fake" an empty tuple store and just
+	 * go ahead waking up the readers because that can lead to wrong results.
+	 */
+	switch (share_type)
+	{
+		case SHARE_MATERIAL:
+		case SHARE_SORT:
+			/* don't recurse into child */
+			return;
+
+		case SHARE_MATERIAL_XSLICE:
+		case SHARE_SORT_XSLICE:
+			if (isWriter && !tuplestoreInitialized)
+				ExecProcNode((PlanState *) node);
+			break;
+		case SHARE_NOTSHARED:
+			break;
+	}
+	ExecSquelchNode(outerPlanState(node));
+
+	/* Free any resources that we can. */
+	ExecEagerFreeShareInputScan(node);
 }

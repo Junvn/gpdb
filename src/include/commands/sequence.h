@@ -5,33 +5,25 @@
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc.
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/commands/sequence.h,v 1.41 2008/05/16 23:36:05 tgl Exp $
+ * src/include/commands/sequence.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef SEQUENCE_H
 #define SEQUENCE_H
 
-#include "nodes/parsenodes.h"
-#include "storage/relfilenode.h"
-#include "storage/itemptr.h"
 #include "access/xlog.h"
 #include "fmgr.h"
+#include "nodes/parsenodes.h"
+#include "storage/relfilenode.h"
 
 
-/*
- * On a machine with no 64-bit-int C datatype, sizeof(int64) will not be 8,
- * but we need this struct type to line up with the way that a sequence
- * table is defined --- and pg_type will say that int8 is 8 bytes anyway.
- * So, we need padding.  Ugly but necessary.
- */
 typedef struct FormData_pg_sequence
 {
 	NameData	sequence_name;
-#ifndef INT64_IS_BUSTED
 	int64		last_value;
 	int64		start_value;
 	int64		increment_by;
@@ -39,22 +31,6 @@ typedef struct FormData_pg_sequence
 	int64		min_value;
 	int64		cache_value;
 	int64		log_cnt;
-#else
-	int32		last_value;
-	int32		pad1;
-	int32		start_value;
-	int32		pad2;
-	int32		increment_by;
-	int32		pad3;
-	int32		max_value;
-	int32		pad4;
-	int32		min_value;
-	int32		pad5;
-	int32		cache_value;
-	int32		pad6;
-	int32		log_cnt;
-	int32		pad7;
-#endif
 	bool		is_cycled;
 	bool		is_called;
 } FormData_pg_sequence;
@@ -82,41 +58,34 @@ typedef FormData_pg_sequence *Form_pg_sequence;
 /* XLOG stuff */
 #define XLOG_SEQ_LOG			0x00
 
+#define SEQ_NEXTVAL_FALSE		'f'
+#define SEQ_NEXTVAL_TRUE		't'
+#define SEQ_NEXTVAL_QUERY_RESPONSE	'?'
+
 typedef struct xl_seq_rec
 {
 	RelFileNode 	node;
-	ItemPointerData persistentTid;
-	int64 			persistentSerialNum;
 
 	/* SEQUENCE TUPLE DATA FOLLOWS AT THE END */
 } xl_seq_rec;
 
 extern Datum nextval(PG_FUNCTION_ARGS);
 extern Datum nextval_oid(PG_FUNCTION_ARGS);
+extern void nextval_qd(Oid relid, int64 *plast, int64 *pcached, int64  *pincrement, bool *poverflow);
 extern Datum currval_oid(PG_FUNCTION_ARGS);
 extern Datum setval_oid(PG_FUNCTION_ARGS);
 extern Datum setval3_oid(PG_FUNCTION_ARGS);
 extern Datum lastval(PG_FUNCTION_ARGS);
 
-extern void DefineSequence(CreateSeqStmt *stmt);
-extern void AlterSequence(AlterSeqStmt *stmt);
-extern void AlterSequenceInternal(Oid relid, List *options);
+extern Datum pg_sequence_parameters(PG_FUNCTION_ARGS);
+
+extern Oid	DefineSequence(CreateSeqStmt *stmt);
+extern Oid	AlterSequence(AlterSeqStmt *stmt);
+extern void ResetSequence(Oid seq_relid);
+extern void ResetSequenceCaches(void);
 
 extern void seq_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *rptr);
-extern void seq_desc(StringInfo buf, XLogRecPtr beginLoc, XLogRecord *record);
-
-/*
- * CDB: nextval entry point called by sequence server
- */
-void
-cdb_sequence_nextval_server(Oid    tablespaceid,
-                            Oid    dbid,
-                            Oid    relid,
-                            bool   istemp,
-                            int64 *plast,
-                            int64 *pcached,
-                            int64 *pincrement,
-                            bool  *poverflow);
+extern void seq_desc(StringInfo buf, XLogRecord *record);
 
 extern void seq_mask(char *pagedata, BlockNumber blkno);
 

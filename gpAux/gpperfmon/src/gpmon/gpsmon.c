@@ -390,7 +390,7 @@ static apr_uint64_t metric_diff_calc( sigar_uint64_t newval, apr_uint64_t oldval
 	{
 		diff = newval - oldval;
 	}
-#if defined(rhel5_x86_64) || defined(rhel7_x86_64) || defined(rhel6_x86_64) || defined(suse10_x86_64)
+#if defined(rhel7_x86_64) || defined(rhel6_x86_64) || defined(suse10_x86_64)
 	// Add this debug on 64 bit machines to try and debug strange values we are seeing
 	if(diff > 1000000000000000000  ) {
 		TR0(("Crazy high value for diff! new value=%" APR_UINT64_T_FMT ", old value=%" APR_UINT64_T_FMT ", diff=%" APR_UINT64_T_FMT "  for %s metric %s; assume the value was reset and set diff to new value.\n",
@@ -799,7 +799,7 @@ static void gx_gettcpcmd(SOCKET sock, short event, void* arg)
 			apr_hash_this(hi, 0, 0, &vptr);
 			pidrec = vptr;
 
-			TR2(("tmid %d ssid %d ccnt %d pid %d (CPU elapsed %d CPU Percent %.2f)\n",
+			TR2(("tmid %d ssid %d ccnt %d pid %d (CPU elapsed %ld CPU Percent %.2f)\n",
 				pidrec->query_key.tmid, pidrec->query_key.ssid, pidrec->query_key.ccnt, pidrec->pid,
 				pidrec->cpu_elapsed, pidrec->p_metrics.cpu_pct));
 
@@ -843,7 +843,7 @@ static void gx_gettcpcmd(SOCKET sock, short event, void* arg)
 			ppkt->u.qlog.cpu_elapsed = pidrec->cpu_elapsed;
 			ppkt->u.qlog.p_metrics.cpu_pct = pidrec->p_metrics.cpu_pct;
 
-			TR2(("SEND tmid %d ssid %d ccnt %d (CPU elapsed %d CPU Percent %.2f)\n",
+			TR2(("SEND tmid %d ssid %d ccnt %d (CPU elapsed %ld CPU Percent %.2f)\n",
 				ppkt->u.qlog.key.tmid, ppkt->u.qlog.key.ssid, ppkt->u.qlog.key.ccnt,
 				ppkt->u.qlog.cpu_elapsed, ppkt->u.qlog.p_metrics.cpu_pct));
 
@@ -993,7 +993,7 @@ static void gx_recvsegment(gpmon_packet_t* pkt)
 
 	p = &pkt->u.seginfo;
 
-	TR2(("Received segment packet for dbid %d (dynamic_memory_used, dynamic_memory_available) (%llu %llu)\n", p->dbid, p->dynamic_memory_used, p->dynamic_memory_available));
+	TR2(("Received segment packet for dbid %d (dynamic_memory_used, dynamic_memory_available) (%lu %lu)\n", p->dbid, p->dynamic_memory_used, p->dynamic_memory_available));
 
 	rec = apr_hash_get(gx.segmenttab, &p->dbid, sizeof(p->dbid));
 	if (rec)
@@ -1047,7 +1047,7 @@ static void extract_segments_exec(gpmon_packet_t* pkt)
 	{
 		rec->u.queryseg.sum_cpu_elapsed += pidrec->cpu_elapsed;
 		rec->u.queryseg.sum_measures_rows_out += p->rowsout;
-		if (p->key.hash_key.segid == -1 && p->key.hash_key.nid == 1)
+		if (p->key.hash_key.segid == -1 && p->key.hash_key.nid == 1 && (int64)(p->rowsout) > rec->u.queryseg.final_rowsout)
 		{
 			rec->u.queryseg.final_rowsout = p->rowsout;
 		}
@@ -1117,7 +1117,7 @@ static void gx_recvfrom(SOCKET sock, short event, void* arg)
 
 	if (n != sizeof(pkt))
 	{
-		gpmon_warning(FLINE, "bad packet (length %d). Expected packet size %d", n, sizeof(pkt));
+		gpmon_warning(FLINE, "bad packet (length %d). Expected packet size %d", n, (int) sizeof(pkt));
 		return;
 	}
 
@@ -1475,7 +1475,7 @@ static void setup_sigar(void)
 		do_destroy = 0;
 	}
 	cnt = 0;
-	TR2(("sigar fsnumber: %d\n", sigar_fslist.number));
+	TR2(("sigar fsnumber: %lu\n", sigar_fslist.number));
 	for (i = 0; i < sigar_fslist.number; i++)
 	{
 		if (sigar_fslist.data[i].type == SIGAR_FSTYPE_LOCAL_DISK)

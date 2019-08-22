@@ -62,9 +62,6 @@ typedef struct URL_EXECUTE_FILE
 	execute_handle_t *handle;	/* ResourceOwner-tracked stuff */
 } URL_EXECUTE_FILE;
 
-extern int popen_with_stderr(int *rwepipe, const char *exe, bool forwrite);
-extern int pclose_with_stderr(int pid, int *rwepipe, StringInfo sinfo);
-extern char *make_command(const char *cmd, extvar_t *ev);
 static void pclose_without_stderr(int *rwepipe);
 static char *interpretError(int exitCode, char *buf, size_t buflen, char *err, size_t errlen);
 static const char *getSignalNameFromCode(int signo);
@@ -180,12 +177,25 @@ make_export(char *name, const char *value, StringInfo buf)
 {
 	char		ch;
 
+	/*
+	 * Shell-quote the value so that we don't need to escape other special char
+	 * except single quote and backslash. (We assume the variable name doesn't contain
+	 * funny characters.
+	 *
+	 * Every single-quote is replaced with '\''. For example, value
+	 * foo'bar becomes 'foo'\''bar'.
+	 *
+	 * Don't need to escape backslash, although using echo will behave differently on
+	 * different platforms. It's better to write as: /usr/bin/env bash -c 'echo -E "$VAR"'.
+	 */
 	appendStringInfo(buf, "%s='", name);
 
 	for ( ; 0 != (ch = *value); value++)
 	{
-		if (ch == '\'' || ch == '\\')
-			appendStringInfoChar(buf, '\\');
+		if(ch == '\'')
+		{
+			appendStringInfo(buf, "\'\\\'");
+		}
 
 		appendStringInfoChar(buf, ch);
 	}
@@ -216,12 +226,7 @@ make_command(const char *cmd, extvar_t *ev)
 	make_export("GP_SEG_PORT", ev->GP_SEG_PORT, &buf);
 	make_export("GP_SESSION_ID", ev->GP_SESSION_ID, &buf);
 	make_export("GP_SEGMENT_COUNT", ev->GP_SEGMENT_COUNT, &buf);
-
-	/* hadoop env var */
-	make_export("GP_HADOOP_CONN_JARDIR", ev->GP_HADOOP_CONN_JARDIR, &buf);
-	make_export("GP_HADOOP_CONN_VERSION", ev->GP_HADOOP_CONN_VERSION, &buf);
-	if (strlen(ev->GP_HADOOP_HOME) > 0)
-		make_export("HADOOP_HOME",    ev->GP_HADOOP_HOME,    &buf);
+	make_export("GP_QUERY_STRING", ev->GP_QUERY_STRING, &buf);
 
 	appendStringInfoString(&buf, cmd);
 
@@ -281,11 +286,10 @@ url_execute_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 	/* Restore process interval timers */
 	restoreTimers(&savetimers);
 
+	elog(DEBUG5, "EXTERNAL TABLE EXECUTE Command: %s", file->shexec);
 	if (file->handle->pid == -1)
 	{
 		errno = save_errno;
-		pfree(file->common.url);
-		pfree(file);
 		ereport(ERROR,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
 						errmsg("cannot start external table command: %m"),
@@ -375,7 +379,13 @@ url_execute_ferror(URL_FILE *file, int bytesread, char *ebuf, int ebuflen)
 		 * Read one byte less than the maximum size to ensure zero
 		 * termination of the buffer.
 		 */
-		nread = piperead(efile->handle->pipes[EXEC_ERR_P], ebuf, ebuflen -1);
+reread:
+		nread = read(efile->handle->pipes[EXEC_ERR_P], ebuf, ebuflen -1);
+		if(nread == -1 && errno == EINTR)
+		{
+			CHECK_FOR_INTERRUPTS();
+			goto reread;
+		}
 
 		if(nread != -1)
 			ebuf[nread] = 0;
@@ -390,8 +400,22 @@ size_t
 url_execute_fread(void *ptr, size_t size, URL_FILE *file, CopyState pstate)
 {
 	URL_EXECUTE_FILE *efile = (URL_EXECUTE_FILE *) file;
+	ssize_t		n;
+	bool        rerun;
 
-	return piperead(efile->handle->pipes[EXEC_DATA_P], ptr, size);
+	do {
+		n = read(efile->handle->pipes[EXEC_DATA_P], ptr, size);
+
+		if (n == -1 && errno == EINTR)
+		{
+			CHECK_FOR_INTERRUPTS();
+			rerun = true;
+		}
+		else
+			rerun = false;
+	} while (rerun);
+
+	return n;
 }
 
 size_t
@@ -406,9 +430,17 @@ url_execute_fwrite(void *ptr, size_t size, URL_FILE *file, CopyState pstate)
     /* ensure all data in buffer is send out to pipe*/
     while(size > offset)
     {
-        n = pipewrite(fd,p,size - offset);
+        n = write(fd,p,size - offset);
 
-        if(n == -1) return -1;
+		if (n == -1)
+		{
+			if (errno == EINTR)
+			{
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			return -1;
+		}
 
         if(n == 0) break;
 
@@ -616,10 +648,10 @@ popen_with_stderr(int *pipes, const char *exe, bool forwrite)
 	const int READ = 0;
 	const int WRITE = 1;
 
-	if (pgpipe(data) < 0)
+	if (pipe(data) < 0)
 		return -1;
 
-	if (pgpipe(err) < 0)
+	if (pipe(err) < 0)
 	{
 		close(data[READ]);
 		close(data[WRITE]);
@@ -745,7 +777,7 @@ read_err_msg(int fid, StringInfo sinfo)
 
 	while (true)
 	{
-		int nread = piperead(fid, ebuf, ebuflen);
+		int nread = read(fid, ebuf, ebuflen);
 
 		if(nread == 0)
 		{
@@ -777,7 +809,7 @@ read_err_msg(int fid, StringInfo sinfo)
 int
 pclose_with_stderr(int pid, int *pipes, StringInfo sinfo)
 {
-	int status;
+	int status = 0;
 
 	/* close the data pipe. we can now read from error pipe without being blocked */
 	close(pipes[EXEC_DATA_P]);
@@ -786,11 +818,14 @@ pclose_with_stderr(int pid, int *pipes, StringInfo sinfo)
 
 	close(pipes[EXEC_ERR_P]);
 
-#ifndef WIN32
-	waitpid(pid, &status, 0);
-#else
-    status = -1;
-#endif
+	if (kill(pid, 0) == 0) /* process exists */
+	{
+	#ifndef WIN32
+		waitpid(pid, &status, 0);
+	#else
+		status = -1;
+	#endif
+	}
 
 	return status;
 }

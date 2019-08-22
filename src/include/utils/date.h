@@ -1,13 +1,13 @@
 /*-------------------------------------------------------------------------
  *
  * date.h
- *	  Definitions for the SQL92 "date" and "time" types.
+ *	  Definitions for the SQL "date" and "time" types.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/utils/date.h,v 1.41 2008/10/14 17:12:33 tgl Exp $
+ * src/include/utils/date.h
  *
  *-------------------------------------------------------------------------
  */
@@ -64,8 +64,7 @@ typedef struct
 #define DateADTGetDatum(X)	  Int32GetDatum(X)
 #define TimeADTGetDatum(X)	  Int64GetDatum(X)
 #define TimeTzADTPGetDatum(X) PointerGetDatum(X)
-
-#else  /* !HAVE_INT64_TIMESTAMP */
+#else							/* !HAVE_INT64_TIMESTAMP */
 
 #define MAX_TIME_PRECISION 10
 
@@ -80,7 +79,6 @@ typedef struct
 #define DateADTGetDatum(X)	  Int32GetDatum(X)
 #define TimeADTGetDatum(X)	  Float8GetDatum(X)
 #define TimeTzADTPGetDatum(X) PointerGetDatum(X)
-
 #endif   /* HAVE_INT64_TIMESTAMP */
 
 #define PG_GETARG_DATEADT(n)	 DatumGetDateADT(PG_GETARG_DATUM(n))
@@ -110,11 +108,13 @@ static inline DateADT date_pl_days(DateADT date, int32 days)
 
 /* date.c */
 extern double date2timestamp_no_overflow(DateADT dateVal);
+extern void EncodeSpecialDate(DateADT dt, char *str);
 
 extern Datum date_in(PG_FUNCTION_ARGS);
 extern Datum date_out(PG_FUNCTION_ARGS);
 extern Datum date_recv(PG_FUNCTION_ARGS);
 extern Datum date_send(PG_FUNCTION_ARGS);
+extern Datum make_date(PG_FUNCTION_ARGS);
 extern Datum date_eq(PG_FUNCTION_ARGS);
 extern Datum date_ne(PG_FUNCTION_ARGS);
 extern Datum date_lt(PG_FUNCTION_ARGS);
@@ -122,6 +122,7 @@ extern Datum date_le(PG_FUNCTION_ARGS);
 extern Datum date_gt(PG_FUNCTION_ARGS);
 extern Datum date_ge(PG_FUNCTION_ARGS);
 extern Datum date_cmp(PG_FUNCTION_ARGS);
+extern Datum date_sortsupport(PG_FUNCTION_ARGS);
 extern Datum date_finite(PG_FUNCTION_ARGS);
 extern Datum date_larger(PG_FUNCTION_ARGS);
 extern Datum date_smaller(PG_FUNCTION_ARGS);
@@ -171,6 +172,8 @@ extern Datum time_recv(PG_FUNCTION_ARGS);
 extern Datum time_send(PG_FUNCTION_ARGS);
 extern Datum timetypmodin(PG_FUNCTION_ARGS);
 extern Datum timetypmodout(PG_FUNCTION_ARGS);
+extern Datum make_time(PG_FUNCTION_ARGS);
+extern Datum time_transform(PG_FUNCTION_ARGS);
 extern Datum time_scale(PG_FUNCTION_ARGS);
 extern Datum time_eq(PG_FUNCTION_ARGS);
 extern Datum time_ne(PG_FUNCTION_ARGS);

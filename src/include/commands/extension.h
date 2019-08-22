@@ -23,13 +23,12 @@
  * on the current pg_extension object for each SQL object created by its
  * installation script.
  */
-extern bool creating_extension;
-extern Oid	CurrentExtensionObject;
+extern PGDLLIMPORT bool creating_extension;
+extern PGDLLIMPORT Oid CurrentExtensionObject;
 
 
-extern void CreateExtension(CreateExtensionStmt *stmt);
+extern Oid	CreateExtension(CreateExtensionStmt *stmt);
 
-extern void RemoveExtensions(DropStmt *stmt);
 extern void RemoveExtensionById(Oid extId);
 
 extern Oid InsertExtensionTuple(const char *extName, Oid extOwner,
@@ -37,15 +36,13 @@ extern Oid InsertExtensionTuple(const char *extName, Oid extOwner,
 					 Datum extConfig, Datum extCondition,
 					 List *requiredExtensions);
 
-extern void ExecAlterExtensionStmt(AlterExtensionStmt *stmt);
+extern Oid	ExecAlterExtensionStmt(AlterExtensionStmt *stmt);
 
-extern void ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt);
+extern Oid	ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt);
 
 extern Oid	get_extension_oid(const char *extname, bool missing_ok);
 extern char *get_extension_name(Oid ext_oid);
 
-extern void AlterExtensionNamespace(List *names, const char *newschema);
-
-extern void AlterExtensionOwner_oid(Oid extensionOid, Oid newOwnerId);
+extern Oid	AlterExtensionNamespace(List *names, const char *newschema);
 
 #endif   /* EXTENSION_H */

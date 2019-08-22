@@ -4,10 +4,10 @@
  *	  POSTGRES heap access method input/output definitions.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/access/hio.h,v 1.37 2008/11/06 20:51:15 tgl Exp $
+ * src/include/access/hio.h
  *
  *-------------------------------------------------------------------------
  */
@@ -30,15 +30,16 @@
  */
 typedef struct BulkInsertStateData
 {
-	BufferAccessStrategy strategy;	/* our BULKWRITE strategy object */
-	Buffer current_buf;				/* current insertion target page */
-} BulkInsertStateData;
+	BufferAccessStrategy strategy;		/* our BULKWRITE strategy object */
+	Buffer		current_buf;	/* current insertion target page */
+}	BulkInsertStateData;
 
 
 extern void RelationPutHeapTuple(Relation relation, Buffer buffer,
 					 HeapTuple tuple);
 extern Buffer RelationGetBufferForTuple(Relation relation, Size len,
 						  Buffer otherBuffer, int options,
-						  struct BulkInsertStateData *bistate);
+						  BulkInsertState bistate,
+						  Buffer *vmbuffer, Buffer *vmbuffer_other);
 
 #endif   /* HIO_H */

@@ -24,8 +24,7 @@
 #include "executor/tuptable.h"
 #include "executor/instrument.h"            /* Instrumentation */
 #include "executor/execHHashagg.h"
-#include "executor/execWorkfile.h"
-#include "storage/bfz.h"
+#include "storage/buffile.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
@@ -37,7 +36,6 @@
 
 #include "cdb/cdbexplain.h"
 #include "cdb/cdbvars.h"
-#include "postmaster/primary_mirror_mode.h"
 
 
 #define HHA_MSG_LVL DEBUG2
@@ -48,12 +46,23 @@ struct BatchFileInfo
 {
 	int64 total_bytes;
 	int64 ntuples;
-	ExecWorkFile *wfile;
+	BufFile *wfile;
 };
 
+/*
+ * Estimate per-file memory overhead. We assume that a BufFile consumed about
+ * 64 bytes for various structs. It also keeps a buffer of size BLCKSZ. It
+ * can be temporarily freed with BufFileSuspend().
+ *
+ * FIXME: This code used to use a different kind of abstraction for reading
+ * files, called BFZ. That used a 16 kB buffer. To keep the calculations
+ * unmodified, we claim the buffer size to still be 16 kB. I got assertion
+ * failures in the regression tests when I tried changing this to BLCKSZ...
+ */
+/* #define FREEABLE_BATCHFILE_METADATA (BLCKSZ) */
+#define FREEABLE_BATCHFILE_METADATA (16 * 1024)
 #define BATCHFILE_METADATA \
-    (sizeof(BatchFileInfo) + sizeof(bfz_t) + sizeof(struct bfz_freeable_stuff))
-#define FREEABLE_BATCHFILE_METADATA (sizeof(struct bfz_freeable_stuff))
+	(sizeof(BatchFileInfo) + 64 + FREEABLE_BATCHFILE_METADATA)
 
 /* Used for padding */
 static char padding_dummy[MAXIMUM_ALIGNOF];
@@ -79,7 +88,7 @@ typedef enum InputRecordType
 		Assert((hashtable)->mem_for_metadata > 0); \
 		Assert((hashtable)->mem_for_metadata > (hashtable)->nbuckets * OVERHEAD_PER_BUCKET); \
 		if ((hashtable)->mem_for_metadata >= (hashtable)->max_mem) \
-			ereport(ERROR, (errcode(ERRCODE_GP_INTERNAL_ERROR), \
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), \
 				errmsg(ERRMSG_GP_INSUFFICIENT_STATEMENT_MEMORY)));\
 	} while (0)
 
@@ -181,14 +190,20 @@ calc_hash_value(AggState* aggstate, TupleTableSlot *inputslot)
  */
 static inline void
 adjustInputGroup(AggState *aggstate, 
-				 void *input_group)
+				 void *input_group,
+				 bool temporary)
 {
 	int32 tuple_size;
 	void *datum;
 	AggStatePerGroup pergroup;
 	AggStatePerAgg peragg = aggstate->peragg;
 	int aggno;
-	
+	Size datum_size;
+	int16 byteaTranstypeLen = 0;
+	bool byteaTranstypeByVal = 0;
+	/* INTERNAL aggtype is always set to BYTEA in cdbgrouping and upstream partial-aggregation */
+	get_typlenbyval(BYTEAOID, &byteaTranstypeLen, &byteaTranstypeByVal);
+
 	tuple_size = memtuple_get_size((MemTuple)input_group);
 	pergroup = (AggStatePerGroup) ((char *)input_group +
 								   MAXALIGN(tuple_size));
@@ -200,11 +215,48 @@ adjustInputGroup(AggState *aggstate,
 	{
 		AggStatePerAgg peraggstate = &peragg[aggno];
 		AggStatePerGroup pergroupstate = &pergroup[aggno];
-		
-		if (!peraggstate->transtypeByVal &&
-			!pergroupstate->transValueIsNull)
+
+		/* Skip null transValue */
+		if (pergroupstate->transValueIsNull)
+			continue;
+
+		/* Deserialize the aggregate states loaded from the spill file */
+		if (OidIsValid(peraggstate->deserialfn_oid))
 		{
-			Size datum_size;
+			FunctionCallInfoData _dsinfo;
+			FunctionCallInfo dsinfo = &_dsinfo;
+			MemoryContext oldContext;
+
+			InitFunctionCallInfoData(_dsinfo,
+									 &peraggstate->deserialfn,
+									 2,
+									 InvalidOid,
+									 (void *) aggstate, NULL);
+
+			dsinfo->arg[0] = PointerGetDatum(datum);
+			dsinfo->argnull[0] = pergroupstate->transValueIsNull;
+			/* Dummy second argument for type-safety reasons */
+			dsinfo->arg[1] = PointerGetDatum(NULL);
+			dsinfo->argnull[1] = false;
+
+			/*
+			 * We run the deserialization functions in per-input-tuple
+			 * memory context if it's safe to be dropped after.
+			 */
+			if (temporary)
+				oldContext = MemoryContextSwitchTo(aggstate->tmpcontext->ecxt_per_tuple_memory);
+
+			pergroupstate->transValue = FunctionCallInvoke(dsinfo);
+
+			if (temporary)
+				MemoryContextSwitchTo(oldContext);
+
+			datum_size = datumGetSize(PointerGetDatum(datum), byteaTranstypeByVal, byteaTranstypeLen);
+			Assert(MAXALIGN(datum_size) - datum_size <= MAXIMUM_ALIGNOF);
+			datum = (char *)datum + MAXALIGN(datum_size);
+		}
+		else if (!peraggstate->transtypeByVal)
+		{
 			pergroupstate->transValue = PointerGetDatum(datum);
 			datum_size = datumGetSize(pergroupstate->transValue,
 									  peraggstate->transtypeByVal,
@@ -262,7 +314,7 @@ makeHashAggEntryForInput(AggState *aggstate, TupleTableSlot *inputslot, uint32 h
 
 	tup_len = 0;
 	aggs_len = aggstate->numaggs * sizeof(AggStatePerGroupData);
-	
+
 	oldcxt = MemoryContextSwitchTo(hashtable->entry_cxt);
 
 	entry = getEmptyHashAggEntry(aggstate);
@@ -272,10 +324,12 @@ makeHashAggEntryForInput(AggState *aggstate, TupleTableSlot *inputslot, uint32 h
 	entry->next = NULL;
 
 	/*
-	 * Copy memtuple into group_buf. Remember to always allocate
-	 * enough space before calling ExecCopySlotMemTupleTo() because
-	 * this function will call palloc() to allocate bigger space if
-	 * the given one is not big enough, which is what we want to avoid.
+	 * Calculate the tup_len we need.
+	 *
+	 * Since *tup_len is 0 and inline_toast is false, the only thing
+	 * memtuple_form_to() does here is calculating the tup_len.
+	 *
+	 * The memtuple_form_to() next time does the actual memtuple copy.
 	 */
 	entry->tuple_and_aggs = (void *)memtuple_form_to(hashslot->tts_mt_bind,
 													 values,
@@ -286,8 +340,14 @@ makeHashAggEntryForInput(AggState *aggstate, TupleTableSlot *inputslot, uint32 h
 
 	if (GET_TOTAL_USED_SIZE(hashtable) + MAXALIGN(MAXALIGN(tup_len) + aggs_len) >=
 		hashtable->max_mem)
+	{
+		MemoryContextSwitchTo(oldcxt);
 		return NULL;
+	}
 
+	/*
+	 * Form memtuple into group_buf.
+	 */
 	entry->tuple_and_aggs = mpool_alloc(hashtable->group_buf,
 										MAXALIGN(MAXALIGN(tup_len) + aggs_len));
 	len = tup_len;
@@ -334,8 +394,12 @@ makeHashAggEntryForGroup(AggState *aggstate, void *tuple_and_aggs,
 	copy_tuple_and_aggs = mpool_alloc(hashtable->group_buf, input_size);
 	memcpy(copy_tuple_and_aggs, tuple_and_aggs, input_size);
 
-	oldcxt = MemoryContextSwitchTo(hashtable->entry_cxt);
-	
+	/*
+	 * The deserialized transValues are not in mpool, put them
+	 * in a separate context and reset with mpool_reset
+	 */
+	oldcxt = MemoryContextSwitchTo(hashtable->serialization_cxt);
+
 	entry = getEmptyHashAggEntry(aggstate);
 	entry->hashvalue = hashvalue;
 	entry->is_primodial = !(hashtable->is_spilling);
@@ -343,7 +407,7 @@ makeHashAggEntryForGroup(AggState *aggstate, void *tuple_and_aggs,
 	entry->next = NULL;
 
 	/* Initialize per group data */
-	adjustInputGroup(aggstate, entry->tuple_and_aggs);
+	adjustInputGroup(aggstate, entry->tuple_and_aggs, false);
 
 	MemoryContextSwitchTo(oldcxt);
 
@@ -447,7 +511,7 @@ lookup_agg_hash_entry(AggState *aggstate,
 					input_datum = memtuple_getattr((MemTuple)input_record, mt_bind, att, &input_isNull);
 					break;
 				default:
-					insist_log(false, "invalid record type %d", input_type);
+					elog(ERROR, "invalid record type %d", input_type);
 			}
 
 			entry_datum = memtuple_getattr(mtup, mt_bind, att, &entry_isNull);
@@ -479,7 +543,7 @@ lookup_agg_hash_entry(AggState *aggstate,
 				entry = makeHashAggEntryForGroup(aggstate, input_record, input_size, hashkey);
 				break;
 			default:
-				insist_log(false, "invalid record type %d", input_type);
+				elog(ERROR, "invalid record type %d", input_type);
 		}
 			
 		if (entry != NULL)
@@ -646,7 +710,7 @@ calcHashAggTableSizes(double memquota,	/* Memory quota in bytes. */
 	{
 		if (force)
 		{
-			insist_log(false, "too many passes or hash entries");
+			elog(ERROR, "too many passes or hash entries");
 		}
 		else
 		{
@@ -748,6 +812,12 @@ create_agg_hash_table(AggState *aggstate)
 
 	hashtable->entry_cxt = AllocSetContextCreate(aggstate->aggcontext, 
 												 "HashAggTableEntryContext",
+												 ALLOCSET_DEFAULT_MINSIZE,
+												 ALLOCSET_DEFAULT_INITSIZE,
+												 ALLOCSET_DEFAULT_MAXSIZE);
+
+	hashtable->serialization_cxt = AllocSetContextCreate(hashtable->entry_cxt,
+												 "HashAggTableEntrySerializationlContext",
 												 ALLOCSET_DEFAULT_MINSIZE,
 												 ALLOCSET_DEFAULT_INITSIZE,
 												 ALLOCSET_DEFAULT_MAXSIZE);
@@ -899,7 +969,7 @@ agg_hash_initial_pass(AggState *aggstate)
 
 			if (hashtable->num_ht_groups <= 1)
 				ereport(ERROR,
-						(errcode(ERRCODE_GP_INTERNAL_ERROR),
+						(errcode(ERRCODE_INTERNAL_ERROR),
 								 ERRMSG_GP_INSUFFICIENT_STATEMENT_MEMORY));
 			
 			/*
@@ -914,7 +984,7 @@ agg_hash_initial_pass(AggState *aggstate)
 				break;
 			}
 
-			if (!hashtable->is_spilling && aggstate->ss.ps.instrument)
+			if (!hashtable->is_spilling && aggstate->ss.ps.instrument && aggstate->ss.ps.instrument->need_cdb)
 			{
 				/* Update in-memory hash table statistics before spilling. */
 				agg_hash_table_stat_upd(hashtable);
@@ -933,12 +1003,11 @@ agg_hash_initial_pass(AggState *aggstate)
 			int tup_len = memtuple_get_size((MemTuple)entry->tuple_and_aggs);
 			MemSet((char *)entry->tuple_and_aggs + MAXALIGN(tup_len), 0,
 				   aggstate->numaggs * sizeof(AggStatePerGroupData));
-			initialize_aggregates(aggstate, aggstate->peragg, hashtable->groupaggs->aggs,
-								  &(aggstate->mem_manager));
+			initialize_aggregates(aggstate, aggstate->peragg, hashtable->groupaggs->aggs);
 		}
 			
 		/* Advance the aggregates */
-		call_AdvanceAggregates(aggstate, hashtable->groupaggs->aggs, &(aggstate->mem_manager));
+		advance_aggregates(aggstate, hashtable->groupaggs->aggs);
 		
 		hashtable->num_tuples++;
 
@@ -981,7 +1050,7 @@ agg_hash_initial_pass(AggState *aggstate)
 		}
 	}
 
-	if (!hashtable->is_spilling && aggstate->ss.ps.instrument)
+	if (!hashtable->is_spilling && aggstate->ss.ps.instrument && aggstate->ss.ps.instrument->need_cdb)
 	{
 		/* Update in-memory hash table statistics if not already done when spilling */
 		agg_hash_table_stat_upd(hashtable);
@@ -1081,10 +1150,11 @@ getSpillFile(workfile_set *work_set, SpillSet *set, int file_no, int *p_alloc_si
 		spill_file->file_info->ntuples = 0;
 		/* Initialize to NULL in case the create function below throws an exception */
 		spill_file->file_info->wfile = NULL; 
-		spill_file->file_info->wfile = workfile_mgr_create_file(work_set);
+		spill_file->file_info->wfile = BufFileCreateTempInSet(work_set, false /* interXact */);
+		BufFilePledgeSequential(spill_file->file_info->wfile);	/* allow compression */
 
-		elog(HHA_MSG_LVL, "HashAgg: create %d level batch file %d with compression %d",
-			 set->level, file_no, work_set->metadata.bfz_compress_type);
+		elog(HHA_MSG_LVL, "HashAgg: create %d level batch file %d",
+			 set->level, file_no);
 
 		*p_alloc_size = BATCHFILE_METADATA;
 	}
@@ -1113,13 +1183,13 @@ suspendSpillFiles(SpillSet *spill_set)
 		if (spill_file->file_info &&
 			spill_file->file_info->wfile != NULL)
 		{
-			ExecWorkFile_Suspend(spill_file->file_info->wfile);
+			BufFileSuspend(spill_file->file_info->wfile);
 
 			freed_size += FREEABLE_BATCHFILE_METADATA;
 
 			elog(HHA_MSG_LVL, "HashAgg: %s contains " INT64_FORMAT " entries ("
 				 INT64_FORMAT " bytes)",
-				 spill_file->file_info->wfile->fileName,
+				 BufFileGetFilename(spill_file->file_info->wfile),
 				 spill_file->file_info->ntuples, spill_file->file_info->total_bytes);
 		}
 	}
@@ -1136,7 +1206,6 @@ closeSpillFile(AggState *aggstate, SpillSet *spill_set, int file_no)
 {
 	int freedspace = 0;
 	SpillFile *spill_file;
-	HashAggTable *hashtable = aggstate->hhashtable;
 	
 	Assert(spill_set != NULL && file_no < spill_set->num_spill_files);
 
@@ -1150,7 +1219,7 @@ closeSpillFile(AggState *aggstate, SpillSet *spill_set, int file_no)
 	if (spill_file->file_info &&
 		spill_file->file_info->wfile != NULL)
 	{
-		workfile_mgr_close_file(hashtable->work_set, spill_file->file_info->wfile);
+		BufFileClose(spill_file->file_info->wfile);
 		spill_file->file_info->wfile = NULL;
 		freedspace += (BATCHFILE_METADATA - sizeof(BatchFileInfo));
 		
@@ -1275,9 +1344,7 @@ spill_hash_table(AggState *aggstate)
 	/* Spill set does not have a workfile_set. Use existing or create new one as needed */
 	if (hashtable->work_set == NULL)
 	{
-		hashtable->work_set = workfile_mgr_create_set(BFZ, true /* can_be_reused */, &aggstate->ss.ps);
-		hashtable->work_set->metadata.buckets = hashtable->nbuckets;
-		//aggstate->workfiles_created = true;
+		hashtable->work_set = workfile_mgr_create_set("HashAggregate", NULL);
 	}
 
 	/* Book keeping. */
@@ -1349,6 +1416,9 @@ spill_hash_table(AggState *aggstate)
 
 	/* Reset the buffer */
 	mpool_reset(hashtable->group_buf);
+
+	/* Reset serialization context */
+	MemoryContextReset(hashtable->serialization_cxt);
 
 	/* Reset in-memory entries count */
 	hashtable->num_entries = 0;
@@ -1440,6 +1510,21 @@ expand_hash_table(AggState *aggstate)
 	Assert(nentries == hashtable->num_entries);
 }
 
+static void
+BufFileWriteOrError(BufFile *buffile, void *data, size_t size)
+{
+	size_t		ret;
+
+	ret = BufFileWrite(buffile, data, size);
+
+	if (ret != size && size != 0)
+	{
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write to temporary file: %m")));
+	}
+}
+
 /*
  * writeHashEntry -- write an hash entry to a batch file.
  *
@@ -1458,11 +1543,18 @@ writeHashEntry(AggState *aggstate, BatchFileInfo *file_info,
 	AggStatePerGroup pergroup;
 	int aggno;
 	AggStatePerAgg peragg = aggstate->peragg;
+	int32 aggstateSize = 0;
+	Size datum_size;
+	Datum serializedVal;
+	int16 byteaTranstypeLen = 0;
+	bool byteaTranstypeByVal = 0;
+	/* INTERNAL aggtype is always set to BYTEA in cdbgrouping and upstream partial-aggregation */
+	get_typlenbyval(BYTEAOID, &byteaTranstypeLen, &byteaTranstypeByVal);
 
 	Assert(file_info != NULL);
 	Assert(file_info->wfile != NULL);
 
-	ExecWorkFile_Write(file_info->wfile, (void *)(&(entry->hashvalue)), sizeof(entry->hashvalue));
+	BufFileWriteOrError(file_info->wfile, (void *) &entry->hashvalue, sizeof(entry->hashvalue));
 
 	tuple_agg_size = memtuple_get_size((MemTuple)entry->tuple_and_aggs);
 	pergroup = (AggStatePerGroup) ((char *)entry->tuple_and_aggs + MAXALIGN(tuple_agg_size));
@@ -1470,49 +1562,95 @@ writeHashEntry(AggState *aggstate, BatchFileInfo *file_info,
 		aggstate->numaggs * sizeof(AggStatePerGroupData);
 	total_size = MAXALIGN(tuple_agg_size);
 
-	for (aggno = 0; aggno < aggstate->numaggs; aggno++)
-	{
-		AggStatePerAgg peraggstate = &peragg[aggno];
-		AggStatePerGroup pergroupstate = &pergroup[aggno];
-		
-		if (!peraggstate->transtypeByVal &&
-			!pergroupstate->transValueIsNull)
-		{
-			Size datum_size = datumGetSize(pergroupstate->transValue,
-										   peraggstate->transtypeByVal,
-										   peraggstate->transtypeLen);
-			total_size += MAXALIGN(datum_size);
-		}
-	}
-
-	ExecWorkFile_Write(file_info->wfile, (char *)&total_size, sizeof(total_size));
-	ExecWorkFile_Write(file_info->wfile, entry->tuple_and_aggs, tuple_agg_size);
+	BufFileWriteOrError(file_info->wfile, (char *) &total_size, sizeof(total_size));
+	BufFileWriteOrError(file_info->wfile, entry->tuple_and_aggs, tuple_agg_size);
 	Assert(MAXALIGN(tuple_agg_size) - tuple_agg_size <= MAXIMUM_ALIGNOF);
 	if (MAXALIGN(tuple_agg_size) - tuple_agg_size > 0)
 	{
-		ExecWorkFile_Write(file_info->wfile, padding_dummy, MAXALIGN(tuple_agg_size) - tuple_agg_size);
+		BufFileWriteOrError(file_info->wfile, padding_dummy, MAXALIGN(tuple_agg_size) - tuple_agg_size);
 	}
 
+	/* Write the transition aggstates */
 	for (aggno = 0; aggno < aggstate->numaggs; aggno++)
 	{
 		AggStatePerAgg peraggstate = &peragg[aggno];
 		AggStatePerGroup pergroupstate = &pergroup[aggno];
-		
-		if (!peraggstate->transtypeByVal &&
-			!pergroupstate->transValueIsNull)
+
+		/* Skip null transValue */
+		if (pergroupstate->transValueIsNull)
+			continue;
+
+		/*
+		 * If it has a serialization function, serialize it without checking
+		 * transtypeByVal since it's INTERNALOID, a pointer but set to byVal.
+		 */
+		if (OidIsValid(peraggstate->serialfn_oid))
 		{
-			Size datum_size = datumGetSize(pergroupstate->transValue,
-										   peraggstate->transtypeByVal,
-										   peraggstate->transtypeLen);
-			ExecWorkFile_Write(file_info->wfile,
-						DatumGetPointer(pergroupstate->transValue), datum_size);
-			Assert(MAXALIGN(datum_size) - datum_size <= MAXIMUM_ALIGNOF);
-			if (MAXALIGN(datum_size) - datum_size > 0)
-			{
-				ExecWorkFile_Write(file_info->wfile,
-						padding_dummy, MAXALIGN(datum_size) - datum_size);
-			}
+			FunctionCallInfoData fcinfo;
+			MemoryContext old_ctx;
+
+			InitFunctionCallInfoData(fcinfo,
+									 &peraggstate->serialfn,
+									 1,
+									 InvalidOid,
+									 (void *) aggstate, NULL);
+
+			fcinfo.arg[0] = pergroupstate->transValue;
+			fcinfo.argnull[0] = pergroupstate->transValueIsNull;
+
+			/* Not necessary to do this if the serialization func has no memory leak */
+			old_ctx = MemoryContextSwitchTo(aggstate->hhashtable->serialization_cxt);
+
+			serializedVal = FunctionCallInvoke(&fcinfo);
+
+			datum_size = datumGetSize(serializedVal, byteaTranstypeByVal, byteaTranstypeLen);
+			BufFileWriteOrError(file_info->wfile,
+								DatumGetPointer(serializedVal), datum_size);
+			pfree(DatumGetPointer(serializedVal));
+
+			MemoryContextSwitchTo(old_ctx);
 		}
+		/* If it's a ByRef, write the data to the file */
+		else if (!peraggstate->transtypeByVal)
+		{
+			datum_size = datumGetSize(pergroupstate->transValue,
+									  peraggstate->transtypeByVal,
+									  peraggstate->transtypeLen);
+			BufFileWriteOrError(file_info->wfile,
+								DatumGetPointer(pergroupstate->transValue), datum_size);
+		}
+		/* Otherwise it's a real ByVal, do nothing */
+		else
+		{
+			continue;
+		}
+
+		Assert(MAXALIGN(datum_size) - datum_size <= MAXIMUM_ALIGNOF);
+		if (MAXALIGN(datum_size) - datum_size > 0)
+		{
+			BufFileWriteOrError(file_info->wfile,
+								padding_dummy, MAXALIGN(datum_size) - datum_size);
+		}
+		aggstateSize += MAXALIGN(datum_size);
+	}
+
+	if (aggstateSize)
+	{
+		total_size += aggstateSize;
+
+		/* Rewind to write the correct total_size */
+		if (BufFileSeek(file_info->wfile, 0, -(aggstateSize + MAXALIGN(tuple_agg_size) + sizeof(total_size)), SEEK_CUR) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in hash agg temporary file: %m")));
+
+		BufFileWriteOrError(file_info->wfile, (char *) &total_size, sizeof(total_size));
+
+		/* Go back to the last offset */
+		if (BufFileSeek(file_info->wfile, 0, aggstateSize + MAXALIGN(tuple_agg_size), SEEK_CUR) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in hash agg temporary file: %m")));
 	}
 
 	return (total_size + sizeof(total_size) + sizeof(entry->hashvalue));
@@ -1626,27 +1764,28 @@ readHashEntry(AggState *aggstate, BatchFileInfo *file_info,
 
 	*p_input_size = 0;
 
-	if (ExecWorkFile_Read(file_info->wfile, (char *)p_hashkey, sizeof(HashKey)) != sizeof(HashKey))
+	if (BufFileRead(file_info->wfile, (char *) p_hashkey, sizeof(HashKey)) != sizeof(HashKey))
 	{
 		return NULL;
 	}
-	
-	if (ExecWorkFile_Read(file_info->wfile, (char *)p_input_size, sizeof(int32)) !=
-			sizeof(int32))
+
+	if (BufFileRead(file_info->wfile, (char *) p_input_size, sizeof(int32)) != sizeof(int32))
 	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERNAL_ERROR),
-						errmsg("could not read from temporary file: %m")));
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not read from temporary file: %m")));
 	}
 
-	tuple_and_aggs = ExecWorkFile_ReadFromBuffer(file_info->wfile, *p_input_size);
+	tuple_and_aggs = BufFileReadFromBuffer(file_info->wfile, *p_input_size);
 	if (tuple_and_aggs == NULL)
 	{
 		oldcxt = MemoryContextSwitchTo(aggstate->tmpcontext->ecxt_per_tuple_memory);
 		tuple_and_aggs = palloc(*p_input_size);
-		int32 read_size = ExecWorkFile_Read(file_info->wfile, tuple_and_aggs, *p_input_size);
+		int32 read_size = BufFileRead(file_info->wfile, tuple_and_aggs, *p_input_size);
 		if (read_size != *p_input_size)
-			ereport(ERROR, (errcode(ERRCODE_GP_INTERNAL_ERROR),
-					errmsg("could not read from temporary file, requesting %d bytes, read %d bytes: %m",
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not read from temporary file, requesting %d bytes, read %d bytes: %m",
 							*p_input_size, read_size)));
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -1717,7 +1856,7 @@ agg_hash_reload(AggState *aggstate)
 
 	if (spill_file->file_info->wfile != NULL)
 	{
-		ExecWorkFile_Restart(spill_file->file_info->wfile);
+		BufFileResume(spill_file->file_info->wfile);
 		hashtable->mem_for_metadata  += FREEABLE_BATCHFILE_METADATA;
 	}
 
@@ -1764,12 +1903,12 @@ agg_hash_reload(AggState *aggstate)
 
 			if (hashtable->num_ht_groups <= 1)
 				ereport(ERROR,
-						(errcode(ERRCODE_GP_INTERNAL_ERROR),
+						(errcode(ERRCODE_INTERNAL_ERROR),
 								 ERRMSG_GP_INSUFFICIENT_STATEMENT_MEMORY));
 
 			elog(gp_workfile_caching_loglevel, "HashAgg: respill occurring in agg_hash_reload while loading batch data");
 
-			if (!hashtable->is_spilling && aggstate->ss.ps.instrument)
+			if (!hashtable->is_spilling && aggstate->ss.ps.instrument && aggstate->ss.ps.instrument->need_cdb)
 			{
 				/* Update in-memory hash table statistics before spilling. */
 				agg_hash_table_stat_upd(hashtable);
@@ -1781,6 +1920,7 @@ agg_hash_reload(AggState *aggstate)
 										  hashkey, &isNew);
 		}
 
+		/* Combine it to the group state if it's not a new entry */
 		if (!isNew)
 		{
 			int aggno;
@@ -1789,9 +1929,14 @@ agg_hash_reload(AggState *aggstate)
 
 			setGroupAggs(hashtable, entry);
 
-			adjustInputGroup(aggstate, input);
+			/*
+			 * Adjust the input in the per tuple memory context, since the
+			 * value will be combined to the group state, we don't need the
+			 * keep the memory storing the transValue.
+			 */
+			adjustInputGroup(aggstate, input, true);
 			
-			/* Advance the aggregates for the group by applying preliminary function. */
+			/* Advance the aggregates for the group by applying combine function. */
 			for (aggno = 0; aggno < aggstate->numaggs; aggno++)
 			{
 				AggStatePerAgg peraggstate = &aggstate->peragg[aggno];
@@ -1802,17 +1947,19 @@ agg_hash_reload(AggState *aggstate)
 				fcinfo.arg[1] = input_pergroupstate[aggno].transValue;
 				fcinfo.argnull[1] = input_pergroupstate[aggno].transValueIsNull;
 
+				/* Combine to the transition aggstate */
 				pergroupstate->transValue =
-					invoke_agg_trans_func(&(peraggstate->prelimfn),
-							peraggstate->prelimfn.fn_nargs - 1,
-							pergroupstate->transValue,
-							&(pergroupstate->noTransValue),
-							&(pergroupstate->transValueIsNull),
-							peraggstate->transtypeByVal,
-							peraggstate->transtypeLen,
-							&fcinfo, (void *)aggstate,
-							aggstate->tmpcontext->ecxt_per_tuple_memory,
-							&(aggstate->mem_manager));
+					invoke_agg_trans_func(aggstate,
+										  peraggstate,
+										  &(peraggstate->combinefn),
+										  peraggstate->combinefn.fn_nargs - 1,
+										  pergroupstate->transValue,
+										  &(pergroupstate->noTransValue),
+										  &(pergroupstate->transValueIsNull),
+										  peraggstate->transtypeByVal,
+										  peraggstate->transtypeLen,
+										  &fcinfo, (void *)aggstate,
+										  aggstate->tmpcontext->ecxt_per_tuple_memory);
 				Assert(peraggstate->transtypeByVal ||
 				       (pergroupstate->transValueIsNull ||
 					PointerIsValid(DatumGetPointer(pergroupstate->transValue))));
@@ -1839,7 +1986,7 @@ agg_hash_reload(AggState *aggstate)
         freed_size = suspendSpillFiles(hashtable->curr_spill_file->spill_set);
         hashtable->mem_for_metadata -= freed_size;
         elog(gp_workfile_caching_loglevel, "loaded hashtable from file %s and then respilled. we should delete file from work_set now",
-        		hashtable->curr_spill_file->file_info->wfile->fileName);
+			 BufFileGetFilename(hashtable->curr_spill_file->file_info->wfile));
         hashtable->curr_spill_file->respilled = true;
 	}
 
@@ -1856,7 +2003,7 @@ agg_hash_reload(AggState *aggstate)
 			 GET_BUFFER_SIZE(hashtable));
 	}
 
-	if (!hashtable->is_spilling && aggstate->ss.ps.instrument)
+	if (!hashtable->is_spilling && aggstate->ss.ps.instrument && aggstate->ss.ps.instrument->need_cdb)
 	{
 		/* Update in-memory hash table statistics if not already done when spilling */
 		agg_hash_table_stat_upd(hashtable);
@@ -1917,7 +2064,7 @@ reCalcNumberBatches(HashAggTable *hashtable, SpillFile *spill_file)
 	
 	if (hashtable->mem_for_metadata +
 		nbatches * BATCHFILE_METADATA > hashtable->max_mem)
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERNAL_ERROR),
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 				 ERRMSG_GP_INSUFFICIENT_STATEMENT_MEMORY));
 	
 	hashtable->hats.nbatches = nbatches;
@@ -2055,7 +2202,7 @@ agg_hash_next_pass(AggState *aggstate)
 	}
 	
 	/* Report statistics for EXPLAIN ANALYZE. */
-	if (!more && aggstate->ss.ps.instrument)
+	if (!more && aggstate->ss.ps.instrument && aggstate->ss.ps.instrument->need_cdb)
 	{
 		Instrumentation    *instr = aggstate->ss.ps.instrument;
 
@@ -2190,6 +2337,8 @@ void reset_agg_hash_table(AggState *aggstate, int64 nentries)
 	hashtable->pshift = 0;
 
 	mpool_reset(hashtable->group_buf);
+
+	MemoryContextReset(hashtable->serialization_cxt);
 
 	init_agg_hash_iter(hashtable);
 

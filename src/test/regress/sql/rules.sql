@@ -37,9 +37,9 @@ create table rtest_person (pname text, pdesc text);
 create table rtest_admin (pname text, sysname text);
 
 create rule rtest_sys_upd as on update to rtest_system do also (
-	update rtest_interface set sysname = new.sysname 
+	update rtest_interface set sysname = new.sysname
 		where sysname = old.sysname;
-	update rtest_admin set sysname = new.sysname 
+	update rtest_admin set sysname = new.sysname
 		where sysname = old.sysname
 	);
 
@@ -75,7 +75,7 @@ create rule rtest_emp_del as on delete to rtest_emp do
 
 --
 -- Tables and rules for the multiple cascaded qualified instead
--- rule test 
+-- rule test
 --
 create table rtest_t4 (a int4, b text);
 create table rtest_t5 (a int4, b text);
@@ -273,9 +273,9 @@ select * from rtest_admin;
 --
 -- Rule qualification test
 --
-insert into rtest_emp values ('wiech', '5000.00');
+insert into rtest_emp values ('wiecc', '5000.00');
 insert into rtest_emp values ('gates', '80000.00');
-update rtest_emp set ename = 'wiecx' where ename = 'wiech';
+update rtest_emp set ename = 'wiecx' where ename = 'wiecc';
 update rtest_emp set ename = 'wieck', salary = '6000.00' where ename = 'wiecx';
 update rtest_emp set salary = '7000.00' where ename = 'wieck';
 delete from rtest_emp where ename = 'gates';
@@ -420,7 +420,7 @@ create table rtest_view1 (a int4, b text, v bool);
 create table rtest_view2 (a int4);
 create table rtest_view3 (a int4, b text);
 create table rtest_view4 (a int4, b text, c int4);
-create view rtest_vview1 as select a, b from rtest_view1 X 
+create view rtest_vview1 as select a, b from rtest_view1 X
 	where 0 < (select count(*) from rtest_view2 Y where Y.a = X.a);
 create view rtest_vview2 as select a, b from rtest_view1 where v;
 create view rtest_vview3 as select a, b from rtest_vview2 X
@@ -493,7 +493,7 @@ create table rtest_unitfact (
 	factor	float
 );
 
-create view rtest_vcomp as 
+create view rtest_vcomp as
 	select X.part, (X.size * Y.factor) as size_in_cm
 			from rtest_comp X, rtest_unitfact Y
 			where X.unit = Y.unit;
@@ -522,7 +522,7 @@ CREATE TABLE shoe_data (
 	shoename   char(10),      -- primary key
 	sh_avail   integer,       -- available # of pairs
 	slcolor    char(10),      -- preferred shoelace color
-	slminlen   float,         -- miminum shoelace length
+	slminlen   float,         -- minimum shoelace length
 	slmaxlen   float,         -- maximum shoelace length
 	slunit     char(8)        -- length unit
 );
@@ -746,7 +746,7 @@ create rule rrule as
   on update to vview do instead
 (
   insert into cchild (pid, descrip)
-    select old.pid, new.descrip where old.descrip isnull; 
+    select old.pid, new.descrip where old.descrip isnull;
   update cchild set descrip = new.descrip where cchild.pid = old.pid;
 );
 
@@ -768,10 +768,17 @@ drop table cchild;
 --
 -- Check that ruleutils are working
 --
+
+-- temporarily disable fancy output, so view changes create less diff noise
+\a\t
+
 SELECT viewname, definition FROM pg_views WHERE schemaname <> 'information_schema' AND viewname <> 'pg_roles' AND viewname <> 'gp_pgdatabase' AND viewname <> 'pg_locks' AND viewname <> 'gp_max_external_files' AND viewname <> 'pg_resqueue_status' AND viewname <> 'pg_stat_resqueues' ORDER BY viewname;
 
-SELECT tablename, rulename, definition FROM pg_rules 
+SELECT tablename, rulename, definition FROM pg_rules
 	ORDER BY tablename, rulename;
+
+-- restore normal output mode
+\a\t
 
 --
 -- CREATE OR REPLACE RULE
@@ -797,14 +804,14 @@ SELECT * FROM ruletest_tbl2;
 create table rule_and_refint_t1 (
 	id1a integer,
 	id1b integer,
-	
+
 	primary key (id1a, id1b)
 );
 
 create table rule_and_refint_t2 (
 	id2a integer,
 	id2c integer,
-	
+
 	primary key (id2a, id2c)
 );
 
@@ -852,6 +859,14 @@ insert into rule_and_refint_t3 values (1, 11, 13, 'row7');
 insert into rule_and_refint_t3 values (1, 13, 11, 'row8');
 
 --
+-- disallow dropping a view's rule (bug #5072)
+--
+
+create view fooview as select 'foo'::text;
+drop rule "_RETURN" on fooview;
+drop view fooview;
+
+--
 -- test conversion of table to view (needed to load some pg_dump files)
 --
 
@@ -863,6 +878,9 @@ create rule "_RETURN" as on select to fooview do instead
 
 select * from fooview;
 select xmin, * from fooview;  -- fail, views don't have such a column
+
+select reltoastrelid, relkind, relfrozenxid
+  from pg_class where oid = 'fooview'::regclass;
 
 drop view fooview;
 
@@ -908,11 +926,11 @@ create temp table t1 (a integer primary key);
 create temp table t1_1 (check (a >= 0 and a < 10)) inherits (t1);
 create temp table t1_2 (check (a >= 10 and a < 20)) inherits (t1);
 
-create rule t1_ins_1 as on insert to t1 
+create rule t1_ins_1 as on insert to t1
 	where new.a >= 0 and new.a < 10
 	do instead
 	insert into t1_1 values (new.a);
-create rule t1_ins_2 as on insert to t1 
+create rule t1_ins_2 as on insert to t1
 	where new.a >= 10 and new.a < 20
 	do instead
 	insert into t1_2 values (new.a);
@@ -934,3 +952,91 @@ update t1 set a = 4 where a = 5;
 select * from only t1;
 select * from only t1_1;
 select * from only t1_2;
+
+-- test various flavors of pg_get_viewdef()
+
+select pg_get_viewdef('shoe'::regclass) as unpretty;
+select pg_get_viewdef('shoe'::regclass,true) as pretty;
+select pg_get_viewdef('shoe'::regclass,0) as prettier;
+
+--
+-- check multi-row VALUES in rules
+--
+
+create table rules_src(f1 int, f2 int);
+create table rules_log(f1 int, f2 int, tag text);
+insert into rules_src values(1,2), (11,12);
+create rule r1 as on update to rules_src do also
+  insert into rules_log values(old.*, 'old'), (new.*, 'new');
+update rules_src set f2 = f2 + 1;
+update rules_src set f2 = f2 * 10;
+select * from rules_src;
+select * from rules_log;
+create rule r2 as on update to rules_src do also
+  values(old.*, 'old'), (new.*, 'new');
+update rules_src set f2 = f2 / 10;
+select * from rules_src;
+select * from rules_log;
+create rule r3 as on delete to rules_src do notify rules_src_deletion;
+\d+ rules_src
+
+--
+-- check alter rename rule
+--
+CREATE TABLE rule_t1 (a INT);
+CREATE VIEW rule_v1 AS SELECT * FROM rule_t1;
+
+CREATE RULE InsertRule AS
+    ON INSERT TO rule_v1
+    DO INSTEAD
+        INSERT INTO rule_t1 VALUES(new.a);
+
+ALTER RULE InsertRule ON rule_v1 RENAME to NewInsertRule;
+
+INSERT INTO rule_v1 VALUES(1);
+SELECT * FROM rule_v1;
+
+\d+ rule_v1
+
+--
+-- error conditions for alter rename rule
+--
+ALTER RULE InsertRule ON rule_v1 RENAME TO NewInsertRule; -- doesn't exist
+ALTER RULE NewInsertRule ON rule_v1 RENAME TO "_RETURN"; -- already exists
+ALTER RULE "_RETURN" ON rule_v1 RENAME TO abc; -- ON SELECT rule cannot be renamed
+
+DROP VIEW rule_v1;
+DROP TABLE rule_t1;
+
+--
+-- check display of VALUES in view definitions
+--
+create view rule_v1 as values(1,2);
+\d+ rule_v1
+drop view rule_v1;
+create view rule_v1(x) as values(1,2);
+\d+ rule_v1
+drop view rule_v1;
+create view rule_v1(x) as select * from (values(1,2)) v;
+\d+ rule_v1
+drop view rule_v1;
+create view rule_v1(x) as select * from (values(1,2)) v(q,w);
+\d+ rule_v1
+drop view rule_v1;
+
+-- test for pg_get_functiondef properly regurgitating SET parameters
+-- Note that the function is kept around to stress pg_dump.
+CREATE FUNCTION func_with_set_params() RETURNS integer
+    AS 'select 1;'
+    LANGUAGE SQL
+    SET extra_float_digits TO 2
+    SET work_mem TO '4MB'
+    SET datestyle to iso, mdy
+    SET search_path TO PG_CATALOG, "Mixed/Case", 'c:/''a"/path', '', '0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789'
+    IMMUTABLE STRICT;
+SELECT pg_get_functiondef('func_with_set_params()'::regprocedure);
+
+-- test rule for select-for-update
+create table t_test_rules_select_for_update (c int) distributed randomly;
+create rule myrule as on insert to t_test_rules_select_for_update
+do instead select * from t_test_rules_select_for_update for update;

@@ -8,9 +8,11 @@ setup_ssh_for_user() {
   local home_dir
   home_dir=$(eval echo "~${user}")
 
-  mkdir -p "${home_dir}"/.ssh
+  mkdir -p "${home_dir}/.ssh"
   touch "${home_dir}/.ssh/authorized_keys" "${home_dir}/.ssh/known_hosts" "${home_dir}/.ssh/config"
-  ssh-keygen -t rsa -N "" -f "${home_dir}/.ssh/id_rsa"
+  if [ ! -f "${home_dir}/.ssh/id_rsa" ]; then
+    ssh-keygen -t rsa -N "" -f "${home_dir}/.ssh/id_rsa"
+  fi
   cat "${home_dir}/.ssh/id_rsa.pub" >> "${home_dir}/.ssh/authorized_keys"
   chmod 0600 "${home_dir}/.ssh/authorized_keys"
   cat << 'NOROAMING' >> "${home_dir}/.ssh/config"
@@ -28,15 +30,18 @@ ssh_keyscan_for_user() {
   {
     ssh-keyscan localhost
     ssh-keyscan 0.0.0.0
-    ssh-keyscan github.com
+    ssh-keyscan `hostname`
   } >> "${home_dir}/.ssh/known_hosts"
 }
 
 transfer_ownership() {
-  chown -R gpadmin:gpadmin gpdb_src
-  [ -d /usr/local/gpdb ] && chown -R gpadmin:gpadmin /usr/local/gpdb
-  [ -d /usr/local/greenplum-db-devel ] && chown -R gpadmin:gpadmin /usr/local/greenplum-db-devel
-  chown -R gpadmin:gpadmin /home/gpadmin
+    chmod a+w gpdb_src
+    find gpdb_src -type d -exec chmod a+w {} \;
+    # Needed for the gpload test
+    [ -f gpdb_src/gpMgmt/bin/gpload_test/gpload2/data_file.csv ] && chown gpadmin:gpadmin gpdb_src/gpMgmt/bin/gpload_test/gpload2/data_file.csv
+    [ -d /usr/local/gpdb ] && chown -R gpadmin:gpadmin /usr/local/gpdb
+    [ -d /usr/local/greenplum-db-devel ] && chown -R gpadmin:gpadmin /usr/local/greenplum-db-devel
+    chown -R gpadmin:gpadmin /home/gpadmin
 }
 
 set_limits() {
@@ -52,18 +57,25 @@ set_limits() {
   su gpadmin -c 'ulimit -a'
 }
 
+create_gpadmin_if_not_existing() {
+  gpadmin_exists=`id gpadmin > /dev/null 2>&1;echo $?`
+  if [ "0" -eq "$gpadmin_exists" ]; then
+      echo "gpadmin user already exists, skipping creating again."
+  else
+      eval "$*"
+  fi
+}
+
 setup_gpadmin_user() {
   groupadd supergroup
   case "$TEST_OS" in
-    sles)
-      groupadd gpadmin
-      /usr/sbin/useradd -G gpadmin,supergroup,tty gpadmin
-      ;;
     centos)
-      /usr/sbin/useradd -G supergroup,tty gpadmin
+      user_add_cmd="/usr/sbin/useradd -G supergroup,tty gpadmin"
+      create_gpadmin_if_not_existing ${user_add_cmd}
       ;;
     ubuntu)
-      /usr/sbin/useradd -G supergroup,tty gpadmin -s /bin/bash
+      user_add_cmd="/usr/sbin/useradd -G supergroup,tty gpadmin -s /bin/bash"
+      create_gpadmin_if_not_existing ${user_add_cmd}
       ;;
     *) echo "Unknown OS: $TEST_OS"; exit 1 ;;
   esac
@@ -107,11 +119,7 @@ determine_os() {
     echo "centos"
     return
   fi
-  if [ -f /etc/os-release ] && grep -q '^NAME=.*SLES' /etc/os-release ; then
-    echo "sles"
-    return
-  fi
-  if lsb_release -a | grep -q 'Ubuntu' ; then
+  if grep -q ID=ubuntu /etc/os-release ; then
     echo "ubuntu"
     return
   fi
@@ -134,4 +142,4 @@ _main() {
   workaround_before_concourse_stops_stripping_suid_bits
 }
 
-_main "$@"
+[ "${BASH_SOURCE[0]}" = "$0" ] && _main "$@"

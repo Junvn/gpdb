@@ -3,8 +3,12 @@ image_resource:
   type: docker-image
 inputs:
   - name: gpdb_src
-  - name: gpaddon_src
-  - name: pxf_src
+  - name: libquicklz-installer
+  - name: libquicklz-devel-installer
+    optional: true
+  - name: libsigar-installer
+    optional: true
+  - name: python-tarball
 outputs:
   - name: gpdb_artifacts
 run:
@@ -14,8 +18,5 @@ params:
   TARGET_OS_VERSION:
   BLD_TARGETS:
   OUTPUT_ARTIFACT_DIR: gpdb_artifacts
-  IVYREPO_HOST:
-  IVYREPO_REALM:
-  IVYREPO_USER:
-  IVYREPO_PASSWD:
   CONFIGURE_FLAGS:
+  ORCA_TAG: v3.65.0

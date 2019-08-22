@@ -4,67 +4,31 @@
  *		Common support routines for bin/scripts/
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/bin/scripts/common.c,v 1.32 2008/05/12 22:59:58 alvherre Exp $
+ * src/bin/scripts/common.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres_fe.h"
 
-#include <pwd.h>
 #include <signal.h>
 #include <unistd.h>
 
 #include "common.h"
-#include "libpq/pqsignal.h"
+#include "dumputils.h"
+#include "fe_utils/connect.h"
 
 static void SetCancelConn(PGconn *conn);
 static void ResetCancelConn(void);
-
-#ifndef HAVE_INT_OPTRESET
-int			optreset;
-#endif
 
 static PGcancel *volatile cancelConn = NULL;
 
 #ifdef WIN32
 static CRITICAL_SECTION cancelConnLock;
 #endif
-
-/*
- * Returns the current user name.
- */
-const char *
-get_user_name(const char *progname)
-{
-#ifndef WIN32
-	struct passwd *pw;
-
-	pw = getpwuid(geteuid());
-	if (!pw)
-	{
-		fprintf(stderr, _("%s: could not obtain information about current user: %s\n"),
-				progname, strerror(errno));
-		exit(1);
-	}
-	return pw->pw_name;
-#else
-	static char username[128];	/* remains after function exit */
-	DWORD		len = sizeof(username) - 1;
-
-	if (!GetUserName(username, &len))
-	{
-		fprintf(stderr, _("%s: could not get current user name: %s\n"),
-				progname, strerror(errno));
-		exit(1);
-	}
-	return username;
-#endif
-}
-
 
 /*
  * Provide strictly harmonized handling of --help and --version
@@ -95,9 +59,10 @@ handle_help_version_opts(int argc, char *argv[],
  * interactive password prompt is automatically issued if required.
  */
 PGconn *
-connectDatabase(const char *dbname, const char *pghost, const char *pgport,
-				const char *pguser, enum trivalue prompt_password,
-				const char *progname)
+connectDatabase(const char *dbname, const char *pghost,
+				const char *pgport, const char *pguser,
+				enum trivalue prompt_password, const char *progname,
+				bool echo, bool fail_ok)
 {
 	PGconn	   *conn;
 	char	   *password = NULL;
@@ -113,14 +78,8 @@ connectDatabase(const char *dbname, const char *pghost, const char *pgport,
 	do
 	{
 #define PARAMS_ARRAY_SIZE	7
-		const char **keywords = malloc(PARAMS_ARRAY_SIZE * sizeof(*keywords));
-		const char **values = malloc(PARAMS_ARRAY_SIZE * sizeof(*values));
-
-		if (!keywords || !values)
-		{
-			fprintf(stderr, _("%s: out of memory\n"), progname);
-			exit(1);
-		}
+		const char **keywords = pg_malloc(PARAMS_ARRAY_SIZE * sizeof(*keywords));
+		const char **values = pg_malloc(PARAMS_ARRAY_SIZE * sizeof(*values));
 
 		keywords[0] = "host";
 		values[0] = pghost;
@@ -167,14 +126,48 @@ connectDatabase(const char *dbname, const char *pghost, const char *pgport,
 	/* check to see that the backend connection was successfully made */
 	if (PQstatus(conn) == CONNECTION_BAD)
 	{
+		if (fail_ok)
+		{
+			PQfinish(conn);
+			return NULL;
+		}
 		fprintf(stderr, _("%s: could not connect to database %s: %s"),
 				progname, dbname, PQerrorMessage(conn));
 		exit(1);
 	}
 
+	if (PQserverVersion(conn) >= 70300)
+		PQclear(executeQuery(conn, ALWAYS_SECURE_SEARCH_PATH_SQL,
+							 progname, echo));
+
 	return conn;
 }
 
+/*
+ * Try to connect to the appropriate maintenance database.
+ */
+PGconn *
+connectMaintenanceDatabase(const char *maintenance_db,
+						   const char *pghost, const char *pgport,
+						   const char *pguser, enum trivalue prompt_password,
+						   const char *progname, bool echo)
+{
+	PGconn	   *conn;
+
+	/* If a maintenance database name was specified, just connect to it. */
+	if (maintenance_db)
+		return connectDatabase(maintenance_db, pghost, pgport, pguser,
+							   prompt_password, progname, echo, false);
+
+	/* Otherwise, try postgres first and then template1. */
+	conn = connectDatabase("postgres", pghost, pgport, pguser, prompt_password,
+						   progname, echo, true);
+	if (!conn)
+		conn = connectDatabase("template1", pghost, pgport, pguser,
+							   prompt_password, progname, echo, false);
+
+	return conn;
+}
 
 /*
  * Run a query, return the results, exit program on failure.
@@ -257,30 +250,118 @@ executeMaintenanceCommand(PGconn *conn, const char *query, bool echo)
 	return r;
 }
 
-/*
- * "Safe" wrapper around strdup().  Pulled from psql/common.c
- */
-char *
-pg_strdup(const char *string)
-{
-	char	   *tmp;
 
-	if (!string)
+/*
+ * Split TABLE[(COLUMNS)] into TABLE and [(COLUMNS)] portions.  When you
+ * finish using them, pg_free(*table).  *columns is a pointer into "spec",
+ * possibly to its NUL terminator.
+ */
+static void
+split_table_columns_spec(const char *spec, int encoding,
+						 char **table, const char **columns)
+{
+	bool		inquotes = false;
+	const char *cp = spec;
+
+	/*
+	 * Find the first '(' not identifier-quoted.  Based on
+	 * dequote_downcase_identifier().
+	 */
+	while (*cp && (*cp != '(' || inquotes))
 	{
-		fprintf(stderr, _("pg_strdup: cannot duplicate null pointer (internal error)\n"));
-		exit(EXIT_FAILURE);
+		if (*cp == '"')
+		{
+			if (inquotes && cp[1] == '"')
+				cp++;			/* pair does not affect quoting */
+			else
+				inquotes = !inquotes;
+			cp++;
+		}
+		else
+			cp += PQmblen(cp, encoding);
 	}
-	tmp = strdup(string);
-	if (!tmp)
-	{
-		fprintf(stderr, _("out of memory\n"));
-		exit(EXIT_FAILURE);
-	}
-	return tmp;
+	*table = pg_strdup(spec);
+	(*table)[cp - spec] = '\0'; /* no strndup */
+	*columns = cp;
 }
 
 /*
- * Check yes/no answer in a localized way.	1=yes, 0=no, -1=neither.
+ * Break apart TABLE[(COLUMNS)] of "spec".  With the reset_val of search_path
+ * in effect, have regclassin() interpret the TABLE portion.  Append to "buf"
+ * the qualified name of TABLE, followed by any (COLUMNS).  Exit on failure.
+ * We use this to interpret --table=foo under the search path psql would get,
+ * in advance of "ANALYZE public.foo" under the always-secure search path.
+ */
+void
+appendQualifiedRelation(PQExpBuffer buf, const char *spec,
+						PGconn *conn, const char *progname, bool echo)
+{
+	char	   *table;
+	const char *columns;
+	PQExpBufferData sql;
+	PGresult   *res;
+	int			ntups;
+
+	/* Before 7.3, the concept of qualifying a name did not exist. */
+	if (PQserverVersion(conn) < 70300)
+	{
+		appendPQExpBufferStr(&sql, spec);
+		return;
+	}
+
+	split_table_columns_spec(spec, PQclientEncoding(conn), &table, &columns);
+
+	/*
+	 * Query must remain ABSOLUTELY devoid of unqualified names.  This would
+	 * be unnecessary given a regclassin() variant taking a search_path
+	 * argument.
+	 */
+	initPQExpBuffer(&sql);
+	appendPQExpBufferStr(&sql,
+						 "SELECT c.relname, ns.nspname\n"
+						 " FROM pg_catalog.pg_class c,"
+						 " pg_catalog.pg_namespace ns\n"
+						 " WHERE c.relnamespace OPERATOR(pg_catalog.=) ns.oid\n"
+						 "  AND c.oid OPERATOR(pg_catalog.=) ");
+	appendStringLiteralConn(&sql, table, conn);
+	appendPQExpBufferStr(&sql, "::pg_catalog.regclass;");
+
+	executeCommand(conn, "RESET search_path", progname, echo);
+
+	/*
+	 * One row is a typical result, as is a nonexistent relation ERROR.
+	 * regclassin() unconditionally accepts all-digits input as an OID; if no
+	 * relation has that OID; this query returns no rows.  Catalog corruption
+	 * might elicit other row counts.
+	 */
+	res = executeQuery(conn, sql.data, progname, echo);
+	ntups = PQntuples(res);
+	if (ntups != 1)
+	{
+		fprintf(stderr,
+				ngettext("%s: query returned %d row instead of one: %s\n",
+						 "%s: query returned %d rows instead of one: %s\n",
+						 ntups),
+				progname, ntups, sql.data);
+		PQfinish(conn);
+		exit(1);
+	}
+	appendPQExpBufferStr(buf,
+						 fmtQualifiedId(PQserverVersion(conn),
+										PQgetvalue(res, 0, 1),
+										PQgetvalue(res, 0, 0)));
+	appendPQExpBufferStr(buf, columns);
+	PQclear(res);
+	termPQExpBuffer(&sql);
+	pg_free(table);
+
+	PQclear(executeQuery(conn, ALWAYS_SECURE_SEARCH_PATH_SQL,
+						 progname, echo));
+}
+
+
+/*
+ * Check yes/no answer in a localized way.  1=yes, 0=no, -1=neither.
  */
 
 /* translator: abbreviation for "yes" */
@@ -293,10 +374,9 @@ yesno_prompt(const char *question)
 {
 	char		prompt[256];
 
-	/*
-	 * translator: This is a question followed by the translated options for
-	 * "yes" and "no".
-	 */
+	/*------
+	   translator: This is a question followed by the translated options for
+	   "yes" and "no". */
 	snprintf(prompt, sizeof(prompt), _("%s (%s/%s) "),
 			 _(question), _(PG_YESLETTER), _(PG_NOLETTER));
 
@@ -382,7 +462,7 @@ ResetCancelConn(void)
 
 #ifndef WIN32
 /*
- * Handle interrupt signals by cancelling the current command,
+ * Handle interrupt signals by canceling the current command,
  * if it's being executed through executeMaintenanceCommand(),
  * and thus has a cancelConn set.
  */

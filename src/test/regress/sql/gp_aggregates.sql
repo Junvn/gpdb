@@ -44,6 +44,12 @@ select distinct two, sum(four) from tenk1 group by two order by two;
 select distinct two, sum(four) from tenk1 group by two having sum(four) > 5000;
 select distinct t1.two, t2.two, t1.four, t2.four from tenk1 t1, tenk1 t2 where t1.hundred=t2.hundred order by t1.two, t1.four;
 
+-- A variant with more result rows. We had a bug at one point where the
+-- Motion Gather node on top of this was missing the Merge Key, and hence
+-- the output came out unsorted. But it was not visible if all the rows
+-- were processed on the same segment, as is the case with the above variant
+-- with only two distinct 'two' values.
+select distinct ten, sum(ten) over() from tenk1 order by ten;
 
 -- Test for a planner bug we used to have, when this query gets planned
 -- as a merge join. This should perform a merge join between 'l' and 'ps',
@@ -83,3 +89,68 @@ reset enable_hashjoin;
 reset enable_mergejoin;
 
 drop table l, ps;
+
+-- Test having a SRF in the targetlist, with an aggregate. GPDB used to not
+-- handle this, because the SRF-in-targetlist support was removed from Agg
+-- node, as an optimization. It's been put back since, so this works now.
+--
+-- We have this same test in the upstream 'aggregates' test, but with MAX().
+-- That's picked up by the MIN/MAX optimization, and turned into an
+-- LIMIT 1 query, however, and doesn't exercise from the SRF-in-targetlist
+-- support.
+select avg(unique2), generate_series(1,3) as g from tenk1 order by g desc;
+
+
+--
+-- "PREFUNC" is accepted as an alias for "COMBINEFUNC", for compatibility with
+-- GPDB 5 and below.
+--
+create function int8pl_with_notice(int8, int8) returns int8
+AS $$
+begin
+  raise notice 'combinefunc called';
+  return $1 + $2;
+end;
+$$ language plpgsql strict;
+create aggregate mysum_prefunc(int4) (
+  sfunc = int4_sum,
+  stype=bigint,
+  prefunc=int8pl_with_notice
+);
+select mysum_prefunc(a::int4) from aggtest;
+
+
+-- Test an aggregate with 'internal' transition type, and a combine function,
+-- but no serial/deserial functions. This is valid, but we have no use for
+-- the combine function in GPDB in that case.
+
+CREATE AGGREGATE my_numeric_avg(numeric) (
+  stype = internal,
+  sfunc = numeric_avg_accum,
+  finalfunc = numeric_avg,
+  combinefunc = numeric_avg_combine
+);
+
+create temp table numerictesttab as select g::numeric as n from generate_series(1,10) g;
+
+select my_numeric_avg(n) from numerictesttab;
+
+--- Test distinct on UDF which EXECUTE ON ALL SEGMENTS
+CREATE FUNCTION distinct_test() RETURNS SETOF boolean EXECUTE ON ALL SEGMENTS
+    LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY SELECT true;
+END
+$$;
+
+SELECT DISTINCT distinct_test();
+
+DROP FUNCTION distinct_test();
+
+-- Test multi-phase aggregate with subquery scan
+create table multiagg_with_subquery (i int, j int, k int, m int) distributed by (i);
+insert into multiagg_with_subquery select i, i+1, i+2, i+3 from generate_series(1, 10)i;
+explain (costs off)
+select count(distinct j), count(distinct k), count(distinct m) from (select j,k,m from multiagg_with_subquery group by j,k,m ) sub group by j;
+select count(distinct j), count(distinct k), count(distinct m) from (select j,k,m from multiagg_with_subquery group by j,k,m ) sub group by j;
+drop table multiagg_with_subquery;

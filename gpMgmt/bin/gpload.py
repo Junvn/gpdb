@@ -51,7 +51,6 @@ except Exception, e:
 import hashlib
 import datetime,getpass,os,signal,socket,subprocess,threading,time,traceback,re
 import uuid
-import socket
 
 thePlatform = platform.system()
 if thePlatform in ['Windows', 'Microsoft']:
@@ -67,7 +66,7 @@ EXECNAME = 'gpload'
 
 NUM_WARN_ROWS = 0
 
-# Mapping for validing our configuration file. We're only concerned with
+# Mapping for validating our configuration file. We're only concerned with
 # keys -- stuff left of ':'. It gets complex in two cases: firstly when
 # we handle blocks which have keys which are not keywords -- such as under
 # COLUMNS:. Secondly, we want to detect when users put keywords in the wrong
@@ -118,10 +117,11 @@ valid_tokens = {
     "update_columns": {'parse_children': False, 'parent': "output"},
     "update_condition": {'parse_children': True, 'parent': "output"},
     "mapping": {'parse_children': False, 'parent': "output"},
-    "including_defaults": {'parse_children': False, 'parent': 'output'},
     "preload": {'parse_children': True, 'parent': 'gpload'},
     "truncate": {'parse_children': False, 'parent': 'preload'},
     "reuse_tables": {'parse_children': False, 'parent': 'preload'},
+    "fast_match": {'parse_children': False, 'parent': 'preload'},
+    "staging_table": {'parse_children': False, 'parent': 'preload'},
     "sql": {'parse_children': True, 'parent': 'gpload'},
     "before": {'parse_children': False, 'parent': 'sql'},
     "after": {'parse_children': False, 'parent': 'sql'},
@@ -560,7 +560,7 @@ def sqlIdentifierCompare(x, y):
     and non-delimited identifiers. Return True if they are equivalent or False
     if they are not equivalent.
     """
-    if x == None or y == None:
+    if x is None or y is None:
        return False
 
     if isDelimited(x):
@@ -611,7 +611,7 @@ def convertListToDelimited(identifiers):
 
 def splitUpMultipartIdentifier(id):
     """
-    Given a sql identifer like sch.tab, return a list of its
+    Given a sql identifier like sch.tab, return a list of its
     individual elements (e.g.  sch.tab would return ['sch','tab']
     """
     returnList = []
@@ -701,10 +701,10 @@ def notice_processor(self):
        return
 
     theNotices = self.db.notices()
-    r = re.compile("^NOTICE:  Found (\d+) data formatting errors.*")
+    r = re.compile("^NOTICE:  found (\d+) data formatting errors.*")
     messageNumber = 0
     m = None
-    while messageNumber < len(theNotices) and m == None:
+    while messageNumber < len(theNotices) and m is None:
        aNotice = theNotices[messageNumber]
        m = r.match(aNotice)
        messageNumber = messageNumber + 1
@@ -899,6 +899,12 @@ def quote(a):
     """
     return "'"+a.replace("'","''").replace('\\','\\\\')+"'"
 
+def quote_no_slash(a):
+    """
+    SQLify a string
+    """
+    return "'"+a.replace("'","''")+"'"
+
 def splitPgpassLine(a):
     """
     If the user has specified a .pgpass file, we'll have to parse it. We simply
@@ -929,7 +935,7 @@ def test_key(gp, key, crumb):
     it has the parent we expect
     """
     val = valid_tokens.get(key)
-    if val == None:
+    if val is None:
         gp.log(gp.ERROR, 'unrecognized key: "%s"' % key)
 
     p = val['parent']
@@ -1069,7 +1075,7 @@ def jenkins(data, initval = 0):
     a, b, c = jenkinsmix(a, b, c)
     return c
 
-# MPP-20927 Citibank: gpload external table name problem
+# MPP-20927: gpload external table name problem
 # Not sure if it is used by other components, just leave it here.
 def shortname(name):
     """
@@ -1143,7 +1149,7 @@ class gpload:
 
         # Create Temp and External table names. However external table name could
         # get overwritten with another name later on (see create_external_table_name).
-        # MPP-20927 Citibank: gpload external table name problem. We use uuid to avoid
+        # MPP-20927: gpload external table name problem. We use uuid to avoid
         # external table name confliction.
         self.unique_suffix = str(uuid.uuid1()).replace('-', '_')
         self.staging_table_name = 'temp_staging_gpload_' + self.unique_suffix
@@ -1311,7 +1317,6 @@ class gpload:
         Level is either DEBUG, LOG, INFO, ERROR. a is the message
         """
         try:
-            t = time.localtime()
             str = '|'.join(
                        [datetime.datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
                         self.elevel2str(level), a]) + '\n'
@@ -1418,7 +1423,7 @@ class gpload:
            self.schema = None
            self.table  = schemaTableList[0]
 
-        # Precendence for configuration: command line > config file > env
+        # Precedence for configuration: command line > config file > env
         # variable
 
         # host to connect to
@@ -1834,7 +1839,7 @@ class gpload:
                 """ remove leading or trailing spaces """
                 d = { tempkey.strip() : value }
                 key = d.keys()[0]
-                if d[key] == None:
+                if d[key] is None:
                     self.log(self.DEBUG,
                              'getting source column data type from target')
                     for name, typ, mapto, hasseq in self.into_columns:
@@ -1857,7 +1862,7 @@ class gpload:
 
         # make sure that all columns have a type
         for name, typ, map, hasseq in self.from_columns:
-            if typ == None:
+            if typ is None:
                 self.log(self.ERROR, 'column "%s" has no type ' % name +
                        'and does not appear in target table "%s"' % self.schemaTable)
         self.log(self.DEBUG, 'from columns are:')
@@ -1873,7 +1878,7 @@ class gpload:
 
         # find the shema name for this table (according to search_path)
         # if it was not explicitly specified in the configuration file.
-        if self.schema == None:
+        if self.schema is None:
             queryString = """SELECT n.nspname
                              FROM pg_catalog.pg_class c
                              LEFT JOIN pg_catalog.pg_namespace n
@@ -1971,10 +1976,9 @@ class gpload:
                     for a in self.into_columns:
                         if sqlIdentifierCompare(a[0], x[0]) == True:
                            i = a
-                           found = True
                            break
                     if i:
-                        if i[2] == None: i[2] = i[0]
+                        if i[2] is None: i[2] = i[0]
                     else:
                         self.log(self.ERROR, 'no mapping for input column ' +
                                  '"%s" to output table' % x[0])
@@ -1989,7 +1993,7 @@ class gpload:
     # This function will return the SQL to run in order to find out whether
     # such a table exists.
     #
-    def get_reuse_exttable_query(self, formatType, formatOpts, limitStr, from_cols, schemaName, log_errors):
+    def get_reuse_exttable_query(self, formatType, formatOpts, limitStr, from_cols, schemaName, log_errors, encodingCode):
         sqlFormat = """select attrelid::regclass
                  from (
                         select
@@ -2033,9 +2037,9 @@ class gpload:
         sql = sqlFormat % (joinStr, conditionStr)
 
         if log_errors:
-            sql += " WHERE pgext.fmterrtbl = pgext.reloid "
+            sql += " WHERE pgext.logerrors "
         else:
-            sql += " WHERE pgext.fmterrtbl IS NULL "
+            sql += " WHERE NOT pgext.logerrors "
 
         for i, l in enumerate(self.locations):
             sql += " and pgext.urilocation[%s] = %s\n" % (i + 1, quote(l))
@@ -2048,6 +2052,9 @@ class gpload:
             sql += "and pgext.rejectlimit = %s " % limitStr
         else:
             sql += "and pgext.rejectlimit IS NULL "
+
+        if encodingCode:
+            sql += "and pgext.encoding = %s " % encodingCode
 
         sql+= "group by attrelid "
 
@@ -2067,12 +2074,75 @@ class gpload:
         self.log(self.DEBUG, "query used to identify reusable external relations: %s" % sql)
         return sql
 
+    # Fast path to find out whether we have an existing external table in the
+    # catalog which could be reused for this operation. we only make sure the
+    # location, data format and error limit are same. we don't check column
+    # names and types
+    #
+    # This function will return the SQL to run in order to find out whether
+    # such a table exists. The results of this SQl are table names without schema
+    #
+    def get_fast_match_exttable_query(self, formatType, formatOpts, limitStr, schemaName, log_errors, encodingCode):
+
+        sqlFormat = """select relname from pg_class
+                    join
+                    pg_exttable pgext
+                    on(pg_class.oid = pgext.reloid)
+                    %s
+                    where
+                    relstorage = 'x' and
+                    relname like 'ext_gpload_reusable_%%' and
+		    %s
+                    """
+
+        joinStr = ""
+        conditionStr = ""
+
+        # if schemaName is None, find the resuable ext table which is visible to
+        # current search path. Else find the resuable ext table under the specific
+        # schema, and this needs to join pg_namespace.
+        if schemaName is None:
+            joinStr = ""
+            conditionStr = "pg_table_is_visible(pg_class.oid)"
+        else:
+            joinStr = """join
+                    pg_namespace pgns
+                    on(pg_class.relnamespace = pgns.oid)"""
+            conditionStr = "pgns.nspname = '%s'" % schemaName
+
+        sql = sqlFormat % (joinStr, conditionStr)
+
+        if log_errors:
+            sql += "and pgext.logerrors "
+        else:
+            sql += "and NOT pgext.logerrors "
+
+        for i, l in enumerate(self.locations):
+            sql += " and pgext.urilocation[%s] = %s\n" % (i + 1, quote(l))
+
+        sql+= """and pgext.fmttype = %s
+                 and pgext.writable = false
+                 and pgext.fmtopts like %s """ % (quote(formatType[0]),quote("%" + quote_unident(formatOpts.rstrip()) +"%"))
+
+        if limitStr:
+            sql += "and pgext.rejectlimit = %s " % limitStr
+        else:
+            sql += "and pgext.rejectlimit IS NULL "
+
+        if encodingCode:
+            sql += "and pgext.encoding = %s " % encodingCode
+
+        sql+= "limit 1;"
+
+        self.log(self.DEBUG, "query used to fast match external relations:\n %s" % sql)
+        return sql
+
     #
     # Create a string from the following conditions to reuse staging table:
     # 1. same target table
     # 2. same number of columns
     # 3. same names and types, in the same order
-    # 4. same distribution key (according to columns' names and thier order)
+    # 4. same distribution key (according to columns' names and their order)
     #
     def get_staging_conditions_string(self, target_table_name, staging_cols, distribution_cols):
 			
@@ -2088,7 +2158,7 @@ class gpload:
     #
     # This function will return the SQL to run in order to find out whether
     # we have an existing staging table in the catalog which could be reused for this
-    # operation, according to the mathod and the encoding conditions.
+    # operation, according to the method and the encoding conditions.
     #
     def get_reuse_staging_table_query(self, encoding_conditions):
 		
@@ -2113,7 +2183,7 @@ class gpload:
         return None
 
     def get_ext_schematable(self, schemaName, tableName):
-        if schemaName == None:
+        if schemaName is None:
             return tableName
         else:
             schemaTable = "%s.%s" % (schemaName, tableName)
@@ -2151,7 +2221,6 @@ class gpload:
             if val.startswith("E'") and val.endswith("'") and len(val[2:-1].decode('unicode-escape')) == 1:
                 subval = val[2:-1]
                 if subval == "\\'":
-                    val = val
                     self.formatOpts += "%s %s " % (specify_str, val)
                 else:
                     val = subval.decode('unicode-escape')
@@ -2161,7 +2230,7 @@ class gpload:
                 self.formatOpts += "%s '%s' " % (specify_str, val)
 
             else:
-                self.control_file_warning(option +''' must be single ASCII charactor, you can also use unprintable characters(for example: '\\x1c' / E'\\x1c' or '\\u001c' / E'\\u001c' ''')
+                self.control_file_warning(option +''' must be single ASCII character, you can also use unprintable characters(for example: '\\x1c' / E'\\x1c' or '\\u001c' / E'\\u001c' ''')
                 self.control_file_error("Invalid option, gpload quit immediately")
                 sys.exit(2);
         else:
@@ -2185,11 +2254,11 @@ class gpload:
         nullas = self.getconfig('gpload:input:null_as', unicode, False)
         self.log(self.DEBUG, "null " + unicode(nullas))
         if nullas != False: # could be empty string
-            self.formatOpts += "null %s " % quote(nullas)
+            self.formatOpts += "null %s " % quote_no_slash(nullas)
         elif formatType=='csv':
             self.formatOpts += "null '' "
         else:
-            self.formatOpts += "null %s " % quote("\N")
+            self.formatOpts += "null %s " % quote_no_slash("\N")
 
 
         esc = self.getconfig('gpload:input:escape', None, None)
@@ -2221,7 +2290,18 @@ class gpload:
                     self.control_file_error("gpload:input:force_not_null must be a YAML sequence of strings")
             self.formatOpts += "force not null %s " % ','.join(force_not_null_columns)
 
+        encodingCode = None
         encodingStr = self.getconfig('gpload:input:encoding', unicode, None)
+        if encodingStr is None:
+            result = self.db.query("SHOW SERVER_ENCODING".encode('utf-8')).getresult()
+            if len(result) > 0:
+                encodingStr = result[0][0]
+
+        if encodingStr:
+            sql = "SELECT pg_char_to_encoding('%s')" % encodingStr
+            result = self.db.query(sql.encode('utf-8')).getresult()
+            if len(result) > 0:
+                encodingCode = result[0][0]
 
         limitStr = self.getconfig('gpload:input:error_limit',int, None)
         if self.log_errors and not limitStr:
@@ -2245,24 +2325,58 @@ class gpload:
         # the one that we need to use. It must have identical attributes,
         # external location, format, and encoding specifications.
         if self.reuse_tables == True:
-            # process the single quotes in order to successfully find an existing external table to reuse.
-            self.formatOpts = self.formatOpts.replace("E'\\''","'\''")
-            sql = self.get_reuse_exttable_query(formatType, self.formatOpts,
-                    limitStr, from_cols, self.extSchemaName, self.log_errors)
-            resultList = self.db.query(sql.encode('utf-8')).getresult()
-            if len(resultList) > 0:
-                # found an external table to reuse. no need to create one. we're done here.
-                self.extTableName = (resultList[0])[0]
-                self.extSchemaTable = self.extTableName
-                self.log(self.INFO, "reusing external table %s" % self.extSchemaTable)
-                return
+            if self.staging_table:
+                if '.' in self.staging_table:
+                    self.log(self.ERROR, "Character '.' is not allowed in staging_table parameter. Please use EXTERNAL->SCHEMA to set the schema of external table")
+                self.extTableName = quote_unident(self.staging_table) 
+                if self.extSchemaName is None:
+                    sql = """SELECT n.nspname as Schema,
+                            c.relname as Name
+                        FROM pg_catalog.pg_class c
+                            LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                        WHERE c.relkind IN ('r','v','S','')
+                            AND c.relstorage IN ('h', 'a', 'c','x','v','')
+                            AND n.nspname <> 'pg_catalog'
+                            AND n.nspname <> 'information_schema'
+                            AND n.nspname !~ '^pg_toast'
+                            AND c.relname = '%s'
+                            AND pg_catalog.pg_table_is_visible(c.oid)
+                        ORDER BY 1,2;""" % self.extTableName
+                else:
+                    sql = "select * from pg_catalog.pg_tables where schemaname = '%s' and tablename = '%s'" % (quote_unident(self.extSchemaName),  self.extTableName)
+                result = self.db.query(sql.encode('utf-8')).getresult()
+                if len(result) > 0:
+                    self.extSchemaTable = self.get_ext_schematable(quote_unident(self.extSchemaName), self.extTableName)
+                    self.log(self.INFO, "reusing external staging table %s" % self.extSchemaTable)
+                    return
+            else:
+                # process the single quotes in order to successfully find an existing external table to reuse.
+                self.formatOpts = self.formatOpts.replace("E'\\''","'\''")
+                if self.fast_match:
+                    sql = self.get_fast_match_exttable_query(formatType, self.formatOpts,
+                        limitStr, self.extSchemaName, self.log_errors, encodingCode)
+                else:
+                    sql = self.get_reuse_exttable_query(formatType, self.formatOpts,
+                        limitStr, from_cols, self.extSchemaName, self.log_errors, encodingCode)
 
-            # didn't find an existing external table suitable for reuse. Format a reusable
-            # name and issue a CREATE EXTERNAL TABLE on it. Hopefully we can use it next time
-            # around
+                resultList = self.db.query(sql.encode('utf-8')).getresult()
+                if len(resultList) > 0:
+                    # found an external table to reuse. no need to create one. we're done here.
+                    self.extTableName = (resultList[0])[0]
+                    # fast match result is only table name, so we need add schema info
+                    if self.fast_match:
+                        self.extSchemaTable = self.get_ext_schematable(quote_unident(self.extSchemaName), self.extTableName)
+                    else:
+                        self.extSchemaTable = self.extTableName
+                    self.log(self.INFO, "reusing external table %s" % self.extSchemaTable)
+                    return
 
-            self.extTableName = "ext_gpload_reusable_%s" % self.unique_suffix
-            self.log(self.INFO, "did not find an external table to reuse. creating %s" % self.extTableName)
+                # didn't find an existing external table suitable for reuse. Format a reusable
+                # name and issue a CREATE EXTERNAL TABLE on it. Hopefully we can use it next time
+                # around
+
+                self.extTableName = "ext_gpload_reusable_%s" % self.unique_suffix
+                self.log(self.INFO, "did not find an external table to reuse. creating %s" % self.get_ext_schematable(self.extSchemaName, self.extTableName))
 
         # process the single quotes in order to successfully create an external table.
         self.formatOpts = self.formatOpts.replace("'\''","E'\\''")
@@ -2303,21 +2417,8 @@ class gpload:
     #
     def create_staging_table(self):
 
-        # Do some initial work to extract the update_columns and metadata
-        # that may be needed in order to create or reuse a temp table
-        if not self.from_cols_from_user:
-            # don't put values serial columns
-            from_cols = filter(lambda a: a[3] != True, self.from_columns)
-        else:
-            from_cols = self.from_columns
-
         # make sure we set the correct distribution policy
         distcols = self.getconfig('gpload:output:match_columns', list)
-
-        # MPP-13399, CR-2227
-        including_defaults = ""
-        if self.getconfig('gpload:output:including_defaults',bool,True):
-            including_defaults = " including defaults"
 
         sql = "SELECT * FROM pg_class WHERE relname LIKE 'temp_gpload_reusable_%%';"
         resultList = self.db.query(sql.encode('utf-8')).getresult()
@@ -2383,11 +2484,11 @@ class gpload:
         if self.log_errors and not self.options.D:
             # make sure we only get errors for our own instance
             if not self.reuse_tables:
-                queryStr = "select count(*) from gp_read_error_log('%s')" % pg.escape_string(self.extTableName)
+                queryStr = "select count(*) from gp_read_error_log('%s')" % pg.escape_string(self.extSchemaTable)
                 results = self.db.query(queryStr.encode('utf-8')).getresult()
                 return (results[0])[0]
             else: # reuse_tables
-                queryStr = "select count(*) from gp_read_error_log('%s') where cmdtime > to_timestamp(%s)" % (pg.escape_string(self.extTableName), self.startTimestamp)
+                queryStr = "select count(*) from gp_read_error_log('%s') where cmdtime > to_timestamp(%s)" % (pg.escape_string(self.extSchemaTable), self.startTimestamp)
                 results = self.db.query(queryStr.encode('utf-8')).getresult()
                 global NUM_WARN_ROWS
                 NUM_WARN_ROWS = (results[0])[0]
@@ -2405,7 +2506,7 @@ class gpload:
         # if reuse_table is set, error message is not deleted.
         if errors and self.log_errors and self.reuse_tables:
             self.log(self.WARN, "Please use following query to access the detailed error")
-            self.log(self.WARN, "select * from gp_read_error_log('{0}') where cmdtime > to_timestamp('{1}')".format(pg.escape_string(self.extTableName), self.startTimestamp))
+            self.log(self.WARN, "select * from gp_read_error_log('{0}') where cmdtime > to_timestamp('{1}')".format(pg.escape_string(self.extSchemaTable), self.startTimestamp))
         self.exitValue = 1 if errors else 0
 
 
@@ -2499,7 +2600,6 @@ class gpload:
                 temp_update_condition = update_condition
                 updateConditionList = splitIntoLiteralsAndNonLiterals(update_condition)
                 skip = False
-                newUpdateConditionList = []
                 update_condition = ''
                 for uc in updateConditionList:
                     if skip == False:
@@ -2535,13 +2635,12 @@ class gpload:
         return tblname
 
     def get_table_dist_key(self):
-
         # NOTE: this query should be re-written better. the problem is that it is
         # not possible to perform a cast on a table name with spaces...
         sql = "select attname from pg_attribute a, gp_distribution_policy p , pg_class c, pg_namespace n "+\
               "where a.attrelid = c.oid and " + \
               "a.attrelid = p.localoid and " + \
-              "a.attnum = any (p.attrnums) and " + \
+              "a.attnum = any (p.distkey) and " + \
               "c.relnamespace = n.oid and " + \
               "n.nspname = '%s' and c.relname = '%s'; " % (quote_unident(self.schema), quote_unident(self.table))
 
@@ -2646,6 +2745,10 @@ class gpload:
         if preload:
             truncate = self.getconfig('gpload:preload:truncate',bool,False)
             self.reuse_tables = self.getconfig('gpload:preload:reuse_tables',bool,False)
+            self.fast_match = self.getconfig('gpload:preload:fast_match',bool,False)
+            if self.reuse_tables == False and self.fast_match == True:
+                self.log(self.WARN, 'fast_match is ignored when reuse_tables is false!')
+            self.staging_table = self.getconfig('gpload:preload:staging_table', unicode, default=None)
         if self.error_table:
             self.log_errors = True
             self.reuse_tables = True
@@ -2712,7 +2815,7 @@ class gpload:
                                          stderr=subprocess.PIPE)
 
                     else:
-                        os.kill(a.pid, signal.SIGTERM)
+                        os.kill(a.pid, signal.SIGKILL)
                 except OSError:
                     pass
         self.log(self.LOG, 'terminating all threads')
@@ -2784,12 +2887,10 @@ class gpload:
             else:
                 self.log(self.INFO, 'gpload failed')
 
-            ## MPP-19015 - Extra python thread shutdown time is needed on HP-UX
-            if platform.uname()[0] == 'HP-UX':
-                time.sleep(1)
-
 
 if __name__ == '__main__':
     g = gpload(sys.argv[1:])
     g.run()
-    sys.exit(g.exitValue)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(g.exitValue)

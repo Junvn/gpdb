@@ -130,7 +130,7 @@ Notes:
    example. GppcAlloc(), GppcAlloc0(), GppcRealloc(), and GppcFree()).
 4. The UDF cannot use Greenplum Database C language UDF API or macros.
 5. The GPPC API and macros can be found in gppc.h located in
-`$GPDB_INSTALLED_DIR/include/postgresql/server/gppc.h`
+`$GPDB_INSTALLED_DIR/include/gppc.h`
 
 ### SPI Functions
 
@@ -202,7 +202,7 @@ The more examples of using GPCC table function are listed in
 https://github.com/greenplum-db/gpdb/tree/master/src/interfaces/gppc/test/tabfunc_gppc_demo
 
 ### Reference
-https://www.postgresql.org/docs/devel/static/xfunc-c.html  
+https://www.postgresql.org/docs/devel/xfunc-c.html
 https://github.com/greenplum-db/gpdb/blob/master/src/include/gppc.h  
 https://github.com/greenplum-db/gpdb/tree/master/src/interfaces/gppc/test/gppc_demo  
 https://github.com/greenplum-db/gpdb/tree/master/src/interfaces/gppc/test/tabfunc_gppc_demo

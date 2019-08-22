@@ -3,7 +3,7 @@
  * sinvaladt.c
  *	  POSTGRES shared cache invalidation data manager.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,13 +20,12 @@
 #include "miscadmin.h"
 #include "storage/backendid.h"
 #include "storage/ipc.h"
-#include "storage/lock.h"
-#include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/shmem.h"
 #include "storage/sinvaladt.h"
 #include "storage/spin.h"
+#include "access/transam.h"
 
 
 /*
@@ -47,7 +46,7 @@
  * In reality, the messages are stored in a circular buffer of MAXNUMMESSAGES
  * entries.  We translate MsgNum values into circular-buffer indexes by
  * computing MsgNum % MAXNUMMESSAGES (this should be fast as long as
- * MAXNUMMESSAGES is a constant and a power of 2).	As long as maxMsgNum
+ * MAXNUMMESSAGES is a constant and a power of 2).  As long as maxMsgNum
  * doesn't exceed minMsgNum by more than MAXNUMMESSAGES, we have enough space
  * in the buffer.  If the buffer does overflow, we recover by setting the
  * "reset" flag for each backend that has fallen too far behind.  A backend
@@ -141,6 +140,7 @@ typedef struct ProcState
 {
 	/* procPid is zero in an inactive ProcState array entry. */
 	pid_t		procPid;		/* PID of backend, for signaling */
+	PGPROC	   *proc;			/* PGPROC of backend */
 	/* nextMsgNum is meaningless if procPid == 0 or resetState is true. */
 	int			nextMsgNum;		/* next message number to read */
 	bool		resetState;		/* backend needs to reset its state */
@@ -248,6 +248,7 @@ CreateSharedInvalidationState(void)
 	for (i = 0; i < shmInvalBuffer->maxBackends; i++)
 	{
 		shmInvalBuffer->procState[i].procPid = 0;		/* inactive */
+		shmInvalBuffer->procState[i].proc = NULL;
 		shmInvalBuffer->procState[i].nextMsgNum = 0;	/* meaningless */
 		shmInvalBuffer->procState[i].resetState = false;
 		shmInvalBuffer->procState[i].signaled = false;
@@ -315,6 +316,7 @@ SharedInvalBackendInit(bool sendOnly)
 
 	/* mark myself active, with all extant messages already read */
 	stateP->procPid = MyProcPid;
+	stateP->proc = MyProc;
 	stateP->nextMsgNum = segP->maxMsgNum;
 	stateP->resetState = false;
 	stateP->signaled = false;
@@ -351,12 +353,11 @@ CleanupInvalidationState(int status, Datum arg)
 	stateP = &segP->procState[MyBackendId - 1];
 
 	/* Update next local transaction ID for next holder of this backendID */
-	/* GPDB_84_MERGE_FIXME: this assignment was reversed in the 8.3 merge; does
-	 * this change need to be backported to 4/5? */
 	stateP->nextLXID = nextLocalTransactionId;
 
 	/* Mark myself inactive */
 	stateP->procPid = 0;
+	stateP->proc = NULL;
 	stateP->nextMsgNum = 0;
 	stateP->resetState = false;
 	stateP->signaled = false;
@@ -373,13 +374,16 @@ CleanupInvalidationState(int status, Datum arg)
 }
 
 /*
- * BackendIdIsActive
- *		Test if the given backend ID is currently assigned to a process.
+ * BackendIdGetProc
+ *		Get the PGPROC structure for a backend, given the backend ID.
+ *		The result may be out of date arbitrarily quickly, so the caller
+ *		must be careful about how this information is used.  NULL is
+ *		returned if the backend is not active.
  */
-bool
-BackendIdIsActive(int backendID)
+PGPROC *
+BackendIdGetProc(int backendID)
 {
-	bool		result;
+	PGPROC	   *result = NULL;
 	SISeg	   *segP = shmInvalBuffer;
 
 	/* Need to lock out additions/removals of backends */
@@ -389,14 +393,46 @@ BackendIdIsActive(int backendID)
 	{
 		ProcState  *stateP = &segP->procState[backendID - 1];
 
-		result = (stateP->procPid != 0);
+		result = stateP->proc;
 	}
-	else
-		result = false;
 
 	LWLockRelease(SInvalWriteLock);
 
 	return result;
+}
+
+/*
+ * BackendIdGetTransactionIds
+ *		Get the xid and xmin of the backend. The result may be out of date
+ *		arbitrarily quickly, so the caller must be careful about how this
+ *		information is used.
+ */
+void
+BackendIdGetTransactionIds(int backendID, TransactionId *xid, TransactionId *xmin)
+{
+	SISeg	   *segP = shmInvalBuffer;
+
+	*xid = InvalidTransactionId;
+	*xmin = InvalidTransactionId;
+
+	/* Need to lock out additions/removals of backends */
+	LWLockAcquire(SInvalWriteLock, LW_SHARED);
+
+	if (backendID > 0 && backendID <= segP->lastBackend)
+	{
+		ProcState  *stateP = &segP->procState[backendID - 1];
+		PGPROC	   *proc = stateP->proc;
+
+		if (proc != NULL)
+		{
+			PGXACT	   *xact = &ProcGlobal->allPgXact[proc->pgprocno];
+
+			*xid = xact->xid;
+			*xmin = xact->xmin;
+		}
+	}
+
+	LWLockRelease(SInvalWriteLock);
 }
 
 /*
@@ -488,9 +524,9 @@ SIInsertDataEntries(const SharedInvalidationMessage *data, int n)
  *		get next SI message(s) for current backend, if there are any
  *
  * Possible return values:
- *	0:   no SI message available
+ *	0:	 no SI message available
  *	n>0: next n SI messages have been extracted into data[]
- * -1:   SI reset message extracted
+ * -1:	 SI reset message extracted
  *
  * If the return value is less than the array size "datasize", the caller
  * can assume that there are no more SI messages after the one(s) returned.
@@ -524,10 +560,10 @@ SIGetDataEntries(SharedInvalidationMessage *data, int datasize)
 
 	/*
 	 * Before starting to take locks, do a quick, unlocked test to see whether
-	 * there can possibly be anything to read.	On a multiprocessor system,
+	 * there can possibly be anything to read.  On a multiprocessor system,
 	 * it's possible that this load could migrate backwards and occur before
 	 * we actually enter this function, so we might miss a sinval message that
-	 * was just added by some other processor.	But they can't migrate
+	 * was just added by some other processor.  But they can't migrate
 	 * backwards over a preceding lock acquisition, so it should be OK.  If we
 	 * haven't acquired a lock preventing against further relevant
 	 * invalidations, any such occurrence is not much different than if the
@@ -639,7 +675,7 @@ SICleanupQueue(bool callerHasWriteLock, int minFree)
 	/*
 	 * Recompute minMsgNum = minimum of all backends' nextMsgNum, identify the
 	 * furthest-back backend that needs signaling (if any), and reset any
-	 * backends that are too far back.	Note that because we ignore sendOnly
+	 * backends that are too far back.  Note that because we ignore sendOnly
 	 * backends here it is possible for them to keep sending messages without
 	 * a problem even when they are the only active backend.
 	 */

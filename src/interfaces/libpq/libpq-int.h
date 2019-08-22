@@ -10,7 +10,7 @@
  *	  only the official API.
  *
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/libpq-int.h
@@ -78,7 +78,7 @@ typedef struct
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#if (SSLEAY_VERSION_NUMBER >= 0x00907000L) && !defined(OPENSSL_NO_ENGINE)
+#if (OPENSSL_VERSION_NUMBER >= 0x00907000L) && !defined(OPENSSL_NO_ENGINE)
 #define USE_SSL_ENGINE
 #endif
 #endif   /* USE_SSL */
@@ -206,7 +206,7 @@ struct pg_result
 	 * on the PGresult don't have to reference the PGconn.
 	 */
 	PGNoticeHooks noticeHooks;
-	PGEvent	   *events;
+	PGEvent    *events;
 	int			nEvents;
 	int			client_encoding;	/* encoding id */
 
@@ -241,11 +241,11 @@ struct pg_result
     int	   extraslen;
 
 	/* GPDB: number of rows rejected in SREH (protocol message 'j') */
-	int			numRejected;
+	int64		numRejected;
 	/* GPDB: number of rows completed when COPY FROM ON SEGMENT */
-	int			numCompleted;
+	int64		numCompleted;
 	/* GPDB: number of processed tuples for each AO partition */
-	int			naotupcounts;
+	int			naotupcounts;   /* number of aotupcounts, the count in it is an int64 */
 	PQaoRelTupCount *aotupcounts;
 };
 
@@ -309,8 +309,11 @@ typedef struct pgLobjfuncs
 	Oid			fn_lo_create;	/* OID of backend function lo_create	*/
 	Oid			fn_lo_unlink;	/* OID of backend function lo_unlink	*/
 	Oid			fn_lo_lseek;	/* OID of backend function lo_lseek		*/
+	Oid			fn_lo_lseek64;	/* OID of backend function lo_lseek64	*/
 	Oid			fn_lo_tell;		/* OID of backend function lo_tell		*/
+	Oid			fn_lo_tell64;	/* OID of backend function lo_tell64	*/
 	Oid			fn_lo_truncate; /* OID of backend function lo_truncate	*/
+	Oid			fn_lo_truncate64;		/* OID of function lo_truncate64 */
 	Oid			fn_lo_read;		/* OID of backend function LOread		*/
 	Oid			fn_lo_write;	/* OID of backend function LOwrite		*/
 } PGlobjfuncs;
@@ -366,7 +369,7 @@ struct pg_conn
 	char	   *sslcrl;			/* certificate revocation list filename */
 	char	   *requirepeer;	/* required peer credentials for local sockets */
 
-#if defined(KRB5) || defined(ENABLE_GSS) || defined(ENABLE_SSPI)
+#if defined(ENABLE_GSS) || defined(ENABLE_SSPI)
 	char	   *krbsrvname;		/* Kerberos service name */
 #endif
     char       *gpconntype; /* type of connection */
@@ -379,9 +382,9 @@ struct pg_conn
 	PGNoticeHooks noticeHooks;
 
 	/* Event procs registered via PQregisterEventProc */
-	PGEvent	   *events;			/* expandable array of event data */
+	PGEvent    *events;			/* expandable array of event data */
 	int			nEvents;		/* number of active events */
-	int			eventArraySize;	/* allocated array size */
+	int			eventArraySize; /* allocated array size */
 
 	/* Status indicators */
 	ConnStatusType status;
@@ -401,7 +404,9 @@ struct pg_conn
 	PGnotify   *notifyTail;		/* newest unreported Notify msg */
 
 	/* Connection data */
-	int			sock;			/* Unix FD for socket, -1 if not connected */
+	/* See PQconnectPoll() for how we use 'int' and not 'pgsocket'. */
+	pgsocket	sock;			/* FD for socket, PGINVALID_SOCKET if
+								 * unconnected */
 	SockAddr	laddr;			/* Local address */
 	SockAddr	raddr;			/* Remote address */
 	ProtocolVersion pversion;	/* FE/BE protocol version in use */
@@ -414,6 +419,8 @@ struct pg_conn
 	bool		sigpipe_flag;	/* can we mask SIGPIPE via MSG_NOSIGNAL? */
 
 	/* Transient state needed while establishing connection */
+	bool		try_next_addr;	/* time to advance to next address? */
+	bool		is_new_addr;	/* need to (re)initialize for new address? */
 	struct addrinfo *addrlist;	/* list of possible backend addresses */
 	struct addrinfo *addr_cur;	/* the one currently being tried */
 	int			addrlist_family;	/* needed to know how to free addrlist */
@@ -461,6 +468,8 @@ struct pg_conn
 	/* Status for asynchronous result construction */
 	PGresult   *result;			/* result being constructed */
 	PGresult   *next_result;	/* next result (used in single-row mode) */
+
+	char		wrote_xlog;
 
 	/* Assorted state for SSL, GSS, etc */
 
@@ -534,7 +543,7 @@ extern char *const pgresStatus[];
 
 /* === in fe-connect.c === */
 
-extern void pqDropConnection(PGconn *conn);
+extern void pqDropConnection(PGconn *conn, bool flushInput);
 extern int pqPacketSend(PGconn *conn, char pack_type,
 			 const void *buf, size_t buf_len);
 extern bool pqGetHomeDirectory(char *buf, int bufsize);
@@ -568,7 +577,7 @@ extern PGresult *pqPrepareAsyncResult(PGconn *conn);
 extern void
 pqInternalNotice(const PGNoticeHooks *hooks, const char *fmt,...)
 /* This lets gcc check the format string for consistency. */
-__attribute__((format(printf, 2, 3)));
+__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
 extern void pqSaveMessageField(PGresult *res, char code,
 				   const char *value);
 extern void pqSaveParameterStatus(PGconn *conn, const char *name,

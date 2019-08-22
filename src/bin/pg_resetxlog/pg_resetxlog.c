@@ -20,10 +20,10 @@
  * step 2 ...
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/bin/pg_resetxlog/pg_resetxlog.c,v 1.70 2008/12/11 07:34:08 petere Exp $
+ * src/bin/pg_resetxlog/pg_resetxlog.c
  *
  *-------------------------------------------------------------------------
  */
@@ -45,9 +45,6 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
-#ifdef HAVE_GETOPT_H
-#include <getopt.h>
-#endif
 
 #include "access/transam.h"
 #include "access/tuptoaster.h"
@@ -55,21 +52,32 @@
 #include "access/xlog_internal.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
-#include "postmaster/primary_mirror_mode.h"
-
-extern int	optind;
-extern char *optarg;
+#include "common/fe_memutils.h"
+#include "storage/large_object.h"
+#include "pg_getopt.h"
 
 
 static ControlFileData ControlFile;		/* pg_control values */
-static uint32 newXlogId,
-			newXlogSeg;			/* ID/Segment of new XLOG segment */
+static XLogSegNo newXlogSegNo;	/* new XLOG segment # */
 static bool guessed = false;	/* T if we had to guess at any values */
 static const char *progname;
+static uint32 set_xid_epoch = (uint32) -1;
+static TransactionId set_xid = 0;
+static Oid	set_oid = 0;
+static Oid	set_relfilenode = 0;
+static MultiXactId set_mxid = 0;
+static MultiXactOffset set_mxoff = (MultiXactOffset) -1;
+static int32 set_data_checksum_version = -1;
+static uint32 minXlogTli = 0;
+static XLogSegNo minXlogSegNo = 0;
+
+static void CheckDataVersion(void);
+static uint64 system_identifier = 0;
 
 static bool ReadControlFile(void);
 static void GuessControlValues(void);
 static void PrintControlValues(bool guessed);
+static void PrintNewControlValues(void);
 static void RewriteControlFile(void);
 static void FindEndOfXLOG(void);
 static void KillExistingXLOG(void);
@@ -77,6 +85,11 @@ static void KillExistingArchiveStatus(void);
 static void WriteEmptyXLOG(void);
 static void usage(void);
 static bool AcceptWarning(void);
+static void	get_restricted_token(const char *progname);
+
+#ifdef WIN32
+static int	CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, const char *progname);
+#endif
 
 #ifndef BUFFER_LEN
 #define BUFFER_LEN (2 * (MAXPGPATH))
@@ -85,23 +98,24 @@ static bool AcceptWarning(void);
 int
 main(int argc, char *argv[])
 {
+	/*
+	 * GPDB_MERGE_110_FIXME: The option numbers below start at 1000 to avoid
+	 * conflicts with upstream. When e22b27f0cb3e arrives, you should be able to
+	 * merge this cleanly into the upstream long_options structure.
+	 */
+	static struct option long_options[] = {
+		{"binary-upgrade", no_argument, NULL, 1000},
+		{"system-identifier", required_argument, NULL, 1001},
+		{NULL, 0, NULL, 0}
+	};
+
 	int			c;
 	bool		force = false;
 	bool		binary_upgrade = false;
 	bool		noupdate = false;
-	uint32		set_xid_epoch = (uint32) -1;
-	TransactionId set_xid = 0;
-	Oid			set_oid = 0;
-	Oid			set_relfilenode = 0;
-	MultiXactId set_mxid = 0;
-	MultiXactOffset set_mxoff = (MultiXactOffset) -1;
-	uint32		minXlogTli = 0,
-				minXlogId = 0,
-				minXlogSeg = 0;
-	uint32		data_checksum_version = (uint32) PG_DATA_CHECKSUM_VERSION + 1;
+	MultiXactId set_oldestmxid = 0;
 	char	   *endptr;
 	char	   *endptr2;
-	char	   *endptr3;
 	char	   *DataDir;
 	int			fd;
 
@@ -129,14 +143,10 @@ main(int argc, char *argv[])
 	}
 
 
-	while ((c = getopt(argc, argv, "yfl:m:no:r:O:x:e:k:")) != -1)
+	while ((c = getopt_long(argc, argv, "fl:m:no:r:O:x:e:k:", long_options, NULL)) != -1)
 	{
 		switch (c)
 		{
-			case 'y':
-				binary_upgrade = true;
-				break;
-
 			case 'f':
 				force = true;
 				break;
@@ -207,7 +217,15 @@ main(int argc, char *argv[])
 
 			case 'm':
 				set_mxid = strtoul(optarg, &endptr, 0);
-				if (endptr == optarg || *endptr != '\0')
+				if (endptr == optarg || *endptr != ',')
+				{
+					fprintf(stderr, _("%s: invalid argument for option -m\n"), progname);
+					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+					exit(1);
+				}
+
+				set_oldestmxid = strtoul(endptr + 1, &endptr2, 0);
+				if (endptr2 == endptr + 1 || *endptr2 != '\0')
 				{
 					fprintf(stderr, _("%s: invalid argument for option -m\n"), progname);
 					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
@@ -216,6 +234,17 @@ main(int argc, char *argv[])
 				if (set_mxid == 0)
 				{
 					fprintf(stderr, _("%s: multitransaction ID (-m) must not be 0\n"), progname);
+					exit(1);
+				}
+
+				/*
+				 * XXX It'd be nice to have more sanity checks here, e.g. so
+				 * that oldest is not wrapped around w.r.t. nextMulti.
+				 */
+				if (set_oldestmxid == 0)
+				{
+					fprintf(stderr, _("%s: oldest multitransaction ID (-m) must not be 0\n"),
+							progname);
 					exit(1);
 				}
 				break;
@@ -236,41 +265,53 @@ main(int argc, char *argv[])
 				break;
 
 			case 'l':
-				minXlogTli = strtoul(optarg, &endptr, 0);
-				if (endptr == optarg || *endptr != ',')
+				if (strspn(optarg, "01234567890ABCDEFabcdef") != 24)
 				{
 					fprintf(stderr, _("%s: invalid argument for option -l\n"), progname);
 					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
 					exit(1);
 				}
-				minXlogId = strtoul(endptr + 1, &endptr2, 0);
-				if (endptr2 == endptr + 1 || *endptr2 != ',')
-				{
-					fprintf(stderr, _("%s: invalid argument for option -l\n"), progname);
-					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
-					exit(1);
-				}
-				minXlogSeg = strtoul(endptr2 + 1, &endptr3, 0);
-				if (endptr3 == endptr2 + 1 || *endptr3 != '\0')
-				{
-					fprintf(stderr, _("%s: invalid argument for option -l\n"), progname);
-					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
-					exit(1);
-				}
+				XLogFromFileName(optarg, &minXlogTli, &minXlogSegNo);
 				break;
 
 			case 'k':
-				data_checksum_version = strtol(optarg, &endptr, 0);
+				set_data_checksum_version = strtol(optarg, &endptr, 0);
 				if (endptr == optarg || *endptr != '\0')
 				{
 					fprintf(stderr, _("%s: invalid argument for option -k\n"), progname);
 					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
 					exit(1);
 				}
-				if (data_checksum_version > PG_DATA_CHECKSUM_VERSION)
+				if (set_data_checksum_version < 0 || set_data_checksum_version > PG_DATA_CHECKSUM_VERSION)
 				{
 					fprintf(stderr, _("%s: data_checksum_version (-k) must be within 0..%d\n"),
 					        progname, PG_DATA_CHECKSUM_VERSION);
+					exit(1);
+				}
+				break;
+
+			/* GPDB-specific long options */
+			case 1000: /* --binary-upgrade */
+				binary_upgrade = true;
+				break;
+
+			case 1001: /* --system-identifier */
+#if SIZEOF_LONG >= 8
+				system_identifier = strtoul(optarg, &endptr, 0);
+#elif defined(HAVE_STRTOULL)
+				system_identifier = strtoull(optarg, &endptr, 0);
+#else
+#	error "The --system-identifier option requires 64-bit support."
+#endif
+				if (endptr == optarg || *endptr != '\0')
+				{
+					fprintf(stderr, _("%s: invalid argument for --system-identifier\n"), progname);
+					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+					exit(1);
+				}
+				if (system_identifier == 0)
+				{
+					fprintf(stderr, _("%s: argument of --system-identifier must not be 0\n"), progname);
 					exit(1);
 				}
 				break;
@@ -305,6 +346,15 @@ main(int argc, char *argv[])
 	}
 #endif
 
+	/* GPDB: only allow setting --system-identifier during upgrade. */
+	if (!binary_upgrade && system_identifier)
+	{
+		fprintf(stderr, _("%s: setting --system-identifier is allowed only during binary upgrade\n"),
+				progname);
+		exit(1);
+	}
+
+	get_restricted_token(progname);
 	DataDir = argv[optind];
 
 	if (chdir(DataDir) < 0)
@@ -313,6 +363,9 @@ main(int argc, char *argv[])
 				progname, DataDir, strerror(errno));
 		exit(1);
 	}
+
+	/* Check that data directory matches our server version */
+	CheckDataVersion();
 
 	/*
 	 * Check for a postmaster lock file --- if there is one, refuse to
@@ -342,9 +395,16 @@ main(int argc, char *argv[])
 		GuessControlValues();
 
 	/*
-	 * Also look at existing segment files to set up newXlogId/newXlogSeg
+	 * Also look at existing segment files to set up newXlogSegNo
 	 */
 	FindEndOfXLOG();
+
+	/*
+	 * If we're not going to proceed with the reset, print the current control
+	 * file parameters.
+	 */
+	if ((guessed && !force) || noupdate)
+		PrintControlValues(guessed);
 
 	/*
 	 * Adjust fields if required by switches.  (Do this now so that printout,
@@ -354,7 +414,21 @@ main(int argc, char *argv[])
 		ControlFile.checkPointCopy.nextXidEpoch = set_xid_epoch;
 
 	if (set_xid != 0)
+	{
 		ControlFile.checkPointCopy.nextXid = set_xid;
+
+		/*
+		 * For the moment, just set oldestXid to a value that will force
+		 * immediate autovacuum-for-wraparound.  It's not clear whether adding
+		 * user control of this is useful, so let's just do something that's
+		 * reasonably safe.  The magic constant here corresponds to the
+		 * maximum allowed value of autovacuum_freeze_max_age.
+		 */
+		ControlFile.checkPointCopy.oldestXid = set_xid - 2000000000;
+		if (ControlFile.checkPointCopy.oldestXid < FirstNormalTransactionId)
+			ControlFile.checkPointCopy.oldestXid += FirstNormalTransactionId;
+		ControlFile.checkPointCopy.oldestXidDB = InvalidOid;
+	}
 
 	if (set_oid != 0)
 		ControlFile.checkPointCopy.nextOid = set_oid;
@@ -363,26 +437,32 @@ main(int argc, char *argv[])
 		ControlFile.checkPointCopy.nextRelfilenode = set_relfilenode;
 
 	if (set_mxid != 0)
+	{
 		ControlFile.checkPointCopy.nextMulti = set_mxid;
+
+		ControlFile.checkPointCopy.oldestMulti = set_oldestmxid;
+		if (ControlFile.checkPointCopy.oldestMulti < FirstMultiXactId)
+			ControlFile.checkPointCopy.oldestMulti += FirstMultiXactId;
+		ControlFile.checkPointCopy.oldestMultiDB = InvalidOid;
+	}
 
 	if (set_mxoff != -1)
 		ControlFile.checkPointCopy.nextMultiOffset = set_mxoff;
 
 	if (minXlogTli > ControlFile.checkPointCopy.ThisTimeLineID)
+	{
 		ControlFile.checkPointCopy.ThisTimeLineID = minXlogTli;
-
-	if (minXlogId > newXlogId ||
-		(minXlogId == newXlogId &&
-		 minXlogSeg > newXlogSeg))
-	{
-		newXlogId = minXlogId;
-		newXlogSeg = minXlogSeg;
+		ControlFile.checkPointCopy.PrevTimeLineID = minXlogTli;
 	}
 
-	if (data_checksum_version <= PG_DATA_CHECKSUM_VERSION)
-	{
-		ControlFile.data_checksum_version = data_checksum_version;
-	}
+	if (minXlogSegNo > newXlogSegNo)
+		newXlogSegNo = minXlogSegNo;
+
+	if (system_identifier != 0)
+		ControlFile.system_identifier = system_identifier;
+
+	if (set_data_checksum_version != -1)
+		ControlFile.data_checksum_version = (uint32) set_data_checksum_version;
 
 	/*
 	 * If we had to guess anything, and -f was not given, just print the
@@ -390,7 +470,7 @@ main(int argc, char *argv[])
 	 */
 	if ((guessed && !force) || noupdate)
 	{
-		PrintControlValues(guessed);
+		PrintNewControlValues();
 		if (!noupdate)
 		{
 			printf(_("\nIf these values seem acceptable, use -f to force reset.\n"));
@@ -471,6 +551,70 @@ AcceptWarning(void)
 }
 
 /*
+ * Look at the version string stored in PG_VERSION and decide if this utility
+ * can be run safely or not.
+ *
+ * We don't want to inject pg_control and WAL files that are for a different
+ * major version; that can't do anything good.  Note that we don't treat
+ * mismatching version info in pg_control as a reason to bail out, because
+ * recovering from a corrupted pg_control is one of the main reasons for this
+ * program to exist at all.  However, PG_VERSION is unlikely to get corrupted,
+ * and if it were it would be easy to fix by hand.  So let's make this check
+ * to prevent simple user errors.
+ */
+static void
+CheckDataVersion(void)
+{
+	const char *ver_file = "PG_VERSION";
+	FILE	   *ver_fd;
+	char		rawline[64];
+	int			len;
+
+	if ((ver_fd = fopen(ver_file, "r")) == NULL)
+	{
+		fprintf(stderr, _("%s: could not open file \"%s\" for reading: %s\n"),
+				progname, ver_file, strerror(errno));
+		exit(1);
+	}
+
+	/* version number has to be the first line read */
+	if (!fgets(rawline, sizeof(rawline), ver_fd))
+	{
+		if (!ferror(ver_fd))
+		{
+			fprintf(stderr, _("%s: unexpected empty file \"%s\"\n"),
+					progname, ver_file);
+		}
+		else
+		{
+			fprintf(stderr, _("%s: could not read file \"%s\": %s\n"),
+					progname, ver_file, strerror(errno));
+		}
+		exit(1);
+	}
+
+	/* remove trailing newline, handling Windows newlines as well */
+	len = strlen(rawline);
+	if (len > 0 && rawline[len - 1] == '\n')
+	{
+		rawline[--len] = '\0';
+		if (len > 0 && rawline[len - 1] == '\r')
+			rawline[--len] = '\0';
+	}
+
+	if (strcmp(rawline, PG_MAJORVERSION) != 0)
+	{
+		fprintf(stderr, _("%s: data directory is of wrong version\n"
+						  "File \"%s\" contains \"%s\", which is not compatible with this program's version \"%s\".\n"),
+				progname, ver_file, rawline, PG_MAJORVERSION);
+		exit(1);
+	}
+
+	fclose(ver_fd);
+}
+
+
+/*
  * Try to read the existing pg_control file.
  *
  * This routine is also responsible for updating old pg_control versions
@@ -502,7 +646,7 @@ ReadControlFile(void)
 	}
 
 	/* Use malloc to ensure we have a maxaligned buffer */
-	buffer = (char *) malloc(PG_CONTROL_SIZE);
+	buffer = (char *) pg_malloc(PG_CONTROL_SIZE);
 
 	len = read(fd, buffer, PG_CONTROL_SIZE);
 	if (len < 0)
@@ -537,7 +681,7 @@ ReadControlFile(void)
 	}
 
 	/* Looks like it's a mess. */
-	fprintf(stderr, _("%s: pg_control exists but is broken or unknown version; ignoring it\n"),
+	fprintf(stderr, _("%s: pg_control exists but is broken or wrong version; ignoring it\n"),
 			progname);
 	return false;
 }
@@ -567,24 +711,41 @@ GuessControlValues(void)
 	 */
 	gettimeofday(&tv, NULL);
 	sysidentifier = ((uint64) tv.tv_sec) << 32;
-	sysidentifier |= (uint32) (tv.tv_sec | tv.tv_usec);
+	sysidentifier |= ((uint64) tv.tv_usec) << 12;
+	sysidentifier |= getpid() & 0xFFF;
 
 	ControlFile.system_identifier = sysidentifier;
 
-	ControlFile.checkPointCopy.redo.xlogid = 0;
-	ControlFile.checkPointCopy.redo.xrecoff = SizeOfXLogLongPHD;
+	ControlFile.checkPointCopy.redo = SizeOfXLogLongPHD;
 	ControlFile.checkPointCopy.ThisTimeLineID = 1;
+	ControlFile.checkPointCopy.PrevTimeLineID = 1;
+	ControlFile.checkPointCopy.fullPageWrites = false;
 	ControlFile.checkPointCopy.nextXidEpoch = 0;
-	ControlFile.checkPointCopy.nextXid = (TransactionId) 514;	/* XXX */
+	ControlFile.checkPointCopy.nextXid = FirstNormalTransactionId;
 	ControlFile.checkPointCopy.nextOid = FirstBootstrapObjectId;
-	ControlFile.checkPointCopy.nextRelfilenode = FirstNormalObjectId;
+	ControlFile.checkPointCopy.nextRelfilenode = FirstBootstrapObjectId;
 	ControlFile.checkPointCopy.nextMulti = FirstMultiXactId;
 	ControlFile.checkPointCopy.nextMultiOffset = 0;
+	ControlFile.checkPointCopy.oldestXid = FirstNormalTransactionId;
+	ControlFile.checkPointCopy.oldestXidDB = InvalidOid;
+	ControlFile.checkPointCopy.oldestMulti = FirstMultiXactId;
+	ControlFile.checkPointCopy.oldestMultiDB = InvalidOid;
 	ControlFile.checkPointCopy.time = (pg_time_t) time(NULL);
+	ControlFile.checkPointCopy.oldestActiveXid = InvalidTransactionId;
 
 	ControlFile.state = DB_SHUTDOWNED;
 	ControlFile.time = (pg_time_t) time(NULL);
 	ControlFile.checkPoint = ControlFile.checkPointCopy.redo;
+	ControlFile.unloggedLSN = 1;
+
+	/* minRecoveryPoint, backupStartPoint and backupEndPoint can be left zero */
+
+	ControlFile.wal_level = WAL_LEVEL_MINIMAL;
+	ControlFile.wal_log_hints = false;
+	ControlFile.MaxConnections = 100;
+	ControlFile.max_worker_processes = 8;
+	ControlFile.max_prepared_xacts = 0;
+	ControlFile.max_locks_per_xact = 64;
 
 	ControlFile.maxAlign = MAXIMUM_ALIGNOF;
 	ControlFile.floatFormat = FLOATFORMAT_VALUE;
@@ -595,6 +756,7 @@ GuessControlValues(void)
 	ControlFile.nameDataLen = NAMEDATALEN;
 	ControlFile.indexMaxKeys = INDEX_MAX_KEYS;
 	ControlFile.toast_max_chunk_size = TOAST_MAX_CHUNK_SIZE;
+	ControlFile.loblksize = LOBLKSIZE;
 #ifdef HAVE_INT64_TIMESTAMP
 	ControlFile.enableIntTimes = true;
 #else
@@ -625,7 +787,7 @@ PrintControlValues(bool guessed)
 	if (guessed)
 		printf(_("Guessed pg_control values:\n\n"));
 	else
-		printf(_("pg_control values:\n\n"));
+		printf(_("Current pg_control values:\n\n"));
 
 	/*
 	 * Format system_identifier separately to keep platform-dependent format
@@ -634,10 +796,6 @@ PrintControlValues(bool guessed)
 	snprintf(sysident_str, sizeof(sysident_str), UINT64_FORMAT,
 			 ControlFile.system_identifier);
 
-	printf(_("First log file ID after reset:        %u\n"),
-		   newXlogId);
-	printf(_("First log file segment after reset:   %u\n"),
-		   newXlogSeg);
 	printf(_("pg_control version number:            %u\n"),
 		   ControlFile.pg_control_version);
 	printf(_("Catalog version number:               %u\n"),
@@ -646,6 +804,8 @@ PrintControlValues(bool guessed)
 		   sysident_str);
 	printf(_("Latest checkpoint's TimeLineID:       %u\n"),
 		   ControlFile.checkPointCopy.ThisTimeLineID);
+	printf(_("Latest checkpoint's full_page_writes: %s\n"),
+		   ControlFile.checkPointCopy.fullPageWrites ? _("on") : _("off"));
 	printf(_("Latest checkpoint's NextXID:          %u/%u\n"),
 		   ControlFile.checkPointCopy.nextXidEpoch,
 		   ControlFile.checkPointCopy.nextXid);
@@ -657,6 +817,16 @@ PrintControlValues(bool guessed)
 		   ControlFile.checkPointCopy.nextMulti);
 	printf(_("Latest checkpoint's NextMultiOffset:  %u\n"),
 		   ControlFile.checkPointCopy.nextMultiOffset);
+	printf(_("Latest checkpoint's oldestXID:        %u\n"),
+		   ControlFile.checkPointCopy.oldestXid);
+	printf(_("Latest checkpoint's oldestXID's DB:   %u\n"),
+		   ControlFile.checkPointCopy.oldestXidDB);
+	printf(_("Latest checkpoint's oldestActiveXID:  %u\n"),
+		   ControlFile.checkPointCopy.oldestActiveXid);
+	printf(_("Latest checkpoint's oldestMultiXid:   %u\n"),
+		   ControlFile.checkPointCopy.oldestMulti);
+	printf(_("Latest checkpoint's oldestMulti's DB: %u\n"),
+		   ControlFile.checkPointCopy.oldestMultiDB);
 	printf(_("Maximum data alignment:               %u\n"),
 		   ControlFile.maxAlign);
 	/* we don't print floatFormat since can't say much useful about it */
@@ -674,6 +844,8 @@ PrintControlValues(bool guessed)
 		   ControlFile.indexMaxKeys);
 	printf(_("Maximum size of a TOAST chunk:        %u\n"),
 		   ControlFile.toast_max_chunk_size);
+	printf(_("Size of a large-object chunk:         %u\n"),
+		   ControlFile.loblksize);
 	printf(_("Date/time type storage:               %s\n"),
 		   (ControlFile.enableIntTimes ? _("64-bit integers") : _("floating-point numbers")));
 	printf(_("Float4 argument passing:              %s\n"),
@@ -682,6 +854,87 @@ PrintControlValues(bool guessed)
 		   (ControlFile.float8ByVal ? _("by value") : _("by reference")));
 	printf(_("Data page checksum version:           %u\n"),
 		   ControlFile.data_checksum_version);
+}
+
+
+/*
+ * Print the values to be changed.
+ */
+static void
+PrintNewControlValues()
+{
+	char		fname[MAXFNAMELEN];
+
+	/* This will be always printed in order to keep format same. */
+	printf(_("\n\nValues to be changed:\n\n"));
+
+	XLogFileName(fname, ControlFile.checkPointCopy.ThisTimeLineID, newXlogSegNo);
+	printf(_("First log segment after reset:        %s\n"), fname);
+
+	if (set_mxid != 0)
+	{
+		printf(_("NextMultiXactId:                      %u\n"),
+			   ControlFile.checkPointCopy.nextMulti);
+		printf(_("OldestMultiXid:                       %u\n"),
+			   ControlFile.checkPointCopy.oldestMulti);
+		printf(_("OldestMulti's DB:                     %u\n"),
+			   ControlFile.checkPointCopy.oldestMultiDB);
+	}
+
+	if (set_mxoff != -1)
+	{
+		printf(_("NextMultiOffset:                      %u\n"),
+			   ControlFile.checkPointCopy.nextMultiOffset);
+	}
+
+	if (set_oid != 0)
+	{
+		printf(_("NextOID:                              %u\n"),
+			   ControlFile.checkPointCopy.nextOid);
+	}
+
+	if (set_relfilenode != 0)
+	{
+		printf(_("NextRelfilenode:                      %u\n"),
+			   ControlFile.checkPointCopy.nextRelfilenode);
+	}
+
+	if (set_xid != 0)
+	{
+		printf(_("NextXID:                              %u\n"),
+			   ControlFile.checkPointCopy.nextXid);
+		printf(_("OldestXID:                            %u\n"),
+			   ControlFile.checkPointCopy.oldestXid);
+		printf(_("OldestXID's DB:                       %u\n"),
+			   ControlFile.checkPointCopy.oldestXidDB);
+	}
+
+	if (set_xid_epoch != -1)
+	{
+		printf(_("NextXID epoch:                        %u\n"),
+			   ControlFile.checkPointCopy.nextXidEpoch);
+	}
+
+	if (set_data_checksum_version != -1)
+	{
+		printf(_("Data page checksum version:           %u\n"),
+			   ControlFile.data_checksum_version);
+	}
+
+	if (system_identifier != 0)
+	{
+		char		sysident_str[32];
+
+		/*
+		 * Format system_identifier separately to keep platform-dependent
+		 * format code out of the translatable message string.
+		 */
+		snprintf(sysident_str, sizeof(sysident_str), UINT64_FORMAT,
+				 ControlFile.system_identifier);
+
+		printf(_("Database system identifier:           %s\n"),
+			   sysident_str);
+	}
 }
 
 
@@ -696,23 +949,33 @@ RewriteControlFile(void)
 
 	/*
 	 * Adjust fields as needed to force an empty XLOG starting at
-	 * newXlogId/newXlogSeg.
+	 * newXlogSegNo.
 	 */
-	ControlFile.checkPointCopy.redo.xlogid = newXlogId;
-	ControlFile.checkPointCopy.redo.xrecoff =
-		newXlogSeg * XLogSegSize + SizeOfXLogLongPHD;
+	XLogSegNoOffsetToRecPtr(newXlogSegNo, SizeOfXLogLongPHD,
+							ControlFile.checkPointCopy.redo);
 	ControlFile.checkPointCopy.time = (pg_time_t) time(NULL);
 
 	ControlFile.state = DB_SHUTDOWNED;
 	ControlFile.time = (pg_time_t) time(NULL);
 	ControlFile.checkPoint = ControlFile.checkPointCopy.redo;
-	ControlFile.prevCheckPoint.xlogid = 0;
-	ControlFile.prevCheckPoint.xrecoff = 0;
-	ControlFile.minRecoveryPoint.xlogid = 0;
-	ControlFile.minRecoveryPoint.xrecoff = 0;
-	ControlFile.backupStartPoint.xlogid = 0;
-	ControlFile.backupStartPoint.xrecoff = 0;
+	ControlFile.prevCheckPoint = 0;
+	ControlFile.minRecoveryPoint = 0;
+	ControlFile.minRecoveryPointTLI = 0;
+	ControlFile.backupStartPoint = 0;
+	ControlFile.backupEndPoint = 0;
 	ControlFile.backupEndRequired = false;
+
+	/*
+	 * Force the defaults for max_* settings. The values don't really matter
+	 * as long as wal_level='minimal'; the postmaster will reset these fields
+	 * anyway at startup.
+	 */
+	ControlFile.wal_level = WAL_LEVEL_MINIMAL;
+	ControlFile.wal_log_hints = false;
+	ControlFile.MaxConnections = 100;
+	ControlFile.max_worker_processes = 8;
+	ControlFile.max_prepared_xacts = 0;
+	ControlFile.max_locks_per_xact = 64;
 
 	/* Now we can force the recorded xlog seg size to the right thing. */
 	ControlFile.xlog_seg_size = XLogSegSize;
@@ -786,14 +1049,16 @@ FindEndOfXLOG(void)
 {
 	DIR		   *xldir;
 	struct dirent *xlde;
+	uint64		segs_per_xlogid;
+	uint64		xlogbytepos;
 
 	/*
 	 * Initialize the max() computation using the last checkpoint address from
-	 * old pg_control.	Note that for the moment we are working with segment
+	 * old pg_control.  Note that for the moment we are working with segment
 	 * numbering according to the old xlog seg size.
 	 */
-	newXlogId = ControlFile.checkPointCopy.redo.xlogid;
-	newXlogSeg = ControlFile.checkPointCopy.redo.xrecoff / ControlFile.xlog_seg_size;
+	segs_per_xlogid = (UINT64CONST(0x0000000100000000) / ControlFile.xlog_seg_size);
+	newXlogSegNo = ControlFile.checkPointCopy.redo / ControlFile.xlog_seg_size;
 
 	/*
 	 * Scan the pg_xlog directory to find existing WAL segment files. We
@@ -808,8 +1073,7 @@ FindEndOfXLOG(void)
 		exit(1);
 	}
 
-	errno = 0;
-	while ((xlde = readdir(xldir)) != NULL)
+	while (errno = 0, (xlde = readdir(xldir)) != NULL)
 	{
 		if (strlen(xlde->d_name) == 24 &&
 			strspn(xlde->d_name, "0123456789ABCDEF") == 24)
@@ -817,8 +1081,10 @@ FindEndOfXLOG(void)
 			unsigned int tli,
 						log,
 						seg;
+			XLogSegNo	segno;
 
 			sscanf(xlde->d_name, "%08X%08X%08X", &tli, &log, &seg);
+			segno = ((uint64) log) * segs_per_xlogid + seg;
 
 			/*
 			 * Note: we take the max of all files found, regardless of their
@@ -826,42 +1092,32 @@ FindEndOfXLOG(void)
 			 * timelines other than the target TLI, but this seems safer.
 			 * Better too large a result than too small...
 			 */
-			if (log > newXlogId ||
-				(log == newXlogId && seg > newXlogSeg))
-			{
-				newXlogId = log;
-				newXlogSeg = seg;
-			}
+			if (segno > newXlogSegNo)
+				newXlogSegNo = segno;
 		}
-		errno = 0;
 	}
-#ifdef WIN32
-
-	/*
-	 * This fix is in mingw cvs (runtime/mingwex/dirent.c rev 1.4), but not in
-	 * released version
-	 */
-	if (GetLastError() == ERROR_NO_MORE_FILES)
-		errno = 0;
-#endif
 
 	if (errno)
 	{
-		fprintf(stderr, _("%s: could not read from directory \"%s\": %s\n"),
+		fprintf(stderr, _("%s: could not read directory \"%s\": %s\n"),
 				progname, XLOGDIR, strerror(errno));
 		exit(1);
 	}
-	closedir(xldir);
+
+	if (closedir(xldir))
+	{
+		fprintf(stderr, _("%s: could not close directory \"%s\": %s\n"),
+				progname, XLOGDIR, strerror(errno));
+		exit(1);
+	}
 
 	/*
 	 * Finally, convert to new xlog seg size, and advance by one to ensure we
 	 * are in virgin territory.
 	 */
-	newXlogSeg *= ControlFile.xlog_seg_size;
-	newXlogSeg = (newXlogSeg + XLogSegSize - 1) / XLogSegSize;
-
-	/* be sure we wrap around correctly at end of a logfile */
-	NextLogSeg(newXlogId, newXlogSeg);
+	xlogbytepos = newXlogSegNo * ControlFile.xlog_seg_size;
+	newXlogSegNo = (xlogbytepos + XLogSegSize - 1) / XLogSegSize;
+	newXlogSegNo++;
 }
 
 
@@ -873,7 +1129,7 @@ KillExistingXLOG(void)
 {
 	DIR		   *xldir;
 	struct dirent *xlde;
-	char		path[MAXPGPATH];
+	char		path[MAXPGPATH + sizeof(XLOGDIR)];
 
 	xldir = opendir(XLOGDIR);
 	if (xldir == NULL)
@@ -883,13 +1139,12 @@ KillExistingXLOG(void)
 		exit(1);
 	}
 
-	errno = 0;
-	while ((xlde = readdir(xldir)) != NULL)
+	while (errno = 0, (xlde = readdir(xldir)) != NULL)
 	{
 		if (strlen(xlde->d_name) == 24 &&
 			strspn(xlde->d_name, "0123456789ABCDEF") == 24)
 		{
-			snprintf(path, MAXPGPATH, "%s/%s", XLOGDIR, xlde->d_name);
+			snprintf(path, sizeof(path), "%s/%s", XLOGDIR, xlde->d_name);
 			if (unlink(path) < 0)
 			{
 				fprintf(stderr, _("%s: could not delete file \"%s\": %s\n"),
@@ -897,25 +1152,21 @@ KillExistingXLOG(void)
 				exit(1);
 			}
 		}
-		errno = 0;
 	}
-#ifdef WIN32
-
-	/*
-	 * This fix is in mingw cvs (runtime/mingwex/dirent.c rev 1.4), but not in
-	 * released version
-	 */
-	if (GetLastError() == ERROR_NO_MORE_FILES)
-		errno = 0;
-#endif
 
 	if (errno)
 	{
-		fprintf(stderr, _("%s: could not read from directory \"%s\": %s\n"),
+		fprintf(stderr, _("%s: could not read directory \"%s\": %s\n"),
 				progname, XLOGDIR, strerror(errno));
 		exit(1);
 	}
-	closedir(xldir);
+
+	if (closedir(xldir))
+	{
+		fprintf(stderr, _("%s: could not close directory \"%s\": %s\n"),
+				progname, XLOGDIR, strerror(errno));
+		exit(1);
+	}
 }
 
 
@@ -925,11 +1176,11 @@ KillExistingXLOG(void)
 static void
 KillExistingArchiveStatus(void)
 {
+#define ARCHSTATDIR XLOGDIR "/archive_status"
+
 	DIR		   *xldir;
 	struct dirent *xlde;
-	char		path[MAXPGPATH];
-
-#define ARCHSTATDIR	XLOGDIR "/archive_status"
+	char		path[MAXPGPATH + sizeof(ARCHSTATDIR)];
 
 	xldir = opendir(ARCHSTATDIR);
 	if (xldir == NULL)
@@ -939,14 +1190,13 @@ KillExistingArchiveStatus(void)
 		exit(1);
 	}
 
-	errno = 0;
-	while ((xlde = readdir(xldir)) != NULL)
+	while (errno = 0, (xlde = readdir(xldir)) != NULL)
 	{
 		if (strspn(xlde->d_name, "0123456789ABCDEF") == 24 &&
 			(strcmp(xlde->d_name + 24, ".ready") == 0 ||
-			 strcmp(xlde->d_name + 24, ".done")  == 0))
+			 strcmp(xlde->d_name + 24, ".done") == 0))
 		{
-			snprintf(path, MAXPGPATH, "%s/%s", ARCHSTATDIR, xlde->d_name);
+			snprintf(path, sizeof(path), "%s/%s", ARCHSTATDIR, xlde->d_name);
 			if (unlink(path) < 0)
 			{
 				fprintf(stderr, _("%s: could not delete file \"%s\": %s\n"),
@@ -954,25 +1204,21 @@ KillExistingArchiveStatus(void)
 				exit(1);
 			}
 		}
-		errno = 0;
 	}
-#ifdef WIN32
-
-	/*
-	 * This fix is in mingw cvs (runtime/mingwex/dirent.c rev 1.4), but not in
-	 * released version
-	 */
-	if (GetLastError() == ERROR_NO_MORE_FILES)
-		errno = 0;
-#endif
 
 	if (errno)
 	{
-		fprintf(stderr, _("%s: could not read from directory \"%s\": %s\n"),
+		fprintf(stderr, _("%s: could not read directory \"%s\": %s\n"),
 				progname, ARCHSTATDIR, strerror(errno));
 		exit(1);
 	}
-	closedir(xldir);
+
+	if (closedir(xldir))
+	{
+		fprintf(stderr, _("%s: could not close directory \"%s\": %s\n"),
+				progname, ARCHSTATDIR, strerror(errno));
+		exit(1);
+	}
 }
 
 
@@ -983,7 +1229,7 @@ KillExistingArchiveStatus(void)
 static void
 WriteEmptyXLOG(void)
 {
-	char	   *buffer;
+	PGAlignedXLogBlock buffer;
 	XLogPageHeader page;
 	XLogLongPageHeader longpage;
 	XLogRecord *record;
@@ -991,23 +1237,15 @@ WriteEmptyXLOG(void)
 	char		path[MAXPGPATH];
 	int			fd;
 	int			nbytes;
-	FILE		*fp = NULL;
-	char 		*pch = NULL;
-	char 		buf[BUFFER_LEN];
 
-	/* Use malloc() to ensure buffer is MAXALIGNED */
-	buffer = (char *) malloc(XLOG_BLCKSZ);
-	page = (XLogPageHeader) buffer;
-	memset(buffer, 0, XLOG_BLCKSZ);
+	memset(buffer.data, 0, XLOG_BLCKSZ);
 
 	/* Set up the XLOG page header */
+	page = (XLogPageHeader) buffer.data;
 	page->xlp_magic = XLOG_PAGE_MAGIC;
 	page->xlp_info = XLP_LONG_HEADER;
 	page->xlp_tli = ControlFile.checkPointCopy.ThisTimeLineID;
-	page->xlp_pageaddr.xlogid =
-		ControlFile.checkPointCopy.redo.xlogid;
-	page->xlp_pageaddr.xrecoff =
-		ControlFile.checkPointCopy.redo.xrecoff - SizeOfXLogLongPHD;
+	page->xlp_pageaddr = ControlFile.checkPointCopy.redo - SizeOfXLogLongPHD;
 	longpage = (XLogLongPageHeader) page;
 	longpage->xlp_sysid = ControlFile.system_identifier;
 	longpage->xlp_seg_size = XLogSegSize;
@@ -1015,8 +1253,7 @@ WriteEmptyXLOG(void)
 
 	/* Insert the initial checkpoint record */
 	record = (XLogRecord *) ((char *) page + SizeOfXLogLongPHD);
-	record->xl_prev.xlogid = 0;
-	record->xl_prev.xrecoff = 0;
+	record->xl_prev = 0;
 	record->xl_xid = InvalidTransactionId;
 	record->xl_tot_len = SizeOfXLogRecord + sizeof(CheckPoint);
 	record->xl_len = sizeof(CheckPoint);
@@ -1027,41 +1264,12 @@ WriteEmptyXLOG(void)
 
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, &ControlFile.checkPointCopy, sizeof(CheckPoint));
-	COMP_CRC32C(crc, (char *) record + sizeof(pg_crc32), SizeOfXLogRecord - sizeof(pg_crc32));
+	COMP_CRC32C(crc, (char *) record, offsetof(XLogRecord, xl_crc));
 	FIN_CRC32C(crc);
 	record->xl_crc = crc;
 
-	/* 
-	 * If we make the filespace for transaction files configurable, then
-	 * pg_resetxlog should pick up the XLOG files from the right location.
-	 * Check the flat file for determining the right location of XLOG files
-	 */
-	fp = fopen(TXN_FILESPACE_FLATFILE, "r");
-	if (fp)
-	{
-		MemSet(buf, 0, BUFFER_LEN);
-		if (fgets(buf, BUFFER_LEN, fp))
-			;	/* First line is Filespace OID, skip it */
-
-		MemSet(buf, 0, BUFFER_LEN);
-		if (fgets(buf, BUFFER_LEN, fp))
-		{
-			buf[strlen(buf)-1]='\0';
-			pch = strtok(buf, " ");	/* The first part is DBID. Skip it */
-			pch = strtok(NULL, " ");
-			sprintf(path,"%s/%s", pch, XLOGDIR);
-		}
-		fclose(fp);
-	}
-	else
-	{
-		/* No flat file. Use the default pg_system filespace */
-		sprintf(path, "%s", XLOGDIR);
-	}
-
 	/* Write the first page */
-	XLogFilePath2(path, ControlFile.checkPointCopy.ThisTimeLineID,
-				 newXlogId, newXlogSeg);
+	XLogFilePath(path, ControlFile.checkPointCopy.ThisTimeLineID, newXlogSegNo);
 
 	unlink(path);
 
@@ -1075,7 +1283,7 @@ WriteEmptyXLOG(void)
 	}
 
 	errno = 0;
-	if (write(fd, buffer, XLOG_BLCKSZ) != XLOG_BLCKSZ)
+	if (write(fd, buffer.data, XLOG_BLCKSZ) != XLOG_BLCKSZ)
 	{
 		/* if write didn't set errno, assume problem is no disk space */
 		if (errno == 0)
@@ -1086,11 +1294,11 @@ WriteEmptyXLOG(void)
 	}
 
 	/* Fill the rest of the file with zeroes */
-	memset(buffer, 0, XLOG_BLCKSZ);
+	memset(buffer.data, 0, XLOG_BLCKSZ);
 	for (nbytes = XLOG_BLCKSZ; nbytes < XLogSegSize; nbytes += XLOG_BLCKSZ)
 	{
 		errno = 0;
-		if (write(fd, buffer, XLOG_BLCKSZ) != XLOG_BLCKSZ)
+		if (write(fd, buffer.data, XLOG_BLCKSZ) != XLOG_BLCKSZ)
 		{
 			if (errno == 0)
 				errno = ENOSPC;
@@ -1109,6 +1317,162 @@ WriteEmptyXLOG(void)
 	close(fd);
 }
 
+#ifdef WIN32
+typedef BOOL(WINAPI * __CreateRestrictedToken) (HANDLE, DWORD, DWORD, PSID_AND_ATTRIBUTES, DWORD, PLUID_AND_ATTRIBUTES, DWORD, PSID_AND_ATTRIBUTES, PHANDLE);
+
+/* Windows API define missing from some versions of MingW headers */
+#ifndef  DISABLE_MAX_PRIVILEGE
+#define DISABLE_MAX_PRIVILEGE	0x1
+#endif
+
+/*
+* Create a restricted token and execute the specified process with it.
+*
+* Returns 0 on failure, non-zero on success, same as CreateProcess().
+*
+* On NT4, or any other system not containing the required functions, will
+* NOT execute anything.
+*/
+static int
+CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, const char *progname)
+{
+	BOOL		b;
+	STARTUPINFO si;
+	HANDLE		origToken;
+	HANDLE		restrictedToken;
+	SID_IDENTIFIER_AUTHORITY NtAuthority = { SECURITY_NT_AUTHORITY };
+	SID_AND_ATTRIBUTES dropSids[2];
+	__CreateRestrictedToken _CreateRestrictedToken = NULL;
+	HANDLE		Advapi32Handle;
+
+	ZeroMemory(&si, sizeof(si));
+	si.cb = sizeof(si);
+
+	Advapi32Handle = LoadLibrary("ADVAPI32.DLL");
+	if (Advapi32Handle != NULL)
+	{
+		_CreateRestrictedToken = (__CreateRestrictedToken)GetProcAddress(Advapi32Handle, "CreateRestrictedToken");
+	}
+
+	if (_CreateRestrictedToken == NULL)
+	{
+		fprintf(stderr, _("%s: WARNING: cannot create restricted tokens on this platform\n"), progname);
+		if (Advapi32Handle != NULL)
+			FreeLibrary(Advapi32Handle);
+		return 0;
+	}
+
+	/* Open the current token to use as a base for the restricted one */
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &origToken))
+	{
+		fprintf(stderr, _("%s: could not open process token: error code %lu\n"), progname, GetLastError());
+		return 0;
+	}
+
+	/* Allocate list of SIDs to remove */
+	ZeroMemory(&dropSids, sizeof(dropSids));
+	if (!AllocateAndInitializeSid(&NtAuthority, 2,
+		SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0,
+		0, &dropSids[0].Sid) ||
+		!AllocateAndInitializeSid(&NtAuthority, 2,
+		SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_POWER_USERS, 0, 0, 0, 0, 0,
+		0, &dropSids[1].Sid))
+	{
+		fprintf(stderr, _("%s: could not allocate SIDs: error code %lu\n"), progname, GetLastError());
+		return 0;
+	}
+
+	b = _CreateRestrictedToken(origToken,
+						DISABLE_MAX_PRIVILEGE,
+						sizeof(dropSids) / sizeof(dropSids[0]),
+						dropSids,
+						0, NULL,
+						0, NULL,
+						&restrictedToken);
+
+	FreeSid(dropSids[1].Sid);
+	FreeSid(dropSids[0].Sid);
+	CloseHandle(origToken);
+	FreeLibrary(Advapi32Handle);
+
+	if (!b)
+	{
+		fprintf(stderr, _("%s: could not create restricted token: error code %lu\n"), progname, GetLastError());
+		return 0;
+	}
+
+#ifndef __CYGWIN__
+	AddUserToTokenDacl(restrictedToken);
+#endif
+
+	if (!CreateProcessAsUser(restrictedToken,
+							NULL,
+							cmd,
+							NULL,
+							NULL,
+							TRUE,
+							CREATE_SUSPENDED,
+							NULL,
+							NULL,
+							&si,
+							processInfo))
+
+	{
+		fprintf(stderr, _("%s: could not start process for command \"%s\": error code %lu\n"), progname, cmd, GetLastError());
+		return 0;
+	}
+
+	return ResumeThread(processInfo->hThread);
+}
+#endif
+
+static void
+get_restricted_token(const char *progname)
+{
+#ifdef WIN32
+
+	/*
+	* Before we execute another program, make sure that we are running with a
+	* restricted token. If not, re-execute ourselves with one.
+	*/
+
+	if ((restrict_env = getenv("PG_RESTRICT_EXEC")) == NULL
+		|| strcmp(restrict_env, "1") != 0)
+	{
+		PROCESS_INFORMATION pi;
+		char	   *cmdline;
+
+		ZeroMemory(&pi, sizeof(pi));
+
+		cmdline = pg_strdup(GetCommandLine());
+
+		putenv("PG_RESTRICT_EXEC=1");
+
+		if (!CreateRestrictedProcess(cmdline, &pi, progname))
+		{
+			fprintf(stderr, _("%s: could not re-execute with restricted token: error code %lu\n"), progname, GetLastError());
+		}
+		else
+		{
+			/*
+			* Successfully re-execed. Now wait for child process to capture
+			* exitcode.
+			*/
+			DWORD		x;
+
+			CloseHandle(pi.hThread);
+			WaitForSingleObject(pi.hProcess, INFINITE);
+
+			if (!GetExitCodeProcess(pi.hProcess, &x))
+			{
+				fprintf(stderr, _("%s: could not get exit code from subprocess: error code %lu\n"), progname, GetLastError());
+				exit(1);
+			}
+			exit(x);
+		}
+	}
+#endif
+}
 
 static void
 usage(void)
@@ -1116,18 +1480,20 @@ usage(void)
 	printf(_("%s resets the PostgreSQL transaction log.\n\n"), progname);
 	printf(_("Usage:\n  %s [OPTION]... DATADIR\n\n"), progname);
 	printf(_("Options:\n"));
-	printf(_("  -e XIDEPOCH     set next transaction ID epoch\n"));
-	printf(_("  -f              force update to be done\n"));
+	printf(_("  -e XIDEPOCH      set next transaction ID epoch\n"));
+	printf(_("  -f               force update to be done\n"));
 	printf(_("  -k data_checksum_version     set data_checksum_version\n"));
-	printf(_("  -l TLI,FILE,SEG force minimum WAL starting location for new transaction log\n"));
-	printf(_("  -m XID          set next multitransaction ID\n"));
-	printf(_("  -n              no update, just show extracted control values (for testing)\n"));
-	printf(_("  -o OID          set next OID\n"));
+	printf(_("  -l XLOGFILE      force minimum WAL starting location for new transaction log\n"));
+	printf(_("  -m MXID,MXID     set next and oldest multitransaction ID\n"));
+	printf(_("  -n               no update, just show what would be done (for testing)\n"));
+	printf(_("  -o OID           set next OID\n"));
 	printf(_("  -r RELFILENODE  set next RELFILENODE\n"));
-	printf(_("  -O OFFSET       set next multitransaction offset\n"));
-	printf(_("  -x XID          set next transaction ID\n"));
-	printf(_("  --help          show this help, then exit\n"));
-	printf(_("  --version       output version information, then exit\n"));
+	printf(_("  -O OFFSET        set next multitransaction offset\n"));
+	printf(_("  -V, --version    output version information, then exit\n"));
+	printf(_("  -x XID           set next transaction ID\n"));
+	printf(_("  --system-identifier=ID\n"
+			 "                   set database system identifier\n"));
+	printf(_("  -?, --help       show this help, then exit\n"));
 	printf(_("  --gp-version    output Greenplum version information, then exit\n"));
 	printf(_("\nReport bugs to <bugs@greenplum.org>.\n"));
 }

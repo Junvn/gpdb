@@ -20,12 +20,16 @@
 #ifndef PERFMON_SEGMENTINFO_H
 #define PERFMON_SEGMENTINFO_H
 
-#include "postgres.h"
-
 /* GUCs */
 extern int gp_perfmon_segment_interval;
 
 /* Interface */
-extern int perfmon_segmentinfo_start(void);
+void SegmentInfoSenderMain(Datum main_arg);
+bool SegmentInfoSenderStartRule(Datum main_arg);
+
+typedef void (*cluster_state_collect_hook_type)(void);
+extern PGDLLIMPORT cluster_state_collect_hook_type cluster_state_collect_hook;
+
+#define SEGMENT_INFO_LOOP_SLEEP_MS (100)
 
 #endif /* PERFMON_SEGMENTINFO_H */

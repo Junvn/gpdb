@@ -9,7 +9,7 @@
 - If you want to link cmake3 to cmake, run:
 
   ```bash
-    ln -sf ../../bin/cmake3 /usr/local/bin/cmake
+    sudo ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
   ```
 
 - Make sure that you add `/usr/local/lib` and `/usr/local/lib64` to
@@ -57,7 +57,9 @@ Use dependency script for CentOS.
 ## Common Platform Tasks:
 
 Make sure that you add `/usr/local/lib` to `/etc/ld.so.conf`,
-then run command `ldconfig`.
+then run command `ldconfig`. After building the optimizer, run
+`ldconfig` again to make sure necessary links and cache have
+been created for these shared libraries.
 
 1. ORCA requires [CMake](https://cmake.org) 3.x; make sure you have it installed.
    Installation instructions vary, please check the CMake website.
@@ -77,8 +79,8 @@ then run command `ldconfig`.
    
    ```
    ssh-keygen
-   cp ~/.ssh/id_rsa.pub authorized_keys
-   chmod 600 authorized_keys
+   cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+   chmod 600 ~/.ssh/authorized_keys
    ```
 
 1. Verify that you can ssh to your machine name without a password
@@ -91,11 +93,11 @@ then run command `ldconfig`.
 
   ```bash
 
-  cat >> /etc/sysctl.conf <<-EOF
+  sudo bash -c 'cat >> /etc/sysctl.conf <<-EOF
   kernel.shmmax = 500000000
   kernel.shmmni = 4096
   kernel.shmall = 4000000000
-  kernel.sem = 250 512000 100 2048
+  kernel.sem = 500 1024000 200 4096
   kernel.sysrq = 1
   kernel.core_uses_pid = 1
   kernel.msgmnb = 65536
@@ -113,19 +115,19 @@ then run command `ldconfig`.
   net.core.wmem_max = 2097152
   vm.overcommit_memory = 2
 
-  EOF
+  EOF'
 
-  cat >> /etc/security/limits.conf <<-EOF
+  sudo bash -c 'cat >> /etc/security/limits.conf <<-EOF
   * soft nofile 65536
   * hard nofile 65536
   * soft nproc 131072
   * hard nproc 131072
 
-  EOF
+  EOF'
 
-  cat >> /etc/ld.so.conf <<-EOF
+  sudo bash -c 'cat >> /etc/ld.so.conf <<-EOF
   /usr/local/lib
 
-  EOF
+  EOF'
 
   ```

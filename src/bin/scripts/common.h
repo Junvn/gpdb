@@ -2,16 +2,17 @@
  *	common.h
  *		Common support routines for bin/scripts/
  *
- *	Copyright (c) 2003-2009, PostgreSQL Global Development Group
+ *	Copyright (c) 2003-2014, PostgreSQL Global Development Group
  *
- *	$PostgreSQL: pgsql/src/bin/scripts/common.h,v 1.20 2008/05/14 15:16:27 momjian Exp $
+ *	src/bin/scripts/common.h
  */
 #ifndef COMMON_H
 #define COMMON_H
 
+#include "common/username.h"
 #include "libpq-fe.h"
-#include "getopt_long.h"
-#include "pqexpbuffer.h"
+#include "getopt_long.h"		/* pgrminclude ignore */
+#include "pqexpbuffer.h"		/* pgrminclude ignore */
 
 enum trivalue
 {
@@ -20,13 +21,7 @@ enum trivalue
 	TRI_YES
 };
 
-#ifndef HAVE_INT_OPTRESET
-extern int	optreset;
-#endif
-
 typedef void (*help_handler) (const char *progname);
-
-extern const char *get_user_name(const char *progname);
 
 extern void handle_help_version_opts(int argc, char *argv[],
 						 const char *fixed_progname,
@@ -34,7 +29,13 @@ extern void handle_help_version_opts(int argc, char *argv[],
 
 extern PGconn *connectDatabase(const char *dbname, const char *pghost,
 				const char *pgport, const char *pguser,
-				enum trivalue prompt_password, const char *progname);
+				enum trivalue prompt_password, const char *progname,
+				bool echo, bool fail_ok);
+
+extern PGconn *connectMaintenanceDatabase(const char *maintenance_db,
+						   const char *pghost, const char *pgport,
+						   const char *pguser, enum trivalue prompt_password,
+						   const char *progname, bool echo);
 
 extern PGresult *executeQuery(PGconn *conn, const char *query,
 			 const char *progname, bool echo);
@@ -45,10 +46,11 @@ extern void executeCommand(PGconn *conn, const char *query,
 extern bool executeMaintenanceCommand(PGconn *conn, const char *query,
 						  bool echo);
 
+extern void appendQualifiedRelation(PQExpBuffer buf, const char *name,
+						PGconn *conn, const char *progname, bool echo);
+
 extern bool yesno_prompt(const char *question);
 
 extern void setup_cancel_handler(void);
-
-extern char *pg_strdup(const char *string);
 
 #endif   /* COMMON_H */

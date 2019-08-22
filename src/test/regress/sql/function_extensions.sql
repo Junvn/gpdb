@@ -66,7 +66,7 @@ select proname, proargnames, prodataaccess from pg_proc where proname = 'func4';
 create or replace function func5(int) returns int as
 $$
   select $1;
-$$ language "SQL";
+$$ language SQL;
 
 -- check prodataaccess column
 select proname, proargnames, prodataaccess from pg_proc where proname = 'func5';
@@ -143,8 +143,8 @@ INSERT INTO srf_testtab VALUES ('foo -1');
 
 create function srf_on_master () returns setof text as $$
 begin
-  return next 'foo ' || current_setting('gp_segment');
-  return next 'bar ' || current_setting('gp_segment');
+  return next 'foo ' || current_setting('gp_contentid');
+  return next 'bar ' || current_setting('gp_contentid');
 end;
 $$ language plpgsql EXECUTE ON MASTER;
 
@@ -169,9 +169,9 @@ begin
 
   -- To make the output reproducible, regardless of the number of segments in
   -- the cluster, only return rows on segments 0 and 1
-  if current_setting('gp_segment')::integer < 2 then
-    return next 'foo ' || current_setting('gp_segment');
-    return next 'bar ' || current_setting('gp_segment');
+  if current_setting('gp_contentid')::integer < 2 then
+    return next 'foo ' || current_setting('gp_contentid');
+    return next 'bar ' || current_setting('gp_contentid');
   end if;
 end;
 $$ language plpgsql EXECUTE ON ALL SEGMENTS;
@@ -220,3 +220,15 @@ alter function test_srf() EXECUTE ON ANY;
 
 DROP FUNCTION test_srf();
 DROP ROLE srftestuser;
+
+-- Test error propagation from segments
+CREATE TABLE uniq_test(id int primary key);
+CREATE OR REPLACE FUNCTION trigger_unique() RETURNS void AS $$
+BEGIN
+	INSERT INTO uniq_test VALUES (1);
+	INSERT INTO uniq_test VALUES (1);
+	EXCEPTION WHEN unique_violation THEN
+		raise notice 'unique_violation';
+END;
+$$ LANGUAGE plpgsql volatile;
+SELECT trigger_unique();

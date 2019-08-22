@@ -128,7 +128,7 @@ SELECT '' AS one, * FROM INTERVAL_TBL
      | 34 years
 (1 row)
 
-SELECT '' AS five, * FROM INTERVAL_TBL 
+SELECT '' AS five, * FROM INTERVAL_TBL
    WHERE INTERVAL_TBL.f1 >= interval '@ 1 month';
  five |       f1        
 ------+-----------------
@@ -207,12 +207,82 @@ SELECT '' AS fortyfive, r1.*, r2.*
            | 34 years        | 6 years
 (45 rows)
 
+-- Test intervals that are large enough to overflow 64 bits in comparisons
+CREATE TEMP TABLE INTERVAL_TBL_OF (f1 interval);
+INSERT INTO INTERVAL_TBL_OF (f1) VALUES
+  ('2147483647 days 2147483647 months'),
+  ('2147483647 days -2147483648 months'),
+  ('1 year'),
+  ('-2147483648 days 2147483647 months'),
+  ('-2147483648 days -2147483648 months');
+-- these should fail as out-of-range
+INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('2147483648 days');
+ERROR:  interval field value out of range: "2147483648 days"
+LINE 1: INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('2147483648 days');
+                                                 ^
+INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('-2147483649 days');
+ERROR:  interval field value out of range: "-2147483649 days"
+LINE 1: INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('-2147483649 days')...
+                                                 ^
+INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('2147483647 years');
+ERROR:  interval out of range
+LINE 1: INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('2147483647 years')...
+                                                 ^
+INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('-2147483648 years');
+ERROR:  interval out of range
+LINE 1: INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('-2147483648 years'...
+                                                 ^
+SELECT r1.*, r2.*
+   FROM INTERVAL_TBL_OF r1, INTERVAL_TBL_OF r2
+   WHERE r1.f1 > r2.f1
+   ORDER BY r1.f1, r2.f1;
+                    f1                     |                    f1                     
+-------------------------------------------+-------------------------------------------
+ -178956970 years -8 mons +2147483647 days | -178956970 years -8 mons -2147483648 days
+ 1 year                                    | -178956970 years -8 mons -2147483648 days
+ 1 year                                    | -178956970 years -8 mons +2147483647 days
+ 178956970 years 7 mons -2147483648 days   | -178956970 years -8 mons -2147483648 days
+ 178956970 years 7 mons -2147483648 days   | -178956970 years -8 mons +2147483647 days
+ 178956970 years 7 mons -2147483648 days   | 1 year
+ 178956970 years 7 mons 2147483647 days    | -178956970 years -8 mons -2147483648 days
+ 178956970 years 7 mons 2147483647 days    | -178956970 years -8 mons +2147483647 days
+ 178956970 years 7 mons 2147483647 days    | 1 year
+ 178956970 years 7 mons 2147483647 days    | 178956970 years 7 mons -2147483648 days
+(10 rows)
+
+CREATE INDEX ON INTERVAL_TBL_OF USING btree (f1);
+SET enable_seqscan TO false;
+EXPLAIN (COSTS OFF)
+SELECT f1 FROM INTERVAL_TBL_OF r1 ORDER BY f1;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: f1
+   ->  Sort
+         Sort Key: f1
+         ->  Bitmap Heap Scan on interval_tbl_of r1
+               ->  Bitmap Index Scan on interval_tbl_of_f1_idx
+ Optimizer: Postgres query optimizer
+(7 rows)
+
+SELECT f1 FROM INTERVAL_TBL_OF r1 ORDER BY f1;
+                    f1                     
+-------------------------------------------
+ -178956970 years -8 mons -2147483648 days
+ -178956970 years -8 mons +2147483647 days
+ 1 year
+ 178956970 years 7 mons -2147483648 days
+ 178956970 years 7 mons 2147483647 days
+(5 rows)
+
+RESET enable_seqscan;
+DROP TABLE INTERVAL_TBL_OF;
 -- Test multiplication and division with intervals.
--- Floating point arithmetic rounding errors can lead to unexpected results, 
--- though the code attempts to do the right thing and round up to days and 
--- minutes to avoid results such as '3 days 24:00 hours' or '14:20:60'. 
--- Note that it is expected for some day components to be greater than 29 and 
--- some time components be greater than 23:59:59 due to how intervals are 
+-- Floating point arithmetic rounding errors can lead to unexpected results,
+-- though the code attempts to do the right thing and round up to days and
+-- minutes to avoid results such as '3 days 24:00 hours' or '14:20:60'.
+-- Note that it is expected for some day components to be greater than 29 and
+-- some time components be greater than 23:59:59 due to how intervals are
 -- stored internally.
 CREATE TABLE INTERVAL_MULDIV_TBL (span interval);
 COPY INTERVAL_MULDIV_TBL FROM STDIN;
@@ -307,10 +377,13 @@ select '4 millenniums 5 centuries 4 decades 1 year 4 months 4 days 17 minutes 31
 (1 row)
 
 -- test long interval output
-select '100000000y 10mon -1000000000d -1000000000h -10min -10.000001s ago'::interval;
-                                         interval                                          
--------------------------------------------------------------------------------------------
- @ 100000000 years 10 mons -1000000000 days -1000000000 hours -10 mins -10.000001 secs ago
+-- Note: the actual maximum length of the interval output is longer,
+-- but we need the test to work for both integer and floating-point
+-- timestamps.
+select '100000000y 10mon -1000000000d -100000h -10min -10.000001s ago'::interval;
+                                       interval                                        
+---------------------------------------------------------------------------------------
+ @ 100000000 years 10 mons -1000000000 days -100000 hours -10 mins -10.000001 secs ago
 (1 row)
 
 -- test justify_hours() and justify_days()
@@ -403,19 +476,6 @@ SELECT interval '999' month;
     interval     
 -----------------
  83 years 3 mons
-(1 row)
-
--- check that '30 days' equals '1 month' according to the hash function
-select '30 days'::interval = '1 month'::interval as t;
- t 
----
- t
-(1 row)
-
-select interval_hash('30 days'::interval) = interval_hash('1 month'::interval) as t;
- t 
----
- t
 (1 row)
 
 -- test SQL-spec syntaxes for restricted field sets
@@ -565,6 +625,30 @@ SELECT interval '1 2:03:04' minute to second;
  1 day 02:03:04
 (1 row)
 
+SELECT interval '1 +2:03' minute to second;
+    interval    
+----------------
+ 1 day 00:02:03
+(1 row)
+
+SELECT interval '1 +2:03:04' minute to second;
+    interval    
+----------------
+ 1 day 02:03:04
+(1 row)
+
+SELECT interval '1 -2:03' minute to second;
+    interval     
+-----------------
+ 1 day -00:02:03
+(1 row)
+
+SELECT interval '1 -2:03:04' minute to second;
+    interval     
+-----------------
+ 1 day -02:03:04
+(1 row)
+
 SELECT interval '123 11' day to hour; -- ok
      interval      
 -------------------
@@ -578,6 +662,10 @@ LINE 1: SELECT interval '123 11' day;
 SELECT interval '123 11'; -- not ok, too ambiguous
 ERROR:  invalid input syntax for type interval: "123 11"
 LINE 1: SELECT interval '123 11';
+                        ^
+SELECT interval '123 2:03 -2:04'; -- not ok, redundant hh:mm fields
+ERROR:  invalid input syntax for type interval: "123 2:03 -2:04"
+LINE 1: SELECT interval '123 2:03 -2:04';
                         ^
 -- test syntaxes for restricted precision
 SELECT interval(0) '1 day 01:23:45.6789';
@@ -673,6 +761,24 @@ SELECT interval '1 2:03:04.5678' minute to second(2);
 -------------------
  1 day 02:03:04.57
 (1 row)
+
+-- test casting to restricted precision (bug #14479)
+SELECT f1, f1::INTERVAL DAY TO MINUTE AS "minutes",
+  (f1 + INTERVAL '1 month')::INTERVAL MONTH::INTERVAL YEAR AS "years"
+  FROM interval_tbl;
+       f1        |     minutes     |  years   
+-----------------+-----------------+----------
+ 00:01:00        | 00:01:00        | 00:00:00
+ 05:00:00        | 05:00:00        | 00:00:00
+ 10 days         | 10 days         | 00:00:00
+ 34 years        | 34 years        | 34 years
+ 3 mons          | 3 mons          | 00:00:00
+ -00:00:14       | 00:00:00        | 00:00:00
+ 1 day 02:03:04  | 1 day 02:03:00  | 00:00:00
+ 6 years         | 6 years         | 6 years
+ 5 mons          | 5 mons          | 00:00:00
+ 5 mons 12:00:00 | 5 mons 12:00:00 | 00:00:00
+(10 rows)
 
 -- test inputting and outputting SQL standard interval literals
 SET IntervalStyle TO sql_standard;
@@ -773,9 +879,67 @@ select interval '1 year 2 mons 3 days 04:05:06.699999';
  @ 1 year 2 mons 3 days 4 hours 5 mins 6.699999 secs
 (1 row)
 
-select interval '0:0:0.7', interval '@ 0.70 secs', interval '0.7 seconds'; 
+select interval '0:0:0.7', interval '@ 0.70 secs', interval '0.7 seconds';
   interval  |  interval  |  interval  
 ------------+------------+------------
  @ 0.7 secs | @ 0.7 secs | @ 0.7 secs
+(1 row)
+
+-- check that '30 days' equals '1 month' according to the hash function
+select '30 days'::interval = '1 month'::interval as t;
+ t 
+---
+ t
+(1 row)
+
+select interval_hash('30 days'::interval) = interval_hash('1 month'::interval) as t;
+ t 
+---
+ t
+(1 row)
+
+-- numeric constructor
+select make_interval(years := 2);
+ make_interval 
+---------------
+ @ 2 years
+(1 row)
+
+select make_interval(years := 1, months := 6);
+  make_interval  
+-----------------
+ @ 1 year 6 mons
+(1 row)
+
+select make_interval(years := 1, months := -1, weeks := 5, days := -7, hours := 25, mins := -180);
+       make_interval        
+----------------------------
+ @ 11 mons 28 days 22 hours
+(1 row)
+
+select make_interval() = make_interval(years := 0, months := 0, weeks := 0, days := 0, mins := 0, secs := 0.0);
+ ?column? 
+----------
+ t
+(1 row)
+
+select make_interval(hours := -2, mins := -10, secs := -25.3);
+          make_interval          
+---------------------------------
+ @ 2 hours 10 mins 25.3 secs ago
+(1 row)
+
+select make_interval(years := 'inf'::float::int);
+ERROR:  integer out of range
+select make_interval(months := 'NaN'::float::int);
+ERROR:  integer out of range
+select make_interval(secs := 'inf');
+ERROR:  interval out of range
+select make_interval(secs := 'NaN');
+ERROR:  interval out of range
+select make_interval(secs := 7e12);
+           make_interval            
+------------------------------------
+ @ 1944444444 hours 26 mins 40 secs
 (1 row)
 

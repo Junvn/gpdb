@@ -20,14 +20,8 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
-#include "optimizer/tlist.h"
 #include "optimizer/subselect.h"
 #include "optimizer/planshare.h"
-
-#include "cdb/cdbgroup.h"					/* cdbpathlocus_collocates() */
-#include "cdb/cdbpath.h"
-#include "cdb/cdbsetop.h"					/* make_motion... routines */
-#include "cdb/cdbvars.h"
 
 int get_plan_share_id(Plan *p)
 {
@@ -140,6 +134,15 @@ static ShareInputScan *make_shareinputscan(PlannerInfo *root, Plan *inputplan)
 
 	Assert(IsA(inputplan, Material) || IsA(inputplan, Sort));
 
+	/*
+	 * Currently GPDB doesn't fully support shareinputscan referencing outer
+	 * rels.
+	 */
+	if (!bms_is_empty(inputplan->extParam))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("shareinputscan with outer refs is not supported by GPDB")));
+
 	sisc = makeNode(ShareInputScan);
 	incr_plan_nsharer(inputplan);
 
@@ -207,13 +210,19 @@ prepare_plan_for_sharing(PlannerInfo *root, Plan *common)
 		Material *m = make_material(common);
 		shared = (Plan *) m;
 
-		cost_material(&matpath, root, common->total_cost, common->plan_rows, common->plan_width);
+		cost_material(&matpath, root,
+					  common->startup_cost,
+					  common->total_cost,
+					  common->plan_rows,
+					  common->plan_width);
 		shared->startup_cost = matpath.startup_cost;
 		shared->total_cost = matpath.total_cost;
 		shared->plan_rows = common->plan_rows;
 		shared->plan_width = common->plan_width;
 		shared->dispatch = common->dispatch;
 		shared->flow = copyObject(common->flow); 
+		shared->extParam = bms_copy(common->extParam);
+		shared->allParam = bms_copy(common->allParam);
 
 		m->share_id = SHARE_ID_NOT_ASSIGNED;
 		m->share_type = SHARE_MATERIAL;
@@ -281,7 +290,11 @@ Cost cost_share_plan(Plan *common, PlannerInfo *root, int numpartners)
 		return common->total_cost + (sipath.total_cost - common->total_cost) * numpartners;
 	}
 
-	cost_material(&mapath, root, common->total_cost, common->plan_rows, common->plan_width);
+	cost_material(&mapath, root,
+				  common->startup_cost,
+				  common->total_cost,
+				  common->plan_rows,
+				  common->plan_width);
 	cost_shareinputscan(&sipath, root, mapath.total_cost, common->plan_rows, common->plan_width);
 
 	return mapath.total_cost + (sipath.total_cost - mapath.total_cost) * numpartners;

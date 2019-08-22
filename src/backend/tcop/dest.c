@@ -4,11 +4,11 @@
  *	  support for communication destinations
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tcop/dest.c,v 1.74 2008/11/30 20:51:25 tgl Exp $
+ *	  src/backend/tcop/dest.c
  *
  *-------------------------------------------------------------------------
  */
@@ -31,7 +31,8 @@
 #include "access/printtup.h"
 #include "access/xact.h"
 #include "commands/copy.h"
-#include "executor/executor.h"
+#include "commands/createas.h"
+#include "commands/matview.h"
 #include "executor/functions.h"
 #include "executor/tstoreReceiver.h"
 #include "libpq/libpq.h"
@@ -120,13 +121,16 @@ CreateDestReceiver(CommandDest dest)
 			return CreateTuplestoreDestReceiver();
 
 		case DestIntoRel:
-			return CreateIntoRelDestReceiver();
+			return CreateIntoRelDestReceiver(NULL);
 
 		case DestCopyOut:
 			return CreateCopyDestReceiver();
 
 		case DestSQLFunction:
 			return CreateSQLFunctionDestReceiver();
+
+		case DestTransientRel:
+			return CreateTransientRelDestReceiver(InvalidOid);
 	}
 
 	/* should never get here */
@@ -144,9 +148,10 @@ EndCommand(const char *commandTag, CommandDest dest)
 	{
 		case DestRemote:
 		case DestRemoteExecute:
+
 			/*
-			 * We assume the commandTag is plain ASCII and therefore
-			 * requires no encoding conversion.
+			 * We assume the commandTag is plain ASCII and therefore requires
+			 * no encoding conversion.
 			 */
 			pq_putmessage('C', commandTag, strlen(commandTag) + 1);
 			break;
@@ -158,6 +163,7 @@ EndCommand(const char *commandTag, CommandDest dest)
 		case DestIntoRel:
 		case DestCopyOut:
 		case DestSQLFunction:
+		case DestTransientRel:
 			break;
 	}
 }
@@ -199,6 +205,7 @@ NullCommand(CommandDest dest)
 		case DestIntoRel:
 		case DestCopyOut:
 		case DestSQLFunction:
+		case DestTransientRel:
 			break;
 	}
 }
@@ -230,6 +237,10 @@ ReadyForQuery(CommandDest dest)
 					pq_beginmessage(&buf, 'k');
 					pq_sendint64(&buf, VmemTracker_GetMaxReservedVmemBytes());
 					pq_endmessage(&buf);
+
+					pq_beginmessage(&buf, 'x');
+					pq_sendbyte(&buf, TransactionDidWriteXLog());
+					pq_endmessage(&buf);
 				}
 
 				pq_beginmessage(&buf, 'Z');
@@ -249,6 +260,7 @@ ReadyForQuery(CommandDest dest)
 		case DestIntoRel:
 		case DestCopyOut:
 		case DestSQLFunction:
+		case DestTransientRel:
 			break;
 	}
 }

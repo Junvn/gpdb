@@ -5,12 +5,12 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/execUtils.c,v 1.156 2008/07/26 19:15:35 tgl Exp $
+ *	  src/backend/executor/execUtils.c
  *
  *-------------------------------------------------------------------------
  */
@@ -47,12 +47,15 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/appendonlywriter.h"
+#include "access/relscan.h"
+#include "access/transam.h"
 #include "catalog/index.h"
 #include "executor/execdebug.h"
 #include "executor/execUtils.h"
+#include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
+#include "storage/lmgr.h"
 #include "utils/memutils.h"
-#include "utils/relcache.h"
 #include "utils/tqual.h"
 
 #include "nodes/primnodes.h"
@@ -66,17 +69,24 @@
 #include "cdb/cdbmotion.h"
 #include "cdb/cdbsreh.h"
 #include "cdb/memquota.h"
+#include "executor/instrument.h"
 #include "executor/spi.h"
 #include "utils/elog.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "storage/ipc.h"
 #include "cdb/cdbllize.h"
+#include "utils/guc.h"
 #include "utils/workfile_mgr.h"
+#include "utils/metrics_utils.h"
 
 #include "cdb/memquota.h"
 
-static void ShutdownExprContext(ExprContext *econtext);
+static bool get_last_attnums(Node *node, ProjectionInfo *projInfo);
+static bool index_recheck_constraint(Relation index, Oid *constr_procs,
+						 Datum *existing_values, bool *existing_isnull,
+						 Datum *new_values);
+static void ShutdownExprContext(ExprContext *econtext, bool isCommit);
 
 
 /* ----------------------------------------------------------------
@@ -129,9 +139,12 @@ CreateExecutorState(void)
 	 * Initialize all fields of the Executor State structure
 	 */
 	estate->es_direction = ForwardScanDirection;
-	estate->es_snapshot = SnapshotNow;
+	estate->es_snapshot = InvalidSnapshot;		/* caller must initialize this */
 	estate->es_crosscheck_snapshot = InvalidSnapshot;	/* no crosscheck */
 	estate->es_range_table = NIL;
+	estate->es_plannedstmt = NULL;
+
+	estate->es_junkFilter = NULL;
 
 	estate->es_output_cid = (CommandId) 0;
 
@@ -139,10 +152,10 @@ CreateExecutorState(void)
 	estate->es_num_result_relations = 0;
 	estate->es_result_relation_info = NULL;
 
-	estate->es_junkFilter = NULL;
-
 	estate->es_trig_target_relations = NIL;
 	estate->es_trig_tuple_slot = NULL;
+	estate->es_trig_oldtup_slot = NULL;
+	estate->es_trig_newtup_slot = NULL;
 
 	estate->es_param_list_info = NULL;
 	estate->es_param_exec_vals = NULL;
@@ -151,25 +164,26 @@ CreateExecutorState(void)
 
 	estate->es_tupleTable = NIL;
 
-	estate->es_processed = 0;
-	estate->es_lastoid = InvalidOid;
 	estate->es_rowMarks = NIL;
 
-	estate->es_instrument = false;
-	estate->es_select_into = false;
-	estate->es_into_oids = false;
+	estate->es_processed = 0;
+	estate->es_lastoid = InvalidOid;
+
+	estate->es_top_eflags = 0;
+	estate->es_instrument = 0;
+	estate->es_finished = false;
 
 	estate->es_exprcontexts = NIL;
 
 	estate->es_subplanstates = NIL;
 
+	estate->es_auxmodifytables = NIL;
+
 	estate->es_per_tuple_exprcontext = NULL;
 
-	estate->es_plannedstmt = NULL;
-	estate->es_evalPlanQual = NULL;
-	estate->es_evTupleNull = NULL;
-	estate->es_evTuple = NULL;
-	estate->es_useEvalPlan = false;
+	estate->es_epqTuple = NULL;
+	estate->es_epqTupleSet = NULL;
+	estate->es_epqScanDone = NULL;
 
 	estate->es_sliceTable = NULL;
 	estate->interconnect_context = NULL;
@@ -179,7 +193,7 @@ CreateExecutorState(void)
 	estate->es_got_eos = false;
 	estate->cancelUnfinished = false;
 
-	estate->dispatcherState = palloc0(sizeof(struct CdbDispatcherState));
+	estate->dispatcherState = NULL;
 
 	estate->currentSliceIdInPlan = 0;
 	estate->currentExecutingSliceId = 0;
@@ -193,28 +207,6 @@ CreateExecutorState(void)
 	MemoryContextSwitchTo(oldcontext);
 
 	return estate;
-}
-
-/*
- * freeDynamicTableScanInfo
- *   Free the space for DynamicTableScanInfo.
- */
-static void
-freeDynamicTableScanInfo(DynamicTableScanInfo *scanInfo)
-{
-	Assert(scanInfo != NULL);
-	
-	if (scanInfo->partsMetadata != NIL)
-	{
-		list_free_deep(scanInfo->partsMetadata);
-	}
-	
-	if (scanInfo->numSelectorsPerScanId != NIL)
-	{
-		list_free(scanInfo->numSelectorsPerScanId);
-	}
-
-	pfree(scanInfo);
 }
 
 /* ----------------
@@ -251,32 +243,13 @@ FreeExecutorState(EState *estate)
 		 * XXX: seems there ought to be a faster way to implement this than
 		 * repeated list_delete(), no?
 		 */
-		FreeExprContext((ExprContext *) linitial(estate->es_exprcontexts));
+		FreeExprContext((ExprContext *) linitial(estate->es_exprcontexts),
+						true);
 		/* FreeExprContext removed the list link for us */
 	}
 
-	if (estate->dispatcherState)
-	{
-		pfree(estate->dispatcherState);
-		estate->dispatcherState = NULL;
-	}
-
-	/*
-	 * Free dynamicTableScanInfo.
-	 */
-	if (estate->dynamicTableScanInfo != NULL)
-	{
-		freeDynamicTableScanInfo(estate->dynamicTableScanInfo);
-		estate->dynamicTableScanInfo = NULL;
-	}
-
-	/*
-	 * Greenplum: release partition-related resources (esp. TupleDesc ref counts).
-	 */
-	if (estate->es_partition_state)
-	{
-		ClearPartitionState(estate);
-	}
+	estate->dispatcherState = NULL;
+	estate->dynamicTableScanInfo = NULL;
 
 	/*
 	 * Free the per-query memory context, thereby releasing all working
@@ -425,16 +398,21 @@ CreateStandaloneExprContext(void)
  * Since we free the temporary context used for expression evaluation,
  * any previously computed pass-by-reference expression result will go away!
  *
+ * If isCommit is false, we are being called in error cleanup, and should
+ * not call callbacks but only release memory.  (It might be better to call
+ * the callbacks and pass the isCommit flag to them, but that would require
+ * more invasive code changes than currently seems justified.)
+ *
  * Note we make no assumption about the caller's memory context.
  * ----------------
  */
 void
-FreeExprContext(ExprContext *econtext)
+FreeExprContext(ExprContext *econtext, bool isCommit)
 {
 	EState	   *estate;
 
 	/* Call any registered callbacks */
-	ShutdownExprContext(econtext);
+	ShutdownExprContext(econtext, isCommit);
 	/* And clean up the memory used */
 	MemoryContextDelete(econtext->ecxt_per_tuple_memory);
 	/* Unlink self from owning EState, if any */
@@ -450,7 +428,7 @@ FreeExprContext(ExprContext *econtext)
  * ReScanExprContext
  *
  *		Reset an expression context in preparation for a rescan of its
- *		plan node.	This requires calling any registered shutdown callbacks,
+ *		plan node.  This requires calling any registered shutdown callbacks,
  *		since any partially complete set-returning-functions must be canceled.
  *
  * Note we make no assumption about the caller's memory context.
@@ -459,7 +437,7 @@ void
 ReScanExprContext(ExprContext *econtext)
 {
 	/* Call any registered callbacks */
-	ShutdownExprContext(econtext);
+	ShutdownExprContext(econtext, true);
 	/* And clean up the memory used */
 	MemoryContextReset(econtext->ecxt_per_tuple_memory);
 }
@@ -491,7 +469,7 @@ MakePerTupleExprContext(EState *estate)
 /* ----------------
  *		ExecAssignExprContext
  *
- *		This initializes the ps_ExprContext field.	It is only necessary
+ *		This initializes the ps_ExprContext field.  It is only necessary
  *		to do this for nodes which use ExecQual or ExecProject
  *		because those routines require an econtext. Other nodes that
  *		don't have to evaluate expressions don't need to do this.
@@ -537,7 +515,7 @@ ExecAssignResultTypeFromTL(PlanState *planstate)
 
 	/*
 	 * ExecTypeFromTL needs the parse-time representation of the tlist, not a
-	 * list of ExprStates.	This is good because some plan nodes don't bother
+	 * list of ExprStates.  This is good because some plan nodes don't bother
 	 * to set up planstate->targetlist ...
 	 */
 	tupDesc = ExecTypeFromTL(planstate->plan->targetlist, hasoid);
@@ -556,9 +534,6 @@ ExecGetResultType(PlanState *planstate)
 	return slot->tts_tupleDescriptor;
 }
 
-extern void
-ExecVariableList(ProjectionInfo *projInfo, Datum *values, bool *isnull);
-
 /* ----------------
  *		ExecBuildProjectionInfo
  *
@@ -568,7 +543,7 @@ ExecVariableList(ProjectionInfo *projInfo, Datum *values, bool *isnull);
  * the given tlist should be a list of ExprState nodes, not Expr nodes.
  *
  * inputDesc can be NULL, but if it is not, we check to see whether simple
- * Vars in the tlist match the descriptor.	It is important to provide
+ * Vars in the tlist match the descriptor.  It is important to provide
  * inputDesc for relation-scan plan nodes, as a cross check that the relation
  * hasn't been changed since the plan was made.  At higher levels of a plan,
  * there is no need to recheck.
@@ -581,123 +556,166 @@ ExecBuildProjectionInfo(List *targetList,
 						TupleDesc inputDesc)
 {
 	ProjectionInfo *projInfo = makeNode(ProjectionInfo);
-	int			len;
-	bool		isVarList;
+	int			len = ExecTargetListLength(targetList);
+	int		   *workspace;
+	int		   *varSlotOffsets;
+	int		   *varNumbers;
+	int		   *varOutputCols;
+	List	   *exprlist;
+	int			numSimpleVars;
+	bool		directMap;
 	ListCell   *tl;
 
-	len = ExecTargetListLength(targetList);
-
-	projInfo->pi_targetlist = targetList;
 	projInfo->pi_exprContext = econtext;
 	projInfo->pi_slot = slot;
+	/* since these are all int arrays, we need do just one palloc */
+	workspace = (int *) palloc(len * 3 * sizeof(int));
+	projInfo->pi_varSlotOffsets = varSlotOffsets = workspace;
+	projInfo->pi_varNumbers = varNumbers = workspace + len;
+	projInfo->pi_varOutputCols = varOutputCols = workspace + len * 2;
+	projInfo->pi_lastInnerVar = 0;
+	projInfo->pi_lastOuterVar = 0;
+	projInfo->pi_lastScanVar = 0;
 
 	/*
-	 * Determine whether the target list consists entirely of simple Var
-	 * references (ie, references to non-system attributes) that match the
-	 * input.  If so, we can use the simpler ExecVariableList instead of
-	 * ExecTargetList.	(Note: if there is a type mismatch then ExecEvalScalarVar
+	 * We separate the target list elements into simple Var references and
+	 * expressions which require the full ExecTargetList machinery.  To be a
+	 * simple Var, a Var has to be a user attribute and not mismatch the
+	 * inputDesc.  (Note: if there is a type mismatch then ExecEvalScalarVar
 	 * will probably throw an error at runtime, but we leave that to it.)
 	 */
-	isVarList = true;
+	exprlist = NIL;
+	numSimpleVars = 0;
+	directMap = true;
 	foreach(tl, targetList)
 	{
 		GenericExprState *gstate = (GenericExprState *) lfirst(tl);
 		Var		   *variable = (Var *) gstate->arg->expr;
-		Form_pg_attribute attr;
+		bool		isSimpleVar = false;
 
-		if (variable == NULL ||
-			!IsA(variable, Var) ||
-			variable->varattno <= 0)
+		if (variable != NULL &&
+			IsA(variable, Var) &&
+			variable->varattno > 0)
 		{
-			isVarList = false;
-			break;
+			if (!inputDesc)
+				isSimpleVar = true;		/* can't check type, assume OK */
+			else if (variable->varattno <= inputDesc->natts)
+			{
+				Form_pg_attribute attr;
+
+				attr = inputDesc->attrs[variable->varattno - 1];
+				if (!attr->attisdropped && variable->vartype == attr->atttypid)
+					isSimpleVar = true;
+			}
 		}
-		if (!inputDesc)
-			continue;			/* can't check type, assume OK */
-		if (variable->varattno > inputDesc->natts)
-		{
-			isVarList = false;
-			break;
-		}
-		attr = inputDesc->attrs[variable->varattno - 1];
-		if (attr->attisdropped || variable->vartype != attr->atttypid)
-		{
-			isVarList = false;
-			break;
-		}
-	}
-	projInfo->pi_isVarList = isVarList;
 
-	if (isVarList)
-	{
-		int		   *varSlotOffsets;
-		int		   *varNumbers;
-		AttrNumber	lastInnerVar = 0;
-		AttrNumber	lastOuterVar = 0;
-		AttrNumber	lastScanVar = 0;
-
-		projInfo->pi_itemIsDone = NULL; /* not needed */
-		projInfo->pi_varSlotOffsets = varSlotOffsets = (int *)
-			palloc0(len * sizeof(int));
-		projInfo->pi_varNumbers = varNumbers = (int *)
-			palloc0(len * sizeof(int));
-
-		/*
-		 * Set up the data needed by ExecVariableList.	The slots in which the
-		 * variables can be found at runtime are denoted by the offsets of
-		 * their slot pointers within the econtext.  This rather grotty
-		 * representation is needed because the caller may not have given us
-		 * the real econtext yet (see hacks in nodeSubplan.c).
-		 */
-		foreach(tl, targetList)
+		if (isSimpleVar)
 		{
-			GenericExprState *gstate = (GenericExprState *) lfirst(tl);
-			Var		   *variable = (Var *) gstate->arg->expr;
-			AttrNumber	attnum = variable->varattno;
 			TargetEntry *tle = (TargetEntry *) gstate->xprstate.expr;
-			AttrNumber	resind = tle->resno - 1;
+			AttrNumber	attnum = variable->varattno;
 
-			Assert(resind >= 0 && resind < len);
-			varNumbers[resind] = attnum;
+			varNumbers[numSimpleVars] = attnum;
+			varOutputCols[numSimpleVars] = tle->resno;
+			if (tle->resno != numSimpleVars + 1)
+				directMap = false;
 
 			switch (variable->varno)
 			{
-				case INNER:
-					varSlotOffsets[resind] = offsetof(ExprContext,
-													  ecxt_innertuple);
-					lastInnerVar = Max(lastInnerVar, attnum);
+				case INNER_VAR:
+					varSlotOffsets[numSimpleVars] = offsetof(ExprContext,
+															 ecxt_innertuple);
+					if (projInfo->pi_lastInnerVar < attnum)
+						projInfo->pi_lastInnerVar = attnum;
 					break;
 
-				case OUTER:
-					varSlotOffsets[resind] = offsetof(ExprContext,
-													  ecxt_outertuple);
-					lastOuterVar = Max(lastOuterVar, attnum);
+				case OUTER_VAR:
+					varSlotOffsets[numSimpleVars] = offsetof(ExprContext,
+															 ecxt_outertuple);
+					if (projInfo->pi_lastOuterVar < attnum)
+						projInfo->pi_lastOuterVar = attnum;
 					break;
+
+					/* INDEX_VAR is handled by default case */
 
 				default:
-					varSlotOffsets[resind] = offsetof(ExprContext,
-													  ecxt_scantuple);
-					lastScanVar = Max(lastScanVar, attnum);
+					varSlotOffsets[numSimpleVars] = offsetof(ExprContext,
+															 ecxt_scantuple);
+					if (projInfo->pi_lastScanVar < attnum)
+						projInfo->pi_lastScanVar = attnum;
 					break;
 			}
+			numSimpleVars++;
 		}
-		projInfo->pi_lastInnerVar = lastInnerVar;
-		projInfo->pi_lastOuterVar = lastOuterVar;
-		projInfo->pi_lastScanVar = lastScanVar;
+		else
+		{
+			/* Not a simple variable, add it to generic targetlist */
+			exprlist = lappend(exprlist, gstate);
+			/* Examine expr to include contained Vars in lastXXXVar counts */
+			get_last_attnums((Node *) variable, projInfo);
+		}
 	}
+	projInfo->pi_targetlist = exprlist;
+	projInfo->pi_numSimpleVars = numSimpleVars;
+	projInfo->pi_directMap = directMap;
+
+	if (exprlist == NIL)
+		projInfo->pi_itemIsDone = NULL; /* not needed */
 	else
-	{
 		projInfo->pi_itemIsDone = (ExprDoneCond *)
-			palloc0(len * sizeof(ExprDoneCond));
-		projInfo->pi_varSlotOffsets = NULL;
-		projInfo->pi_varNumbers = NULL;
+			palloc(len * sizeof(ExprDoneCond));
+
+	return projInfo;
+}
+
+/*
+ * get_last_attnums: expression walker for ExecBuildProjectionInfo
+ *
+ *	Update the lastXXXVar counts to be at least as large as the largest
+ *	attribute numbers found in the expression
+ */
+static bool
+get_last_attnums(Node *node, ProjectionInfo *projInfo)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *variable = (Var *) node;
+		AttrNumber	attnum = variable->varattno;
+
+		switch (variable->varno)
+		{
+			case INNER_VAR:
+				if (projInfo->pi_lastInnerVar < attnum)
+					projInfo->pi_lastInnerVar = attnum;
+				break;
+
+			case OUTER_VAR:
+				if (projInfo->pi_lastOuterVar < attnum)
+					projInfo->pi_lastOuterVar = attnum;
+				break;
+
+				/* INDEX_VAR is handled by default case */
+
+			default:
+				if (projInfo->pi_lastScanVar < attnum)
+					projInfo->pi_lastScanVar = attnum;
+				break;
+		}
+		return false;
 	}
 
-#ifdef USE_CODEGEN
-	// Set the default location for ExecVariableList
-	projInfo->ExecVariableList_gen_info.ExecVariableList_fn = ExecVariableList;
-#endif
-	return projInfo;
+	/*
+	 * Don't examine the arguments or filters of Aggrefs or WindowFuncs,
+	 * because those do not represent expressions to be evaluated within the
+	 * overall targetlist's econtext.
+	 */
+	if (IsA(node, Aggref))
+		return false;
+	if (IsA(node, WindowFunc))
+		return false;
+	return expression_tree_walker(node, get_last_attnums,
+								  (void *) projInfo);
 }
 
 /* ----------------
@@ -716,10 +734,10 @@ ExecAssignProjectionInfo(PlanState *planstate,
 	ProjectionInfo* pi = planstate->ps_ProjInfo;
 	if (NULL != pi)
 	{
-		if (NULL != pi->pi_varNumbers)
-		{
-			pfree(pi->pi_varNumbers);
-		}
+		/*
+		 * Note that pi->pi_varSlotOffsets, pi->pi_varNumbers, and
+		 * pi->pi_varOutputCols are all pointers into the same allocation.
+		 */
 		if (NULL != pi->pi_varSlotOffsets)
 		{
 			pfree(pi->pi_varSlotOffsets);
@@ -738,6 +756,7 @@ ExecAssignProjectionInfo(PlanState *planstate,
 								inputDesc);
 }
 
+
 /* ----------------
  *		ExecFreeExprContext
  *
@@ -748,7 +767,7 @@ ExecAssignProjectionInfo(PlanState *planstate,
  *
  * However ... there is no particular need to do it during ExecEndNode,
  * because FreeExecutorState will free any remaining ExprContexts within
- * the EState.	Letting FreeExecutorState do it allows the ExprContexts to
+ * the EState.  Letting FreeExecutorState do it allows the ExprContexts to
  * be freed in reverse order of creation, rather than order of creation as
  * will happen if we delete them here, which saves O(N^2) work in the list
  * cleanup inside FreeExprContext.
@@ -768,7 +787,7 @@ ExecFreeExprContext(PlanState *planstate)
  *		the following scan type support functions are for
  *		those nodes which are stubborn and return tuples in
  *		their Scan tuple slot instead of their Result tuple
- *		slot..	luck fur us, these nodes do not do projections
+ *		slot..  luck fur us, these nodes do not do projections
  *		so we don't have to worry about getting the ProjectionInfo
  *		right for them...  -cim 6/3/91
  * ----------------------------------------------------------------
@@ -854,8 +873,9 @@ ExecRelationIsTargetRelation(EState *estate, Index scanrelid)
  * ----------------------------------------------------------------
  */
 Relation
-ExecOpenScanRelation(EState *estate, Index scanrelid)
+ExecOpenScanRelation(EState *estate, Index scanrelid, int eflags)
 {
+	Relation	rel;
 	Oid			reloid;
 	LOCKMODE	lockmode;
 
@@ -875,7 +895,9 @@ ExecOpenScanRelation(EState *estate, Index scanrelid)
 		{
 			ExecRowMark *erm = lfirst(l);
 
-			if (erm->rti == scanrelid)
+			/* Keep this check in sync with InitPlan! */
+			if (erm->rti == scanrelid &&
+				erm->relation != NULL)
 			{
 				lockmode = NoLock;
 				break;
@@ -883,12 +905,24 @@ ExecOpenScanRelation(EState *estate, Index scanrelid)
 		}
 	}
 
-	/* OK, open the relation and acquire lock as needed */
+	/* Open the relation and acquire lock as needed */
 	reloid = getrelid(scanrelid, estate->es_range_table);
+	rel = heap_open(reloid, lockmode);
 
-	Assert(reloid != InvalidOid);
-	
-	return heap_open(reloid, lockmode);
+	/*
+	 * Complain if we're attempting a scan of an unscannable relation, except
+	 * when the query won't actually be run.  This is a slightly klugy place
+	 * to do this, perhaps, but there is no better place.
+	 */
+	if ((eflags & (EXEC_FLAG_EXPLAIN_ONLY | EXEC_FLAG_WITH_NO_DATA)) == 0 &&
+		!RelationIsScannable(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("materialized view \"%s\" has not been populated",
+						RelationGetRelationName(rel)),
+				 errhint("Use the REFRESH MATERIALIZED VIEW command.")));
+
+	return rel;
 }
 
 /*
@@ -1049,17 +1083,21 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *		doesn't provide the functionality needed by the
  *		executor.. -cim 9/27/89
  *
+ *		This returns a list of index OIDs for any unique or exclusion
+ *		constraints that are deferred and that had
+ *		potential (unconfirmed) conflicts.
+ *
  *		CAUTION: this must not be called for a HOT update.
  *		We can't defend against that here for lack of info.
  *		Should we change the API to make it safer?
  * ----------------------------------------------------------------
  */
-void
+List *
 ExecInsertIndexTuples(TupleTableSlot *slot,
 					  ItemPointer tupleid,
-					  EState *estate,
-					  bool is_vacuum)
+					  EState *estate)
 {
+	List	   *result = NIL;
 	ResultRelInfo *resultRelInfo;
 	int			i;
 	int			numIndices;
@@ -1093,9 +1131,12 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 	 */
 	for (i = 0; i < numIndices; i++)
 	{
+		Relation	indexRelation = relationDescs[i];
 		IndexInfo  *indexInfo;
+		IndexUniqueCheck checkUnique;
+		bool		satisfiesConstraint;
 
-		if (relationDescs[i] == NULL)
+		if (indexRelation == NULL)
 			continue;
 
 		indexInfo = indexInfoArray[i];
@@ -1138,18 +1179,309 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 					   isnull);
 
 		/*
-		 * The index AM does the rest.	Note we suppress unique-index checks
-		 * if we are being called from VACUUM, since VACUUM may need to move
-		 * dead tuples that have the same keys as live ones.
+		 * The index AM does the actual insertion, plus uniqueness checking.
+		 *
+		 * For an immediate-mode unique index, we just tell the index AM to
+		 * throw error if not unique.
+		 *
+		 * For a deferrable unique index, we tell the index AM to just detect
+		 * possible non-uniqueness, and we add the index OID to the result
+		 * list if further checking is needed.
 		 */
-		index_insert(relationDescs[i],	/* index relation */
-					 values,	/* array of index Datums */
-					 isnull,	/* null flags */
-					 tupleid,	/* tid of heap tuple */
-					 heapRelation,
-					 relationDescs[i]->rd_index->indisunique && !is_vacuum);
+		if (!indexRelation->rd_index->indisunique)
+			checkUnique = UNIQUE_CHECK_NO;
+		else if (indexRelation->rd_index->indimmediate)
+			checkUnique = UNIQUE_CHECK_YES;
+		else
+			checkUnique = UNIQUE_CHECK_PARTIAL;
 
+		satisfiesConstraint =
+			index_insert(indexRelation, /* index relation */
+						 values,	/* array of index Datums */
+						 isnull,	/* null flags */
+						 tupleid,		/* tid of heap tuple */
+						 heapRelation,	/* heap relation */
+						 checkUnique);	/* type of uniqueness check to do */
+
+		/*
+		 * If the index has an associated exclusion constraint, check that.
+		 * This is simpler than the process for uniqueness checks since we
+		 * always insert first and then check.  If the constraint is deferred,
+		 * we check now anyway, but don't throw error on violation; instead
+		 * we'll queue a recheck event.
+		 *
+		 * An index for an exclusion constraint can't also be UNIQUE (not an
+		 * essential property, we just don't allow it in the grammar), so no
+		 * need to preserve the prior state of satisfiesConstraint.
+		 */
+		if (indexInfo->ii_ExclusionOps != NULL)
+		{
+			bool		errorOK = !indexRelation->rd_index->indimmediate;
+
+			satisfiesConstraint =
+				check_exclusion_constraint(heapRelation,
+										   indexRelation, indexInfo,
+										   tupleid, values, isnull,
+										   estate, false, errorOK);
+		}
+
+		if ((checkUnique == UNIQUE_CHECK_PARTIAL ||
+			 indexInfo->ii_ExclusionOps != NULL) &&
+			!satisfiesConstraint)
+		{
+			/*
+			 * The tuple potentially violates the uniqueness or exclusion
+			 * constraint, so make a note of the index so that we can re-check
+			 * it later.
+			 */
+			result = lappend_oid(result, RelationGetRelid(indexRelation));
+		}
 	}
+
+	return result;
+}
+
+/*
+ * Check for violation of an exclusion constraint
+ *
+ * heap: the table containing the new tuple
+ * index: the index supporting the exclusion constraint
+ * indexInfo: info about the index, including the exclusion properties
+ * tupleid: heap TID of the new tuple we have just inserted
+ * values, isnull: the *index* column values computed for the new tuple
+ * estate: an EState we can do evaluation in
+ * newIndex: if true, we are trying to build a new index (this affects
+ *		only the wording of error messages)
+ * errorOK: if true, don't throw error for violation
+ *
+ * Returns true if OK, false if actual or potential violation
+ *
+ * When errorOK is true, we report violation without waiting to see if any
+ * concurrent transaction has committed or not; so the violation is only
+ * potential, and the caller must recheck sometime later.  This behavior
+ * is convenient for deferred exclusion checks; we need not bother queuing
+ * a deferred event if there is definitely no conflict at insertion time.
+ *
+ * When errorOK is false, we'll throw error on violation, so a false result
+ * is impossible.
+ */
+bool
+check_exclusion_constraint(Relation heap, Relation index, IndexInfo *indexInfo,
+						   ItemPointer tupleid, Datum *values, bool *isnull,
+						   EState *estate, bool newIndex, bool errorOK)
+{
+	Oid		   *constr_procs = indexInfo->ii_ExclusionProcs;
+	uint16	   *constr_strats = indexInfo->ii_ExclusionStrats;
+	Oid		   *index_collations = index->rd_indcollation;
+	int			index_natts = index->rd_index->indnatts;
+	IndexScanDesc index_scan;
+	HeapTuple	tup;
+	ScanKeyData scankeys[INDEX_MAX_KEYS];
+	SnapshotData DirtySnapshot;
+	int			i;
+	bool		conflict;
+	bool		found_self;
+	ExprContext *econtext;
+	TupleTableSlot *existing_slot;
+	TupleTableSlot *save_scantuple;
+
+	/*
+	 * If any of the input values are NULL, the constraint check is assumed to
+	 * pass (i.e., we assume the operators are strict).
+	 */
+	for (i = 0; i < index_natts; i++)
+	{
+		if (isnull[i])
+			return true;
+	}
+
+	/*
+	 * Search the tuples that are in the index for any violations, including
+	 * tuples that aren't visible yet.
+	 */
+	InitDirtySnapshot(DirtySnapshot);
+
+	for (i = 0; i < index_natts; i++)
+	{
+		ScanKeyEntryInitialize(&scankeys[i],
+							   0,
+							   i + 1,
+							   constr_strats[i],
+							   InvalidOid,
+							   index_collations[i],
+							   constr_procs[i],
+							   values[i]);
+	}
+
+	/*
+	 * Need a TupleTableSlot to put existing tuples in.
+	 *
+	 * To use FormIndexDatum, we have to make the econtext's scantuple point
+	 * to this slot.  Be sure to save and restore caller's value for
+	 * scantuple.
+	 */
+	existing_slot = MakeSingleTupleTableSlot(RelationGetDescr(heap));
+
+	econtext = GetPerTupleExprContext(estate);
+	save_scantuple = econtext->ecxt_scantuple;
+	econtext->ecxt_scantuple = existing_slot;
+
+	/*
+	 * May have to restart scan from this point if a potential conflict is
+	 * found.
+	 */
+retry:
+	conflict = false;
+	found_self = false;
+	index_scan = index_beginscan(heap, index, &DirtySnapshot, index_natts, 0);
+	index_rescan(index_scan, scankeys, index_natts, NULL, 0);
+
+	while ((tup = index_getnext(index_scan,
+								ForwardScanDirection)) != NULL)
+	{
+		TransactionId xwait;
+		ItemPointerData ctid_wait;
+		Datum		existing_values[INDEX_MAX_KEYS];
+		bool		existing_isnull[INDEX_MAX_KEYS];
+		char	   *error_new;
+		char	   *error_existing;
+
+		/*
+		 * Ignore the entry for the tuple we're trying to check.
+		 */
+		if (ItemPointerEquals(tupleid, &tup->t_self))
+		{
+			if (found_self)		/* should not happen */
+				elog(ERROR, "found self tuple multiple times in index \"%s\"",
+					 RelationGetRelationName(index));
+			found_self = true;
+			continue;
+		}
+
+		/*
+		 * Extract the index column values and isnull flags from the existing
+		 * tuple.
+		 */
+		ExecStoreHeapTuple(tup,	existing_slot, InvalidBuffer, false);
+		FormIndexDatum(indexInfo, existing_slot, estate,
+					   existing_values, existing_isnull);
+
+		/* If lossy indexscan, must recheck the condition */
+		if (index_scan->xs_recheck)
+		{
+			if (!index_recheck_constraint(index,
+										  constr_procs,
+										  existing_values,
+										  existing_isnull,
+										  values))
+				continue;		/* tuple doesn't actually match, so no
+								 * conflict */
+		}
+
+		/*
+		 * At this point we have either a conflict or a potential conflict. If
+		 * we're not supposed to raise error, just return the fact of the
+		 * potential conflict without waiting to see if it's real.
+		 */
+		if (errorOK)
+		{
+			conflict = true;
+			break;
+		}
+
+		/*
+		 * If an in-progress transaction is affecting the visibility of this
+		 * tuple, we need to wait for it to complete and then recheck.  For
+		 * simplicity we do rechecking by just restarting the whole scan ---
+		 * this case probably doesn't happen often enough to be worth trying
+		 * harder, and anyway we don't want to hold any index internal locks
+		 * while waiting.
+		 */
+		xwait = TransactionIdIsValid(DirtySnapshot.xmin) ?
+			DirtySnapshot.xmin : DirtySnapshot.xmax;
+
+		if (TransactionIdIsValid(xwait))
+		{
+			ctid_wait = tup->t_data->t_ctid;
+			index_endscan(index_scan);
+			XactLockTableWait(xwait, heap, &ctid_wait,
+							  XLTW_RecheckExclusionConstr);
+			goto retry;
+		}
+
+		/*
+		 * We have a definite conflict.  Report it.
+		 */
+		error_new = BuildIndexValueDescription(index, values, isnull);
+		error_existing = BuildIndexValueDescription(index, existing_values,
+													existing_isnull);
+		if (newIndex)
+			ereport(ERROR,
+					(errcode(ERRCODE_EXCLUSION_VIOLATION),
+					 errmsg("could not create exclusion constraint \"%s\"",
+							RelationGetRelationName(index)),
+					 error_new && error_existing ?
+						errdetail("Key %s conflicts with key %s.",
+								  error_new, error_existing) :
+						errdetail("Key conflicts exist."),
+					 errtableconstraint(heap,
+										RelationGetRelationName(index))));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_EXCLUSION_VIOLATION),
+					 errmsg("conflicting key value violates exclusion constraint \"%s\"",
+							RelationGetRelationName(index)),
+					 error_new && error_existing ?
+						errdetail("Key %s conflicts with existing key %s.",
+								  error_new, error_existing) :
+						errdetail("Key conflicts with existing key."),
+					 errtableconstraint(heap,
+										RelationGetRelationName(index))));
+	}
+
+	index_endscan(index_scan);
+
+	/*
+	 * Ordinarily, at this point the search should have found the originally
+	 * inserted tuple, unless we exited the loop early because of conflict.
+	 * However, it is possible to define exclusion constraints for which that
+	 * wouldn't be true --- for instance, if the operator is <>. So we no
+	 * longer complain if found_self is still false.
+	 */
+
+	econtext->ecxt_scantuple = save_scantuple;
+
+	ExecDropSingleTupleTableSlot(existing_slot);
+
+	return !conflict;
+}
+
+/*
+ * Check existing tuple's index values to see if it really matches the
+ * exclusion condition against the new_values.  Returns true if conflict.
+ */
+static bool
+index_recheck_constraint(Relation index, Oid *constr_procs,
+						 Datum *existing_values, bool *existing_isnull,
+						 Datum *new_values)
+{
+	int			index_natts = index->rd_index->indnatts;
+	int			i;
+
+	for (i = 0; i < index_natts; i++)
+	{
+		/* Assume the exclusion operators are strict */
+		if (existing_isnull[i])
+			return false;
+
+		if (!DatumGetBool(OidFunctionCall2Coll(constr_procs[i],
+											   index->rd_indcollation[i],
+											   existing_values[i],
+											   new_values[i])))
+			return false;
+	}
+
+	return true;
 }
 
 /*
@@ -1172,7 +1504,7 @@ ExecUpdateAOtupCount(ResultRelInfo *result_rels,
 
 	for (i = num_result_rels; i > 0; i--)
 	{
-		if(RelationIsAoRows(result_rels->ri_RelationDesc) || RelationIsAoCols(result_rels->ri_RelationDesc))
+		if(RelationIsAppendOptimized(result_rels->ri_RelationDesc))
 		{
 			Assert(result_rels->ri_aosegno != InvalidFileSegNumber);
 
@@ -1285,9 +1617,12 @@ UnregisterExprContextCallback(ExprContext *econtext,
  *
  * The callback list is emptied (important in case this is only a rescan
  * reset, and not deletion of the ExprContext).
+ *
+ * If isCommit is false, just clean the callback list but don't call 'em.
+ * (See comment for FreeExprContext.)
  */
 static void
-ShutdownExprContext(ExprContext *econtext)
+ShutdownExprContext(ExprContext *econtext, bool isCommit)
 {
 	ExprContext_CB *ecxt_callback;
 	MemoryContext oldcontext;
@@ -1308,7 +1643,8 @@ ShutdownExprContext(ExprContext *econtext)
 	while ((ecxt_callback = econtext->ecxt_callbacks) != NULL)
 	{
 		econtext->ecxt_callbacks = ecxt_callback->next;
-		(*ecxt_callback->function) (ecxt_callback->arg);
+		if (isCommit)
+			(*ecxt_callback->function) (ecxt_callback->arg);
 		pfree(ecxt_callback);
 	}
 
@@ -1346,6 +1682,87 @@ ExecGetShareNodeEntry(EState* estate, int shareidx, bool fCreate)
 	return (ShareNodeEntry *) list_nth(*estate->es_sharenode, shareidx);
 }
 
+/*
+ * Prefetch JoinQual to prevent motion hazard.
+ *
+ * A motion hazard is a deadlock between motions, a classic motion hazard in a
+ * join executor is formed by its inner and outer motions, it can be prevented
+ * by prefetching the inner plan, refer to motion_sanity_check() for details.
+ *
+ * A similar motion hazard can be formed by the outer motion and the join qual
+ * motion.  A join executor fetches a outer tuple, filters it with the join
+ * qual, then repeat the process on all the outer tuples.  When there are
+ * motions in both outer plan and the join qual then below state is possible:
+ *
+ * 0. processes A and B belong to the join slice, process C belongs to the
+ *    outer slice, process D belongs to the JoinQual slice;
+ * 1. A has read the first outer tuple and is fetching tuples from D;
+ * 2. D is waiting for ACK from B;
+ * 3. B is fetching the first outer tuple from C;
+ * 4. C is waiting for ACK from A;
+ *
+ * So a deadlock is formed A->D->B->C->A.  We can prevent it also by
+ * prefetching the join qual.
+ *
+ * An example is demonstrated and explained in test case
+ * src/test/regress/sql/deadlock2.sql.
+ *
+ * Return true if the JoinQual is prefetched.
+ */
+bool
+ExecPrefetchJoinQual(JoinState *node)
+{
+	EState	   *estate = node->ps.state;
+	ExprContext *econtext = node->ps.ps_ExprContext;
+	PlanState  *inner = innerPlanState(node);
+	PlanState  *outer = outerPlanState(node);
+	List	   *joinqual = node->joinqual;
+	TupleTableSlot *innertuple = econtext->ecxt_innertuple;
+
+	if (!joinqual)
+		return false;
+
+	/* Outer tuples should not be fetched before us */
+	Assert(econtext->ecxt_outertuple == NULL);
+
+	/* Build fake inner & outer tuples */
+	econtext->ecxt_innertuple = ExecInitNullTupleSlot(estate,
+													  ExecGetResultType(inner));
+	econtext->ecxt_outertuple = ExecInitNullTupleSlot(estate,
+													  ExecGetResultType(outer));
+
+	/* Fetch subplan with the fake inner & outer tuples */
+	ExecQual(joinqual, econtext, false);
+
+	/* Restore previous state */
+	econtext->ecxt_innertuple = innertuple;
+	econtext->ecxt_outertuple = NULL;
+
+	return true;
+}
+
+/*
+ * Decide if should prefetch joinqual.
+ *
+ * Joinqual should be prefetched when both outer and joinqual contain motions.
+ * In create_*join_plan() functions we set prefetch_joinqual according to the
+ * outer motions, now we detect for joinqual motions to make the final
+ * decision.
+ *
+ * See ExecPrefetchJoinQual() for details.
+ *
+ * This function should be called in ExecInit*Join() functions.
+ *
+ * Return true if JoinQual should be prefetched.
+ */
+bool
+ShouldPrefetchJoinQual(EState *estate, Join *join)
+{
+	return (join->prefetch_joinqual &&
+			findSenderMotion(estate->es_plannedstmt,
+							 estate->currentSliceIdInPlan));
+}
+
 /* ----------------------------------------------------------------
  *		CDB Slice Table utilities
  * ----------------------------------------------------------------
@@ -1365,18 +1782,25 @@ InitSliceTable(EState *estate, int nMotions, int nSubplans)
 				n;
 	MemoryContext oldcontext;
 
+	n = 1 + nMotions + nSubplans;
+
+	if (gp_max_slices > 0 && n > gp_max_slices)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("at most %d slices are allowed in a query, current number: %d", gp_max_slices, n),
+				 errhint("rewrite your query or adjust GUC gp_max_slices")));
+
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
 	table = makeNode(SliceTable);
 	table->nMotions = nMotions;
 	table->nInitPlans = nSubplans;
 	table->slices = NIL;
-    table->doInstrument = false;
+	table->instrument_options = INSTRUMENT_NONE;
 
 	/* Each slice table has a unique-id. */
 	table->ic_instance_id = ++gp_interconnect_id;
 
-	n = 1 + nMotions + nSubplans;
 	for (i = 0; i < n; i++)
 	{
 		slice = makeNode(Slice);
@@ -1385,7 +1809,7 @@ InitSliceTable(EState *estate, int nMotions, int nSubplans)
         slice->rootIndex = (i > 0 && i <= nMotions) ? -1 : i;
 		slice->gangType = GANGTYPE_UNALLOCATED;
 		slice->gangSize = 0;
-		slice->numGangMembersToBeActive = 0;
+		slice->segments = NIL;
 		slice->directDispatch.isDirectDispatch = false;
 		slice->directDispatch.contentIds = NIL;
 		slice->primaryGang = NULL;
@@ -1456,13 +1880,11 @@ sliceCalculateNumSendingProcesses(Slice *slice)
 			return 1; /* on segment */
 
 		case GANGTYPE_PRIMARY_WRITER:
-			return 0; /* writers don't send */
-
 		case GANGTYPE_PRIMARY_READER:
 			if (slice->directDispatch.isDirectDispatch)
 				return list_length(slice->directDispatch.contentIds);
 			else
-				return getgpsegmentCount();
+				return slice->gangSize;
 
 		default:
 			Insist(false);
@@ -1470,110 +1892,8 @@ sliceCalculateNumSendingProcesses(Slice *slice)
 	}
 }
 
-/* Assign gang descriptions to the root slices of the slice forest.
- *
- * The root slices of initPlan slice trees will always run on the QD,
- * which, for the time being, we represent as
- *
- *	  (gangType, gangSize) = <GANGTYPE_UNALLOCATED, 0>.
- *
- * The root slice of the main plan wil run on the QD in case it's a
- * SELECT,	but will run on QE(s) in case it's an INSERT, UPDATE, or
- * DELETE. Because we restrict UPDATE and DELETE to have no motions
- * (i.e., one slice) and because INSERT must always route tuples,
- * the assigment for these will be primary and mirror writer gangs,
- * which we represent as
- *
- *	  (gangType, gangSize) =  <GANGTYPE_PRIMARY_WRITER, N>
- */
-void
-InitRootSlices(QueryDesc *queryDesc)
-{
-	EState	   *estate = queryDesc->estate;
-	SliceTable *sliceTable = estate->es_sliceTable;
-	ListCell   *cell;
-	Slice	   *slice;
-	int			i;
-
-	foreach(cell, sliceTable->slices)
-	{
-		slice = (Slice *) lfirst(cell);
-		i = slice->sliceIndex;
-		if (i == 0)
-		{
-			/* Main plan root slice */
-			switch (queryDesc->operation)
-			{
-				case CMD_SELECT:
-					Assert(slice->gangType == GANGTYPE_UNALLOCATED && slice->gangSize == 0);
-					if (queryDesc->plannedstmt->intoClause != NULL)
-					{
-						slice->gangType = GANGTYPE_PRIMARY_WRITER;
-						slice->gangSize = getgpsegmentCount();
-						slice->numGangMembersToBeActive = sliceCalculateNumSendingProcesses(slice);
-					}
-					break;
-
-				case CMD_INSERT:
-				case CMD_UPDATE:
-				case CMD_DELETE:
-				{
-					/* if updating a master-only table: do not dispatch to segments */
-					List *resultRelations = queryDesc->plannedstmt->resultRelations;
-					Assert(list_length(resultRelations) > 0);
-					int idx = list_nth_int(resultRelations, 0);
-					Assert (idx > 0);
-					Oid reloid = getrelid(idx, queryDesc->plannedstmt->rtable);
-					if (GpPolicyFetch(CurrentMemoryContext, reloid)->ptype != POLICYTYPE_ENTRY)
-					{
-						slice->gangType = GANGTYPE_PRIMARY_WRITER;
-						slice->gangSize = getgpsegmentCount();
-						slice->numGangMembersToBeActive = sliceCalculateNumSendingProcesses(slice);
-			        }
-			        /* else: result relation is master-only, so top slice should run on the QD and not be dispatched */
-					break;
-				}
-				default:
-					Assert(FALSE);
-			}
-		}
-		if (i <= sliceTable->nMotions)
-		{
-			/* Non-root slice */
-			continue;
-		}
-		else
-		{
-			/* InitPlan root slice */
-			Assert(slice->gangType == GANGTYPE_UNALLOCATED && slice->gangSize == 0);
-		}
-	}
-}
-
-/*
- * Context for AssignGangs() and helper functions.
- */
-typedef struct SliceReq
-{
-	int			numNgangs;
-	int			num1gangs_primary_reader;
-    int         num1gangs_entrydb_reader;
-	int			nxtNgang;
-	int			nxt1gang_primary_reader;
-	int			nxt1gang_entrydb_reader;
-	Gang	  **vecNgangs;
-	Gang	  **vec1gangs_primary_reader;
-	Gang	  **vec1gangs_entrydb_reader;
-	bool		writer;
-
-}	SliceReq;
-
 /* Forward declarations */
-static void InitSliceReq(SliceReq * req);
-static void AccumSliceReq(SliceReq * inv, SliceReq * req);
-static void InventorySliceTree(Slice ** sliceMap, int sliceIndex, SliceReq * req);
-static void AssociateSlicesToProcesses(Slice ** sliceMap, int sliceIndex, SliceReq * req);
-
+static void InventorySliceTree(CdbDispatcherState *ds, List * slices, int sliceIndex);
 
 /*
  * Function AssignGangs runs on the QD and finishes construction of the
@@ -1582,7 +1902,7 @@ static void AssociateSlicesToProcesses(Slice ** sliceMap, int sliceIndex, SliceR
  *
  * On entry, the slice table (at queryDesc->estate->es_sliceTable) has
  * the correct structure (established by InitSliceTable) and has correct
- * gang types (established by function InitRootSlices).
+ * gang types (established by function FillSliceTable).
  *
  * Gang assignment involves taking an inventory of the requirements of
  * each slice tree in the slice table, asking the executor factory to
@@ -1594,139 +1914,27 @@ static void AssociateSlicesToProcesses(Slice ** sliceMap, int sliceIndex, SliceR
  * slice in the slice table.
  */
 void
-AssignGangs(QueryDesc *queryDesc)
+AssignGangs(CdbDispatcherState *ds, QueryDesc *queryDesc)
 {
-	EState	   *estate = queryDesc->estate;
-	SliceTable *sliceTable = estate->es_sliceTable;
-	ListCell   *cell;
-	Slice	   *slice;
-	int			i,
-				nslices;
-	Slice	  **sliceMap;
-	SliceReq	req,
-				inv;
+	SliceTable	*sliceTable;
+	ListCell  	*cell;
+	Slice		*slice;
+	EState		*estate;
+	int			rootIdx;
 
-	/* Make a map so we can access slices quickly by index. */
-	nslices = list_length(sliceTable->slices);
-	sliceMap = (Slice **) palloc(nslices * sizeof(Slice *));
-	i = 0;
+	estate = queryDesc->estate;
+	sliceTable = estate->es_sliceTable;
+	rootIdx = RootSliceIndex(queryDesc->estate);
+
+	/* cleanup processMap because initPlan and main Plan share the same slice table */
 	foreach(cell, sliceTable->slices)
 	{
 		slice = (Slice *) lfirst(cell);
-		Assert(i == slice->sliceIndex);
-		sliceMap[i] = slice;
-		i++;
+		slice->processesMap = NULL;
 	}
 
-	/* Initialize gang requirement inventory */
-	InitSliceReq(&inv);
-
-	/* Capture main slice tree requirement. */
-	InventorySliceTree(sliceMap, 0, &inv);
-
-	/* Capture initPlan slice tree requirements. */
-	for (i = sliceTable->nMotions + 1; i < nslices; i++)
-	{
-		InitSliceReq(&req);
-		InventorySliceTree(sliceMap, i, &req);
-		AccumSliceReq(&inv, &req);
-	}
-
-	/*
-	 * Get the gangs we'll use.
-	 *
-	 * As a general rule the first gang is a writer and the rest are readers.
-	 * If this happens to be an extended query protocol then all gangs are readers.
-	 */
-	if (inv.numNgangs > 0)
-	{
-		inv.vecNgangs = (Gang **) palloc(sizeof(Gang *) * inv.numNgangs);
-		for (i = 0; i < inv.numNgangs; i++)
-		{
-			if (i == 0 && !queryDesc->extended_query)
-			{
-				inv.vecNgangs[i] = AllocateWriterGang();
-
-				Assert(inv.vecNgangs[i] != NULL);
-			}
-			else
-			{
-				inv.vecNgangs[i] = AllocateReaderGang(GANGTYPE_PRIMARY_READER, queryDesc->portal_name);
-			}
-		}
-	}
-	if (inv.num1gangs_primary_reader > 0)
-	{
-		inv.vec1gangs_primary_reader = (Gang **) palloc(sizeof(Gang *) * inv.num1gangs_primary_reader);
-		for (i = 0; i < inv.num1gangs_primary_reader; i++)
-		{
-			inv.vec1gangs_primary_reader[i] = AllocateReaderGang(GANGTYPE_SINGLETON_READER, queryDesc->portal_name);
-		}
-	}
-	if (inv.num1gangs_entrydb_reader > 0)
-	{
-		inv.vec1gangs_entrydb_reader = (Gang **) palloc(sizeof(Gang *) * inv.num1gangs_entrydb_reader);
-		for (i = 0; i < inv.num1gangs_entrydb_reader; i++)
-		{
-			inv.vec1gangs_entrydb_reader[i] = AllocateReaderGang(GANGTYPE_ENTRYDB_READER, queryDesc->portal_name);
-		}
-	}
-
-	/* Use the gangs to construct the CdbProcess lists in slices. */
-	inv.nxtNgang = 0;
-    inv.nxt1gang_primary_reader = 0;
-    inv.nxt1gang_entrydb_reader = 0;
-	AssociateSlicesToProcesses(sliceMap, 0, &inv);		/* Main tree. */
-
-	for (i = sliceTable->nMotions + 1; i < nslices; i++)
-	{
-		inv.nxtNgang = 0;
-        inv.nxt1gang_primary_reader = 0;
-        inv.nxt1gang_entrydb_reader = 0;
-		AssociateSlicesToProcesses(sliceMap, i, &inv);	/* An initPlan */
-	}
-
-	/* Clean up */
-	pfree(sliceMap);
-	if (inv.vecNgangs != NULL)
-		pfree(inv.vecNgangs);
-	if (inv.vec1gangs_primary_reader != NULL)
-		pfree(inv.vec1gangs_primary_reader);
-	if (inv.vec1gangs_entrydb_reader != NULL)
-		pfree(inv.vec1gangs_entrydb_reader);
-
+	InventorySliceTree(ds, sliceTable->slices, rootIdx);
 }
-
-void
-ReleaseGangs(QueryDesc *queryDesc)
-{
-	Assert(queryDesc != NULL);
-
-	freeGangsForPortal(queryDesc->portal_name);
-}
-
-
-void
-InitSliceReq(SliceReq * req)
-{
-	req->numNgangs = 0;
-    req->num1gangs_primary_reader = 0;
-    req->num1gangs_entrydb_reader = 0;
-	req->writer = FALSE;
-	req->vecNgangs = NULL;
-	req->vec1gangs_primary_reader = NULL;
-	req->vec1gangs_entrydb_reader = NULL;
-}
-
-void
-AccumSliceReq(SliceReq * inv, SliceReq * req)
-{
-	inv->numNgangs = Max(inv->numNgangs, req->numNgangs);
-	inv->num1gangs_primary_reader = Max(inv->num1gangs_primary_reader, req->num1gangs_primary_reader);
-	inv->num1gangs_entrydb_reader = Max(inv->num1gangs_entrydb_reader, req->num1gangs_entrydb_reader);
-	inv->writer = (inv->writer || req->writer);
-}
-
 
 /*
  * Helper for AssignGangs takes a simple inventory of the gangs required
@@ -1734,125 +1942,28 @@ AccumSliceReq(SliceReq * inv, SliceReq * req)
  * generally useful.
  */
 void
-InventorySliceTree(Slice ** sliceMap, int sliceIndex, SliceReq * req)
+InventorySliceTree(CdbDispatcherState *ds, List *slices, int sliceIndex)
 {
-	ListCell   *cell;
-	int			childIndex;
-	Slice	   *slice = sliceMap[sliceIndex];
+	ListCell *cell;
+	int childIndex;
+	Slice *slice = list_nth(slices, sliceIndex);
 
-	switch (slice->gangType)
+	if (slice->gangType == GANGTYPE_UNALLOCATED)
 	{
-		case GANGTYPE_UNALLOCATED:
-			/* Roots that run on the  QD don't need a gang. */
-			break;
-
-		case GANGTYPE_ENTRYDB_READER:
-            Assert(slice->gangSize == 1);
-			req->num1gangs_entrydb_reader++;
-			break;
-
-		case GANGTYPE_SINGLETON_READER:
-			req->num1gangs_primary_reader++;
-			break;
-
-		case GANGTYPE_PRIMARY_WRITER:
-			req->writer = TRUE;
-			/* fall through */
-
-		case GANGTYPE_PRIMARY_READER:
-			Assert(slice->gangSize == getgpsegmentCount());
-			req->numNgangs++;
-			break;
+		slice->primaryGang = NULL;
+		slice->primaryProcesses = getCdbProcessesForQD(true);
+	}
+	else
+	{
+		Assert(slice->segments != NIL);
+		slice->primaryGang = AllocateGang(ds, slice->gangType, slice->segments);
+		setupCdbProcessList(slice);
 	}
 
 	foreach(cell, slice->children)
 	{
 		childIndex = lfirst_int(cell);
-		InventorySliceTree(sliceMap, childIndex, req);
-	}
-}
-
-
-#ifdef USE_ASSERT_CHECKING
-static int
-countNonNullValues(List *list)
-{
-	int res = 0;
-	ListCell *lc;
-
-	foreach(lc,list)
-		if ( lfirst(lc) != NULL)
-			res++;
-	return res;
-}
-#endif
-
-/*
- * Helper for AssignGangs uses the gangs in the inventory to fill in the
- * CdbProcess lists in the slice tree.	Recursive.	Closely coupled with
- * AssignGangs.  Not generally useful.
- */
-void
-AssociateSlicesToProcesses(Slice ** sliceMap, int sliceIndex, SliceReq * req)
-{
-	ListCell   *cell;
-	int			childIndex;
-	Slice	   *slice = sliceMap[sliceIndex];
-
-	switch (slice->gangType)
-	{
-		case GANGTYPE_UNALLOCATED:
-			/* Roots that run on the  QD don't need a gang. */
-
-			slice->primaryGang = NULL;
-			slice->primaryProcesses = getCdbProcessesForQD(true);
-			break;
-
-		case GANGTYPE_ENTRYDB_READER:
-			Assert(slice->gangSize == 1);
-			slice->primaryGang = req->vec1gangs_entrydb_reader[req->nxt1gang_entrydb_reader++];
-			Assert(slice->primaryGang != NULL);
-			slice->primaryProcesses = getCdbProcessList(slice->primaryGang,
-                                                        slice->sliceIndex,
-														NULL);
-			Assert(sliceCalculateNumSendingProcesses(slice) == countNonNullValues(slice->primaryProcesses));
-			break;
-
-		case GANGTYPE_PRIMARY_WRITER:
-			Assert(slice->gangSize == getgpsegmentCount());
-			Assert(req->numNgangs > 0 && req->nxtNgang == 0 && req->writer);
-			Assert(req->vecNgangs[0] != NULL);
-
-			slice->primaryGang = req->vecNgangs[req->nxtNgang++];
-			Assert(slice->primaryGang != NULL);
-			slice->primaryProcesses = getCdbProcessList(slice->primaryGang, slice->sliceIndex, &slice->directDispatch);
-			break;
-
-		case GANGTYPE_SINGLETON_READER:
-			Assert(slice->gangSize == 1);
-			slice->primaryGang = req->vec1gangs_primary_reader[req->nxt1gang_primary_reader++];
-			Assert(slice->primaryGang != NULL);
-			slice->primaryProcesses = getCdbProcessList(slice->primaryGang,
-                                                        slice->sliceIndex,
-                                                        &slice->directDispatch);
-			Assert(sliceCalculateNumSendingProcesses(slice) == countNonNullValues(slice->primaryProcesses));
-			break;
-
-		case GANGTYPE_PRIMARY_READER:
-			Assert(slice->gangSize == getgpsegmentCount());
-			slice->primaryGang = req->vecNgangs[req->nxtNgang++];
-			Assert(slice->primaryGang != NULL);
-			slice->primaryProcesses = getCdbProcessList(slice->primaryGang,
-                                                        slice->sliceIndex,
-                                                        &slice->directDispatch);
-			Assert(sliceCalculateNumSendingProcesses(slice) == countNonNullValues(slice->primaryProcesses));
-			break;
-	}
-
-	foreach(cell, slice->children)
-	{
-		childIndex = lfirst_int(cell);
-		AssociateSlicesToProcesses(sliceMap, childIndex, req);
+		InventorySliceTree(ds, slices, childIndex);
 	}
 }
 
@@ -1931,11 +2042,13 @@ void mppExecutorFinishup(QueryDesc *queryDesc)
 	/*
 	 * If QD, wait for QEs to finish and check their results.
 	 */
-	if (estate->dispatcherState->primaryResults)
+	if (estate->dispatcherState && estate->dispatcherState->primaryResults)
 	{
-		CdbDispatchResults *pr = estate->dispatcherState->primaryResults;
-		HTAB 			   *aopartcounts = NULL;
-		DispatchWaitMode	waitMode = DISPATCH_WAIT_NONE;
+		CdbDispatchResults *pr = NULL;
+		CdbDispatcherState *ds = estate->dispatcherState;
+		DispatchWaitMode waitMode = DISPATCH_WAIT_NONE;
+		ErrorData *qeError = NULL;
+		HTAB *aopartcounts = NULL;
 
 		/*
 		 * If we are finishing a query before all the tuples of the query
@@ -1955,16 +2068,29 @@ void mppExecutorFinishup(QueryDesc *queryDesc)
 		 */
 		if (estate->cancelUnfinished)
 			waitMode = DISPATCH_WAIT_FINISH;
-		CdbCheckDispatchResult(estate->dispatcherState, waitMode);
+
+		cdbdisp_checkDispatchResult(ds, waitMode);
+
+		pr = cdbdisp_getDispatchResults(ds, &qeError);		
+
+		if (qeError)
+		{
+			estate->dispatcherState = NULL;
+			cdbdisp_destroyDispatcherState(ds);
+			ReThrowError(qeError);
+		}
 
 		/* If top slice was delegated to QEs, get num of rows processed. */
-		if (sliceRunsOnQE(currentSlice))
+		int primaryWriterSliceIndex = PrimaryWriterSliceIndex(estate);
+		//if (sliceRunsOnQE(currentSlice))
 		{
 			estate->es_processed +=
-				cdbdisp_sumCmdTuples(pr, LocallyExecutingSliceIndex(estate));
+				cdbdisp_sumCmdTuples(pr, primaryWriterSliceIndex);
 			estate->es_lastoid =
-				cdbdisp_maxLastOid(pr, LocallyExecutingSliceIndex(estate));
-			aopartcounts = cdbdisp_sumAoPartTupCount(estate->es_result_partitions, pr);
+				cdbdisp_maxLastOid(pr, primaryWriterSliceIndex);
+
+			if (estate->es_result_partitions)
+				aopartcounts = cdbdisp_sumAoPartTupCount(pr);
 		}
 
 		/* sum up rejected rows if any (single row error handling only) */
@@ -2028,7 +2154,8 @@ void mppExecutorFinishup(QueryDesc *queryDesc)
 		 * error, report it and exit to our error handler via PG_THROW.
 		 * NB: This call doesn't wait, because we already waited above.
 		 */
-		cdbdisp_finishCommand(estate->dispatcherState);
+		estate->dispatcherState = NULL;
+		cdbdisp_destroyDispatcherState(ds);
 	}
 
 	/* Teardown the Interconnect */
@@ -2041,7 +2168,7 @@ void mppExecutorFinishup(QueryDesc *queryDesc)
 		 * mark the estate to "cancelUnfinished" and then try to do a
 		 * normal interconnect teardown).
 		 */
-		TeardownInterconnect(estate->interconnect_context, estate->motionlayer_context, estate->cancelUnfinished, false);
+		TeardownInterconnect(estate->interconnect_context, estate->cancelUnfinished, false);
 		estate->es_interconnect_is_setup = false;
 	}
 }
@@ -2053,10 +2180,16 @@ void mppExecutorFinishup(QueryDesc *queryDesc)
  */
 void mppExecutorCleanup(QueryDesc *queryDesc)
 {
+	CdbDispatcherState *ds;
 	EState	   *estate;
 
 	/* caller must have switched into per-query memory context already */
 	estate = queryDesc->estate;
+	ds = estate->dispatcherState;
+
+	/* GPDB hook for collecting query info */
+	if (query_info_collect_hook && QueryCancelCleanup)
+		(*query_info_collect_hook)(METRICS_QUERY_CANCELING, queryDesc);
 
 	/*
 	 * If this query is being canceled, record that when the gpperfmon
@@ -2068,23 +2201,6 @@ void mppExecutorCleanup(QueryDesc *queryDesc)
 		QueryCancelCleanup)
 	{			
 		gpmon_qlog_query_canceling(queryDesc->gpmon_pkt);
-
-		if (gp_cancel_query_print_log)
-		{
-			elog(LOG, "canceling query (%d, %d)",
-				 queryDesc->gpmon_pkt->u.qlog.key.ssid,
-				 queryDesc->gpmon_pkt->u.qlog.key.ccnt);
-		}
-	}
-
-	/*
-	 * Delaying the cancellation for a specified time.
-	 */
-	if (Gp_role == GP_ROLE_DISPATCH &&
-		QueryCancelCleanup &&
-		gp_cancel_query_delay_time > 0)
-	{
-		pg_usleep(gp_cancel_query_delay_time * 1000);
 	}
 
 	/*
@@ -2092,26 +2208,22 @@ void mppExecutorCleanup(QueryDesc *queryDesc)
 	 * Wait for them to finish and clean up the dispatching structures.
 	 * Replace current error info with QE error info if more interesting.
 	 */
-	if (estate->dispatcherState && estate->dispatcherState->primaryResults)
+	if (ds)
 	{
-		/*
-		 * If we are finishing a query before all the tuples of the query
-		 * plan were fetched we must call ExecSquelchNode before checking
-		 * the dispatch results in order to tell the nodes below we no longer
-		 * need any more tuples.
-		 */
-		if (estate->es_interconnect_is_setup && !estate->es_got_eos)
-			ExecSquelchNode(queryDesc->planstate);
-
-		CdbDispatchHandleError(estate->dispatcherState);
+		estate->dispatcherState = NULL;
+		CdbDispatchHandleError(ds);
 	}
 
 	/* Clean up the interconnect. */
 	if (estate->es_interconnect_is_setup)
 	{
-		TeardownInterconnect(estate->interconnect_context, estate->motionlayer_context, true /* force EOS */, true);
+		TeardownInterconnect(estate->interconnect_context, true /* force EOS */, true);
 		estate->es_interconnect_is_setup = false;
 	}
+
+	/* GPDB hook for collecting query info */
+	if (query_info_collect_hook)
+		(*query_info_collect_hook)(QueryCancelCleanup ? METRICS_QUERY_CANCELED : METRICS_QUERY_ERROR, queryDesc);
 	
 	/**
 	 * Perfmon related stuff.
@@ -2124,9 +2236,6 @@ void mppExecutorCleanup(QueryDesc *queryDesc)
 		pfree(queryDesc->gpmon_pkt);
 		queryDesc->gpmon_pkt = NULL;
 	}
-
-	/* Workfile manager per-query resource accounting */
-	WorkfileQueryspace_ReleaseEntry();
 
 	ReportOOMConsumption();
 
@@ -2167,7 +2276,8 @@ uint64 PlanStateOperatorMemKB(const PlanState *ps)
 	{
 		if (IsA(ps, AggState))
 		{
-			result = ps->plan->operatorMemKB + MemoryAccounting_RequestQuotaIncrease();
+			/* Retrieve all relinquished memory (quota the other node not using) */
+			result = ps->plan->operatorMemKB + (MemoryAccounting_RequestQuotaIncrease() >> 10);
 		}
 		else
 			result = ps->plan->operatorMemKB;
@@ -2215,7 +2325,8 @@ MotionStateFinderWalker(PlanState *node,
  * Given a slice index, find the motionstate that corresponds to this slice index. This will iterate over the planstate tree
  * to get the right node.
  */
-MotionState *getMotionState(struct PlanState *ps, int sliceIndex)
+MotionState *
+getMotionState(struct PlanState *ps, int sliceIndex)
 {
 	Assert(ps);
 	Assert(sliceIndex > -1);
@@ -2224,7 +2335,10 @@ MotionState *getMotionState(struct PlanState *ps, int sliceIndex)
 	ctx.motionId = sliceIndex;
 	ctx.motionState = NULL;
 	planstate_walk_node(ps, MotionStateFinderWalker, &ctx);
-	Assert(ctx.motionState != NULL);
+
+	if (ctx.motionState == NULL)
+		elog(ERROR, "could not find MotionState in executor tree");
+
 	return ctx.motionState;
 }
 
@@ -2308,7 +2422,7 @@ SubPlanFinderWalker(Plan *node,
 			ctx->bms_subplans = bms_add_member(ctx->bms_subplans, i);
 		else
 			return false;
-	 }
+	}
 
 	/* Continue walking */
 	return plan_tree_walker((Node*)node, SubPlanFinderWalker, ctx);
@@ -2537,6 +2651,29 @@ int LocallyExecutingSliceIndex(EState *estate)
 }
 
 /**
+ * Provide index of slice being executed on the primary writer gang
+ */
+int PrimaryWriterSliceIndex(EState *estate)
+{
+	ListCell   *lc;
+
+	Assert(estate);
+
+	if (!estate->es_sliceTable)
+		return 0;
+
+	foreach (lc, estate->es_sliceTable->slices)
+	{
+		Slice	   *slice = (Slice *) lfirst(lc);
+
+		if (slice->gangType == GANGTYPE_PRIMARY_WRITER)
+			return slice->sliceIndex;
+	}
+
+	return 0;
+}
+
+/**
  * Provide root slice of locally executing slice.
  */
 int RootSliceIndex(EState *estate)
@@ -2552,6 +2689,7 @@ int RootSliceIndex(EState *estate)
 
 	return result;
 }
+
 
 #ifdef USE_ASSERT_CHECKING
 /**

@@ -5,7 +5,7 @@ PostgreSQL documentation
 
 <refentry id="SQL-ALTERRESOURCEGROUP">
  <refmeta>
-  <refentrytitle id="sql-alterresourcequeue-title">ALTER RESOURCE GROUP</refentrytitle>
+  <refentrytitle id="sql-alterresourcegroup-title">ALTER RESOURCE GROUP</refentrytitle>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -25,6 +25,7 @@ ALTER RESOURCE GROUP name SET group_attribute value
 where group_attribute is one of:
    CONCURRENCY integer
    CPU_RATE_LIMIT integer
+   CPUSET tuple
    MEMORY_LIMIT integer
    MEMORY_SHARED_QUOTA integer
    MEMORY_SPILL_RATIO integer

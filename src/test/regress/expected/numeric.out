@@ -688,12 +688,12 @@ INSERT INTO fract_only VALUES (1, '0.0');
 INSERT INTO fract_only VALUES (2, '0.1');
 INSERT INTO fract_only VALUES (3, '1.0');	-- should fail
 ERROR:  numeric field overflow
-DETAIL:  A field with precision 4, scale 4 must round to an absolute value less than 1. Rounded overflowing value: 1.0000
+DETAIL:  A field with precision 4, scale 4 must round to an absolute value less than 1.
 INSERT INTO fract_only VALUES (4, '-0.9999');
 INSERT INTO fract_only VALUES (5, '0.99994');
 INSERT INTO fract_only VALUES (6, '0.99995');  -- should fail
 ERROR:  numeric field overflow
-DETAIL:  A field with precision 4, scale 4 must round to an absolute value less than 1. Rounded overflowing value: 1.0000
+DETAIL:  A field with precision 4, scale 4 must round to an absolute value less than 1.
 INSERT INTO fract_only VALUES (7, '0.00001');
 INSERT INTO fract_only VALUES (8, '0.00017');
 SELECT * FROM fract_only;
@@ -708,6 +708,27 @@ SELECT * FROM fract_only;
 (6 rows)
 
 DROP TABLE fract_only;
+-- Check inf/nan conversion behavior
+SELECT 'NaN'::float8::numeric;
+ numeric 
+---------
+     NaN
+(1 row)
+
+SELECT 'Infinity'::float8::numeric;
+ERROR:  cannot convert infinity to numeric
+SELECT '-Infinity'::float8::numeric;
+ERROR:  cannot convert infinity to numeric
+SELECT 'NaN'::float4::numeric;
+ numeric 
+---------
+     NaN
+(1 row)
+
+SELECT 'Infinity'::float4::numeric;
+ERROR:  cannot convert infinity to numeric
+SELECT '-Infinity'::float4::numeric;
+ERROR:  cannot convert infinity to numeric
 -- Simple check that ceil(), floor(), and round() work correctly
 CREATE TABLE ceil_floor_round (a numeric);
 INSERT INTO ceil_floor_round VALUES ('-5.5');
@@ -746,9 +767,9 @@ ERROR:  count must be greater than zero
 SELECT width_bucket(3.5::float8, 3.0::float8, 3.0::float8, 888);
 ERROR:  lower bound cannot equal upper bound
 SELECT width_bucket('NaN', 3.0, 4.0, 888);
-ERROR:  operand, lower bound and upper bound cannot be NaN
+ERROR:  operand, lower bound, and upper bound cannot be NaN
 SELECT width_bucket(0::float8, 'NaN', 4.0::float8, 888);
-ERROR:  operand, lower bound and upper bound cannot be NaN
+ERROR:  operand, lower bound, and upper bound cannot be NaN
 -- normal operation
 CREATE TABLE width_bucket_test (operand_num numeric, operand_f8 float8);
 COPY width_bucket_test (operand_num) FROM stdin;
@@ -805,7 +826,7 @@ SELECT width_bucket('Infinity'::float8, 1, 10, 10),
 DROP TABLE width_bucket_test;
 -- TO_CHAR()
 --
-SELECT '' AS to_char_1, to_char(val, '9G999G999G999G999G999') 
+SELECT '' AS to_char_1, to_char(val, '9G999G999G999G999G999')
 	FROM num_data;
  to_char_1 |        to_char         
 -----------+------------------------
@@ -1139,6 +1160,21 @@ SELECT '' AS to_char_22, to_char(val, 'FM9999999999999999.999999999999999')	FROM
             | 93901.57763026
 (10 rows)
 
+SELECT '' AS to_char_23, to_char(val, '9.999EEEE')				FROM num_data;
+ to_char_23 |  to_char   
+------------+------------
+            |  0.000e+00
+            |  0.000e+00
+            | -3.434e+07
+            |  4.310e+00
+            |  7.799e+06
+            |  1.640e+04
+            |  9.390e+04
+            | -8.303e+07
+            |  7.488e+04
+            | -2.493e+07
+(10 rows)
+
 SELECT '' AS to_char_24, to_char('100'::numeric, 'FM999.9');
  to_char_24 | to_char 
 ------------+---------
@@ -1248,13 +1284,7 @@ INSERT INTO num_input_test(n1) VALUES ('  -93853');
 INSERT INTO num_input_test(n1) VALUES ('555.50');
 INSERT INTO num_input_test(n1) VALUES ('-555.50');
 INSERT INTO num_input_test(n1) VALUES ('NaN ');
-ERROR:  invalid input syntax for type numeric: "NaN "
-LINE 1: INSERT INTO num_input_test(n1) VALUES ('NaN ');
-                                               ^
 INSERT INTO num_input_test(n1) VALUES ('        nan');
-ERROR:  invalid input syntax for type numeric: "        nan"
-LINE 1: INSERT INTO num_input_test(n1) VALUES ('        nan');
-                                               ^
 -- bad inputs
 INSERT INTO num_input_test(n1) VALUES ('     ');
 ERROR:  invalid input syntax for type numeric: "     "
@@ -1291,12 +1321,41 @@ LINE 1: INSERT INTO num_input_test(n1) VALUES (' N aN ');
 SELECT * FROM num_input_test;
    n1    
 ---------
-  -93853
- -555.50
      123
-  555.50
  3245874
-(5 rows)
+  -93853
+  555.50
+ -555.50
+     NaN
+     NaN
+(7 rows)
+
+--
+-- Test some corner cases for multiplication
+--
+select 4790999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;
+                                                                                     ?column?                                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 47909999999999999999999999999999999999999999999999999999999999999999999999999999999999985209000000000000000000000000000000000000000000000000000000000000000000000000000000000001
+(1 row)
+
+select 4789999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;
+                                                                                     ?column?                                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 47899999999999999999999999999999999999999999999999999999999999999999999999999999999999985210000000000000000000000000000000000000000000000000000000000000000000000000000000000001
+(1 row)
+
+select 4770999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;
+                                                                                     ?column?                                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 47709999999999999999999999999999999999999999999999999999999999999999999999999999999999985229000000000000000000000000000000000000000000000000000000000000000000000000000000000001
+(1 row)
+
+select 4769999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;
+                                                                                     ?column?                                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 47699999999999999999999999999999999999999999999999999999999999999999999999999999999999985230000000000000000000000000000000000000000000000000000000000000000000000000000000000001
+(1 row)
 
 --
 -- Test some corner cases for division
@@ -1379,3 +1438,22 @@ select div(12345678901234567890, 123) * 123 + 12345678901234567890 % 123;
  12345678901234567890
 (1 row)
 
+--
+-- Test code path for raising to integer powers
+--
+select 10.0 ^ -2147483648 as rounds_to_zero;
+   rounds_to_zero   
+--------------------
+ 0.0000000000000000
+(1 row)
+
+select 10.0 ^ -2147483647 as rounds_to_zero;
+   rounds_to_zero   
+--------------------
+ 0.0000000000000000
+(1 row)
+
+select 10.0 ^ 2147483647 as overflows;
+ERROR:  value overflows numeric format
+select 117743296169.0 ^ 1000000000 as overflows;
+ERROR:  value overflows numeric format

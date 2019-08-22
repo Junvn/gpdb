@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/alter_trigger.sgml,v 1.11 2008/11/14 10:22:45 petere Exp $
+doc/src/sgml/ref/alter_trigger.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERTRIGGER">
+ <indexterm zone="sql-altertrigger">
+  <primary>ALTER TRIGGER</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-altertrigger-title">ALTER TRIGGER</refentrytitle>
+  <refentrytitle>ALTER TRIGGER</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -15,13 +19,9 @@ PostgreSQL documentation
   <refpurpose>change the definition of a trigger</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-altertrigger">
-  <primary>ALTER TRIGGER</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable class="PARAMETER">table</replaceable> RENAME TO <replaceable class="PARAMETER">newname</replaceable>
+ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable class="PARAMETER">table_name</replaceable> RENAME TO <replaceable class="PARAMETER">new_name</replaceable>
 </synopsis>
  </refsynopsisdiv>
 
@@ -54,7 +54,7 @@ ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable 
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">table</replaceable></term>
+    <term><replaceable class="PARAMETER">table_name</replaceable></term>
     <listitem>
      <para>
       The name of the table on which this trigger acts.
@@ -63,7 +63,7 @@ ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable 
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">newname</replaceable></term>
+    <term><replaceable class="PARAMETER">new_name</replaceable></term>
     <listitem>
      <para>
       The new name for the trigger.
@@ -78,7 +78,7 @@ ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable 
 
    <para>
     The ability to temporarily enable or disable a trigger is provided by
-    <xref linkend="SQL-ALTERTABLE" endterm="SQL-ALTERTABLE-TITLE">, not by
+    <xref linkend="SQL-ALTERTABLE">, not by
     <command>ALTER TRIGGER</>, because <command>ALTER TRIGGER</> has no
     convenient way to express the option of enabling or disabling all of
     a table's triggers at once.
@@ -92,8 +92,7 @@ ALTER TRIGGER <replaceable class="PARAMETER">name</replaceable> ON <replaceable 
    To rename an existing trigger:
 <programlisting>
 ALTER TRIGGER emp_stamp ON emp RENAME TO emp_track_chgs;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1>
@@ -109,7 +108,7 @@ ALTER TRIGGER emp_stamp ON emp RENAME TO emp_track_chgs;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-altertable" endterm="sql-altertable-title"></member>
+   <member><xref linkend="sql-altertable"></member>
   </simplelist>
  </refsect1>
 </refentry>

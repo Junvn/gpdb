@@ -26,13 +26,11 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/contrib/pgcrypto/pgp-pgsql.c,v 1.10 2008/05/04 16:42:41 tgl Exp $
+ * contrib/pgcrypto/pgp-pgsql.c
  */
 
 #include "postgres.h"
 
-#include "fmgr.h"
-#include "parser/scansup.h"
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 
@@ -43,23 +41,6 @@
 /*
  * public functions
  */
-Datum		pgp_sym_encrypt_text(PG_FUNCTION_ARGS);
-Datum		pgp_sym_encrypt_bytea(PG_FUNCTION_ARGS);
-Datum		pgp_sym_decrypt_text(PG_FUNCTION_ARGS);
-Datum		pgp_sym_decrypt_bytea(PG_FUNCTION_ARGS);
-
-Datum		pgp_pub_encrypt_text(PG_FUNCTION_ARGS);
-Datum		pgp_pub_encrypt_bytea(PG_FUNCTION_ARGS);
-Datum		pgp_pub_decrypt_text(PG_FUNCTION_ARGS);
-Datum		pgp_pub_decrypt_bytea(PG_FUNCTION_ARGS);
-
-Datum		pgp_key_id_w(PG_FUNCTION_ARGS);
-
-Datum		pg_armor(PG_FUNCTION_ARGS);
-Datum		pg_dearmor(PG_FUNCTION_ARGS);
-
-/* function headers */
-
 PG_FUNCTION_INFO_V1(pgp_sym_encrypt_bytea);
 PG_FUNCTION_INFO_V1(pgp_sym_encrypt_text);
 PG_FUNCTION_INFO_V1(pgp_sym_decrypt_bytea);
@@ -260,7 +241,10 @@ set_arg(PGP_Context *ctx, char *key, char *val,
 		res = pgp_set_convert_crlf(ctx, atoi(val));
 	else if (strcmp(key, "unicode-mode") == 0)
 		res = pgp_set_unicode_mode(ctx, atoi(val));
-	/* decrypt debug */
+	/*
+	 * The remaining options are for debugging/testing and are therefore not
+	 * documented in the user-facing docs.
+	 */
 	else if (ex != NULL && strcmp(key, "debug") == 0)
 		ex->debug = atoi(val);
 	else if (ex != NULL && strcmp(key, "expect-cipher-algo") == 0)
@@ -617,7 +601,7 @@ decrypt_internal(int is_pubenc, int need_text, text *data,
 	px_set_debug_handler(NULL);
 
 	/*
-	 * add successfull decryptions also into RNG
+	 * add successful decryptions also into RNG
 	 */
 	add_entropy(res, key, keypsw);
 

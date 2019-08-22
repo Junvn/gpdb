@@ -1,4 +1,20 @@
+-- start_matchsubs
+
+-- m/ERROR:  moving tuple from partition .* to partition .* not supported/
+-- s/ERROR:  moving tuple from partition .* to partition .* not supported/ERROR:  cross-partition or multi-update to a row/
+
+-- m/ERROR:  multiple updates to a row by the same query is not allowed/
+-- s/ERROR:  multiple updates to a row by the same query is not allowed/ERROR:  cross-partition or multi-update to a row/
+
+-- end_matchsubs
+
 -- First create a bunch of test tables
+
+-- start_matchsubs
+-- m/DETAIL:  Failing row contains \(.*\)/
+-- s/DETAIL:  Failing row contains \(.*\)/DETAIL:  Failing row contains (#####)/
+-- end_matchsubs
+SET statement_mem='250 MB';
 
 CREATE TABLE dml_ao_check_r (
 	a int default 100 CHECK( a between 1 and 105),
@@ -444,12 +460,6 @@ SELECT COUNT(*) FROM dml_ao_pt_r;
 INSERT INTO dml_ao_pt_r SELECT dml_ao_pt_r.* FROM dml_ao_pt_r,dml_ao_pt_s WHERE dml_ao_pt_r.b = dml_ao_pt_s.a and false;
 SELECT COUNT(*) FROM dml_ao_pt_r;
 
---Negative tests Insert column of different data type
-SELECT COUNT(*) FROM dml_ao_pt_r;
-SELECT COUNT(*) FROM (SELECT ('a')::int, dml_ao_pt_r.b,10 FROM dml_ao_pt_s WHERE dml_ao_pt_r.b = dml_ao_pt_s.b)foo;
-INSERT INTO dml_ao_pt_r SELECT ('a')::int, dml_ao_pt_r.b,10 FROM dml_ao_pt_s WHERE dml_ao_pt_r.b = dml_ao_pt_s.b;
-SELECT COUNT(*) FROM dml_ao_pt_r;
-
 --Negative test case. INSERT has more expressions than target columns
 begin;
 SELECT COUNT(*) FROM dml_ao_pt_s;
@@ -599,13 +609,6 @@ SELECT COUNT(*) FROM dml_ao_r;
 SELECT COUNT(*) FROM dml_ao_r;
 INSERT INTO dml_ao_r SELECT dml_ao_r.* FROM dml_ao_r,dml_ao_s WHERE dml_ao_r.b = dml_ao_s.a and false;
 SELECT COUNT(*) FROM dml_ao_r;
-
---Negative test case. INSERT has more expressions than target columns
-SELECT COUNT(*) FROM dml_ao_s;
-SELECT COUNT(*) FROM (SELECT COUNT(*) as a, dml_ao_r.* FROM dml_ao_r, dml_ao_s WHERE dml_ao_s.a = dml_ao_r.a GROUP BY dml_ao_r.a, dml_ao_r.b, dml_ao_r.c)foo;
-INSERT INTO dml_ao_s SELECT COUNT(*) as a, dml_ao_r.* FROM dml_ao_r, dml_ao_s WHERE dml_ao_s.a = dml_ao_r.a GROUP BY dml_ao_r.a, dml_ao_r.b, dml_ao_r.c;
-SELECT COUNT(*) FROM dml_ao_s;
-
 
 --Insert data that satisfy the check constraints
 begin;
@@ -904,18 +907,6 @@ SELECT COUNT(*) FROM dml_co_r;
 SELECT COUNT(*) FROM dml_co_r;
 INSERT INTO dml_co_r SELECT dml_co_r.* FROM dml_co_r,dml_co_s WHERE dml_co_r.b = dml_co_s.a and false;
 SELECT COUNT(*) FROM dml_co_r;
-
---Negative tests Insert column of different data type
-SELECT COUNT(*) FROM dml_co_r;
-SELECT COUNT(*) FROM ( SELECT ('a')::int, dml_co_r.b,10 FROM dml_co_s WHERE dml_co_r.b = dml_co_s.b)foo;
-INSERT INTO dml_co_r SELECT ('a')::int, dml_co_r.b,10 FROM dml_co_s WHERE dml_co_r.b = dml_co_s.b;
-SELECT COUNT(*) FROM dml_co_r;
-
---Negative test case. INSERT has more expressions than target columns
-SELECT COUNT(*) FROM dml_co_s;
-SELECT COUNT(*) FROM (SELECT COUNT(*) as a, dml_co_r.* FROM dml_co_r, dml_co_s WHERE dml_co_s.a = dml_co_r.a GROUP BY dml_co_r.a, dml_co_r.b, dml_co_r.c)foo;
-INSERT INTO dml_co_s SELECT COUNT(*) as a, dml_co_r.* FROM dml_co_r, dml_co_s WHERE dml_co_s.a = dml_co_r.a GROUP BY dml_co_r.a, dml_co_r.b, dml_co_r.c;
-SELECT COUNT(*) FROM dml_co_s;
 
 --Insert data that satisfy the check constraints
 begin;
@@ -1308,12 +1299,6 @@ SELECT COUNT(*) FROM dml_heap_pt_r;
 INSERT INTO dml_heap_pt_r SELECT dml_heap_pt_r.* FROM dml_heap_pt_r,dml_heap_pt_s WHERE dml_heap_pt_r.b = dml_heap_pt_s.a and false;
 SELECT COUNT(*) FROM dml_heap_pt_r;
 
---Negative tests Insert column of different data type
-SELECT COUNT(*) FROM dml_heap_pt_r;
-SELECT COUNT(*) FROM (SELECT ('a')::int, dml_heap_pt_r.b,10 FROM dml_heap_pt_s WHERE dml_heap_pt_r.b = dml_heap_pt_s.b)foo;
-INSERT INTO dml_heap_pt_r SELECT ('a')::int, dml_heap_pt_r.b,10 FROM dml_heap_pt_s WHERE dml_heap_pt_r.b = dml_heap_pt_s.b;
-SELECT COUNT(*) FROM dml_heap_pt_r;
-
 --Negative test case. INSERT has more expressions than target columns
 begin;
 SELECT COUNT(*) FROM dml_heap_pt_s;
@@ -1367,6 +1352,16 @@ begin;
 SELECT SUM(a) FROM dml_heap_pt_r;
 SELECT SUM(b) FROM dml_heap_pt_r;
 ALTER TABLE dml_heap_pt_r ADD DEFAULT partition def;
+
+-- Temporary workaround to make the error reported by the following
+-- update statement deterministic.  Without the savepoint, a QE reader
+-- may continue performing its part of the plan even after its writer
+-- has finished aborting the transaction.  This would lead to
+-- occasional "relation not found for OID ..." errors because the
+-- default partition would have been dropped as part of writer's abort
+-- processing.
+SAVEPOINT sp1;
+
 UPDATE dml_heap_pt_r SET a = DEFAULT, b = DEFAULT;
 SELECT SUM(a) FROM dml_heap_pt_r;
 SELECT SUM(b) FROM dml_heap_pt_r;
@@ -1432,6 +1427,16 @@ SELECT COUNT(*) FROM dml_heap_pt_r WHERE b is NULL;
 SELECT dml_heap_pt_s.a + 10 FROM dml_heap_pt_r,dml_heap_pt_s WHERE dml_heap_pt_r.a = dml_heap_pt_s.a ORDER BY 1 LIMIT 1;
 SELECT * FROM dml_heap_pt_r WHERE a = 1;
 ALTER TABLE dml_heap_pt_r ADD DEFAULT partition def;
+
+-- Temporary workaround to make the error reported by the following
+-- update statement deterministic.  Without the savepoint, a QE reader
+-- may continue performing its part of the plan even after its writer
+-- has finished aborting the transaction.  This would lead to
+-- occasional "relation not found for OID ..." errors because the
+-- default partition would have been dropped as part of writer's abort
+-- processing.
+SAVEPOINT sp1;
+
 UPDATE dml_heap_pt_r SET a = dml_heap_pt_s.a + 10 ,b = NULL FROM dml_heap_pt_s WHERE dml_heap_pt_r.a + 2= dml_heap_pt_s.b;
 SELECT * FROM dml_heap_pt_r WHERE a = 11 ORDER BY 1,2;
 SELECT COUNT(*) FROM dml_heap_pt_r WHERE b is NULL;
@@ -1487,9 +1492,9 @@ rollback;
 --Update on table with composite distribution key
 -- This currently falls back to planner, even if ORCA is enabled. And planner can't
 -- produce plans that update distribution key columns.
-SELECT SUM(a) FROM dml_heap_pt_r;
-UPDATE dml_heap_pt_p SET a = dml_heap_pt_p.b % 2 FROM dml_heap_pt_r WHERE dml_heap_pt_p.b::int = dml_heap_pt_r.b::int and dml_heap_pt_p.a = dml_heap_pt_r.a;
-SELECT SUM(a) FROM dml_heap_pt_r;
+begin;
+UPDATE dml_heap_pt_p SET a = dml_heap_pt_p.b % 2 FROM dml_heap_pt_r WHERE dml_heap_pt_p.b::int = dml_heap_pt_r.b::int and dml_heap_pt_p.a = dml_heap_pt_r.a and dml_heap_pt_p.b = 63;
+rollback;
 
 --Update on table with composite distribution key
 begin;
@@ -1632,18 +1637,6 @@ SELECT COUNT(*) FROM dml_heap_r;
 SELECT COUNT(*) FROM dml_heap_r;
 INSERT INTO dml_heap_r SELECT dml_heap_r.* FROM dml_heap_r,dml_heap_s WHERE dml_heap_r.b = dml_heap_s.a and false;
 SELECT COUNT(*) FROM dml_heap_r;
-
---Negative tests Insert column of different data type
-SELECT COUNT(*) FROM dml_heap_r;
-SELECT COUNT(*) FROM ( SELECT ('a')::int, dml_heap_r.b,10 FROM dml_heap_s WHERE dml_heap_r.b = dml_heap_s.b)foo;
-INSERT INTO dml_heap_r SELECT ('a')::int, dml_heap_r.b,10 FROM dml_heap_s WHERE dml_heap_r.b = dml_heap_s.b;
-SELECT COUNT(*) FROM dml_heap_r;
-
---Negative test case. INSERT has more expressions than target columns
-SELECT COUNT(*) FROM dml_heap_s;
-SELECT COUNT(*) FROM (SELECT COUNT(*) as a, dml_heap_r.* FROM dml_heap_r, dml_heap_s WHERE dml_heap_s.a = dml_heap_r.a GROUP BY dml_heap_r.a, dml_heap_r.b, dml_heap_r.c)foo;
-INSERT INTO dml_heap_s SELECT COUNT(*) as a, dml_heap_r.* FROM dml_heap_r, dml_heap_s WHERE dml_heap_s.a = dml_heap_r.a GROUP BY dml_heap_r.a, dml_heap_r.b, dml_heap_r.c;
-SELECT COUNT(*) FROM dml_heap_s;
 
 --Update and generate_series
 begin;

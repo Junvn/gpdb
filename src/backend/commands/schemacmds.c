@@ -5,16 +5,17 @@
  *
  * Portions Copyright (c) 2005-2010, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/schemacmds.c,v 1.51 2008/11/02 01:45:27 tgl Exp $
+ *	  src/backend/commands/schemacmds.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/heapam.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
@@ -22,6 +23,8 @@
 #include "catalog/heap.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_namespace.h"
 #include "commands/dbcommands.h"
 #include "commands/schemacmds.h"
@@ -30,20 +33,19 @@
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
-#include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/syscache.h"
 
 #include "cdb/cdbdisp_query.h"
-#include "cdb/cdbsrlz.h"
 #include "cdb/cdbvars.h"
 
-static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId);
 
+static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId);
 
 /*
  * CREATE SCHEMA
  */
-void
+Oid
 CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 {
 	const char *schemaName = stmt->schemaname;
@@ -70,12 +72,12 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 	{
 		Assert(Gp_role == GP_ROLE_EXECUTE);
 
-		Assert(stmt->schemaname == InvalidOid);
+		Assert(stmt->schemaname == NULL);
 		Assert(stmt->authid == NULL);
 		Assert(stmt->schemaElts == NIL);
 
 		InitTempTableNamespace();
-		return;
+		return InvalidOid;
 	}
 
 	GetUserIdAndSecContext(&saved_uid, &save_sec_context);
@@ -84,7 +86,7 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 	 * Who is supposed to own the new schema?
 	 */
 	if (authId)
-		owner_uid = get_roleid_checked(authId);
+		owner_uid = get_role_oid(authId, false);
 	else
 		owner_uid = saved_uid;
 
@@ -92,7 +94,7 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 	 * To create a schema, must have schema-create privilege on the current
 	 * database and must be able to become the target role (this does not
 	 * imply that the target role itself must have create-schema privilege).
-	 * The latter provision guards against "giveaway" attacks.	Note that a
+	 * The latter provision guards against "giveaway" attacks.  Note that a
 	 * superuser will always have both of these privileges a fortiori.
 	 */
 	aclresult = pg_database_aclcheck(MyDatabaseId, saved_uid, ACL_CREATE);
@@ -103,7 +105,7 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 	check_is_member_of_role(saved_uid, owner_uid);
 
 	/* Additional check to protect reserved schema names */
-	if (!allowSystemTableModsDDL && IsReservedName(schemaName))
+	if (!allowSystemTableMods && IsReservedName(schemaName))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_RESERVED_NAME),
@@ -113,21 +115,26 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 	}
 
 	/*
-	 * If the requested authorization is different from the current user,
-	 * temporarily set the current user so that the object(s) will be created
-	 * with the correct ownership.
-	 *
-	 * (The setting will be restored at the end of this routine, or in case
-	 * of error, transaction abort will clean things up.)
+	 * If if_not_exists was given and the schema already exists, bail out.
+	 * (Note: we needn't check this when not if_not_exists, because
+	 * NamespaceCreate will complain anyway.)  We could do this before making
+	 * the permissions checks, but since CREATE TABLE IF NOT EXISTS makes its
+	 * creation-permission check first, we do likewise.
 	 */
-	if (saved_uid != owner_uid)
-		SetUserIdAndSecContext(owner_uid,
-							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
+	if (stmt->if_not_exists &&
+		SearchSysCacheExists1(NAMESPACENAME, PointerGetDatum(schemaName)))
+	{
+		ereport(NOTICE,
+				(errcode(ERRCODE_DUPLICATE_SCHEMA),
+				 errmsg("schema \"%s\" already exists, skipping",
+						schemaName)));
+		return InvalidOid;
+	}
 
 	/* Create the schema's namespace */
 	if (shouldDispatch || Gp_role != GP_ROLE_EXECUTE)
 	{
-		namespaceId = NamespaceCreate(schemaName, owner_uid);
+		namespaceId = NamespaceCreate(schemaName, owner_uid, false);
 
 		if (shouldDispatch)
 		{
@@ -156,8 +163,20 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 	}
 	else
 	{
-		namespaceId = NamespaceCreate(schemaName, owner_uid);
+		namespaceId = NamespaceCreate(schemaName, owner_uid, false);
 	}
+
+	/*
+	 * If the requested authorization is different from the current user,
+	 * temporarily set the current user so that the object(s) will be created
+	 * with the correct ownership.
+	 *
+	 * (The setting will be restored at the end of this routine, or in case of
+	 * error, transaction abort will clean things up.)
+	 */
+	if (saved_uid != owner_uid)
+		SetUserIdAndSecContext(owner_uid,
+							save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 
 	/* Advance cmd counter to make the namespace visible */
 	CommandCounterIncrement();
@@ -175,7 +194,7 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 	/*
 	 * Examine the list of commands embedded in the CREATE SCHEMA command, and
 	 * reorganize them into a sequentially executable order with no forward
-	 * references.	Note that the result is still a list of raw parsetrees ---
+	 * references.  Note that the result is still a list of raw parsetrees ---
 	 * we cannot, in general, run parse analysis on one statement until we
 	 * have actually executed the prior ones.
 	 */
@@ -194,8 +213,8 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 		/* do this step */
 		ProcessUtility(stmt,
 					   queryString,
+					   PROCESS_UTILITY_SUBCOMMAND,
 					   NULL,
-					   false,	/* not top level */
 					   None_Receiver,
 					   NULL);
 		/* make sure later steps can see the object created here */
@@ -207,109 +226,9 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 
 	/* Reset current user and security context */
 	SetUserIdAndSecContext(saved_uid, save_sec_context);
+
+	return namespaceId;
 }
-
-
-/*
- *	RemoveSchemas
- *		Implements DROP SCHEMA.
- */
-void
-RemoveSchemas(DropStmt *drop)
-{
-	ObjectAddresses *objects;
-	ListCell		*cell;
-	List			*namespaceIdList = NIL;
-
-	/*
-	 * First we identify all the schemas, then we delete them in a single
-	 * performMultipleDeletions() call.  This is to avoid unwanted
-	 * DROP RESTRICT errors if one of the schemas depends on another.
-	 */
-	objects = new_object_addresses();
-
-	foreach(cell, drop->objects)
-	{
-		List	   *names = (List *) lfirst(cell);
-		char	   *namespaceName;
-		Oid			namespaceId;
-		ObjectAddress object;
-
-		if (list_length(names) != 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("schema name cannot be qualified")));
-		namespaceName = strVal(linitial(names));
-
-		namespaceId = GetSysCacheOid(NAMESPACENAME,
-									 CStringGetDatum(namespaceName),
-									 0, 0, 0);
-
-		if (!OidIsValid(namespaceId))
-		{
-			if (!drop->missing_ok)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_SCHEMA),
-						 errmsg("schema \"%s\" does not exist",
-								namespaceName)));
-			}
-			else
-			{
-				if (Gp_role != GP_ROLE_EXECUTE)
-					ereport(NOTICE,
-							(errmsg("schema \"%s\" does not exist, skipping",
-								namespaceName)));
-			}
-			continue;
-		}
-
-		namespaceIdList = lappend_oid(namespaceIdList, namespaceId);
-
-		/* Permission check */
-		if (!pg_namespace_ownercheck(namespaceId, GetUserId()))
-			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_NAMESPACE,
-						   namespaceName);
-
-		/*
-		 * Additional check to protect reserved schema names, exclude temp
-		 * schema
-		 */
-		if (!allowSystemTableModsDDL &&	IsReservedName(namespaceName) &&
-			(strlen(namespaceName) >= 7 &&
-			 strncmp(namespaceName, "pg_temp", 7) != 0))
-			ereport(ERROR,
-					(errcode(ERRCODE_RESERVED_NAME),
-					 errmsg("cannot drop schema %s because it is required by the database system",
-							namespaceName)));
-
-		object.classId = NamespaceRelationId;
-		object.objectId = namespaceId;
-		object.objectSubId = 0;
-
-		add_exact_object_address(&object, objects);
-	}
-
-	/*
-	 * Do the deletions.  Objects contained in the schema(s) are removed by
-	 * means of their dependency links to the schema.
-	 */
-	performMultipleDeletions(objects, drop->behavior);
-
-	/* MPP-6929: metadata tracking */
-	if (Gp_role == GP_ROLE_DISPATCH)
-	{
-		foreach(cell, namespaceIdList)
-		{
-			Oid namespaceId = lfirst_oid(cell);
-
-			MetaTrackDropObject(NamespaceRelationId, namespaceId);
-		}
-	}
-
-	free_object_addresses(objects);
-}
-
 
 /*
  * Guts of schema deletion.
@@ -322,9 +241,8 @@ RemoveSchemaById(Oid schemaOid)
 
 	relation = heap_open(NamespaceRelationId, RowExclusiveLock);
 
-	tup = SearchSysCache(NAMESPACEOID,
-						 ObjectIdGetDatum(schemaOid),
-						 0, 0, 0);
+	tup = SearchSysCache1(NAMESPACEOID,
+						  ObjectIdGetDatum(schemaOid));
 	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for namespace %u", schemaOid);
 
@@ -335,39 +253,36 @@ RemoveSchemaById(Oid schemaOid)
 	heap_close(relation, RowExclusiveLock);
 }
 
+
 /*
  * Rename schema
  */
-void
+Oid
 RenameSchema(const char *oldname, const char *newname)
 {
+	Oid			nspOid;
 	HeapTuple	tup;
-	Oid			nsoid;
 	Relation	rel;
 	AclResult	aclresult;
 
 	rel = heap_open(NamespaceRelationId, RowExclusiveLock);
 
-	tup = SearchSysCacheCopy(NAMESPACENAME,
-							 CStringGetDatum(oldname),
-							 0, 0, 0);
+	tup = SearchSysCacheCopy1(NAMESPACENAME, CStringGetDatum(oldname));
 	if (!HeapTupleIsValid(tup))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_SCHEMA),
 				 errmsg("schema \"%s\" does not exist", oldname)));
 
+	nspOid = HeapTupleGetOid(tup);
+
 	/* make sure the new name doesn't exist */
-	if (HeapTupleIsValid(
-						 SearchSysCache(NAMESPACENAME,
-										CStringGetDatum(newname),
-										0, 0, 0)))
+	if (OidIsValid(get_namespace_oid(newname, true)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_SCHEMA),
 				 errmsg("schema \"%s\" already exists", newname)));
 
 	/* must be owner */
-	nsoid = HeapTupleGetOid(tup);
-	if (!pg_namespace_ownercheck(nsoid, GetUserId()))
+	if (!pg_namespace_ownercheck(nspOid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_NAMESPACE,
 					   oldname);
 
@@ -377,7 +292,7 @@ RenameSchema(const char *oldname, const char *newname)
 		aclcheck_error(aclresult, ACL_KIND_DATABASE,
 					   get_database_name(MyDatabaseId));
 
-	if (!allowSystemTableModsDDL && IsReservedName(oldname))
+	if (!allowSystemTableMods && IsReservedName(oldname))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -385,7 +300,7 @@ RenameSchema(const char *oldname, const char *newname)
 				 errdetail("Schema %s is reserved for system use.", oldname)));
 	}
 
-	if (!allowSystemTableModsDDL && IsReservedName(newname))
+	if (!allowSystemTableMods && IsReservedName(newname))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_RESERVED_NAME),
@@ -403,14 +318,17 @@ RenameSchema(const char *oldname, const char *newname)
 	/* MPP-6929: metadata tracking */
 	if (Gp_role == GP_ROLE_DISPATCH)
 		MetaTrackUpdObject(NamespaceRelationId,
-						   nsoid,
+						   nspOid,
 						   GetUserId(),
 						   "ALTER", "RENAME"
 				);
 
+	InvokeObjectPostAlterHook(NamespaceRelationId, HeapTupleGetOid(tup), 0);
+
 	heap_close(rel, NoLock);
 	heap_freetuple(tup);
 
+	return nspOid;
 }
 
 void
@@ -421,9 +339,7 @@ AlterSchemaOwner_oid(Oid oid, Oid newOwnerId)
 
 	rel = heap_open(NamespaceRelationId, RowExclusiveLock);
 
-	tup = SearchSysCache(NAMESPACEOID,
-						 ObjectIdGetDatum(oid),
-						 0, 0, 0);
+	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(oid));
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for schema %u", oid);
 
@@ -438,23 +354,22 @@ AlterSchemaOwner_oid(Oid oid, Oid newOwnerId)
 /*
  * Change schema owner
  */
-void
+Oid
 AlterSchemaOwner(const char *name, Oid newOwnerId)
 {
+	Oid			nspOid;
 	HeapTuple	tup;
 	Relation	rel;
 
 	rel = heap_open(NamespaceRelationId, RowExclusiveLock);
 
-	tup = SearchSysCache(NAMESPACENAME,
-						 CStringGetDatum(name),
-						 0, 0, 0);
+	tup = SearchSysCache1(NAMESPACENAME, CStringGetDatum(name));
 	if (!HeapTupleIsValid(tup))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_SCHEMA),
 				 errmsg("schema \"%s\" does not exist", name)));
 
-	if (!allowSystemTableModsDDL && IsReservedName(name))
+	if (!allowSystemTableMods && IsReservedName(name))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -462,11 +377,15 @@ AlterSchemaOwner(const char *name, Oid newOwnerId)
 				 errdetail("Schema %s is reserved for system use.", name)));
 	}
 
+	nspOid = HeapTupleGetOid(tup);
+
 	AlterSchemaOwner_internal(tup, rel, newOwnerId);
 
 	ReleaseSysCache(tup);
 
 	heap_close(rel, RowExclusiveLock);
+
+	return nspOid;
 }
 
 static void
@@ -559,4 +478,6 @@ AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 								newOwnerId);
 	}
 
+	InvokeObjectPostAlterHook(NamespaceRelationId,
+							  HeapTupleGetOid(tup), 0);
 }

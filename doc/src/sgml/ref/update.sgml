@@ -1,11 +1,15 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/update.sgml,v 1.48 2008/11/16 17:34:28 tgl Exp $
+doc/src/sgml/ref/update.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-UPDATE">
+ <indexterm zone="sql-update">
+  <primary>UPDATE</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-UPDATE-TITLE">UPDATE</refentrytitle>
+  <refentrytitle>UPDATE</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -15,16 +19,13 @@ PostgreSQL documentation
   <refpurpose>update rows of a table</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-update">
-  <primary>UPDATE</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-UPDATE [ ONLY ] <replaceable class="PARAMETER">table</replaceable> [ * ] [ [ AS ] <replaceable class="parameter">alias</replaceable> ]
-    SET { <replaceable class="PARAMETER">column</replaceable> = { <replaceable class="PARAMETER">expression</replaceable> | DEFAULT } |
-          ( <replaceable class="PARAMETER">column</replaceable> [, ...] ) = ( { <replaceable class="PARAMETER">expression</replaceable> | DEFAULT } [, ...] ) } [, ...]
-    [ FROM <replaceable class="PARAMETER">fromlist</replaceable> ]
+[ WITH [ RECURSIVE ] <replaceable class="parameter">with_query</replaceable> [, ...] ]
+UPDATE [ ONLY ] <replaceable class="PARAMETER">table_name</replaceable> [ * ] [ [ AS ] <replaceable class="parameter">alias</replaceable> ]
+    SET { <replaceable class="PARAMETER">column_name</replaceable> = { <replaceable class="PARAMETER">expression</replaceable> | DEFAULT } |
+          ( <replaceable class="PARAMETER">column_name</replaceable> [, ...] ) = ( { <replaceable class="PARAMETER">expression</replaceable> | DEFAULT } [, ...] ) } [, ...]
+    [ FROM <replaceable class="PARAMETER">from_list</replaceable> ]
     [ WHERE <replaceable class="PARAMETER">condition</replaceable> | WHERE CURRENT OF <replaceable class="PARAMETER">cursor_name</replaceable> ]
     [ RETURNING * | <replaceable class="parameter">output_expression</replaceable> [ [ AS ] <replaceable class="parameter">output_name</replaceable> ] [, ...] ]
 </synopsis>
@@ -59,9 +60,10 @@ UPDATE [ ONLY ] <replaceable class="PARAMETER">table</replaceable> [ * ] [ [ AS 
   </para>
 
   <para>
-   You must have the <literal>UPDATE</literal> privilege on the table
-   to update it, as well as the <literal>SELECT</literal>
-   privilege to any table whose values are read in the
+   You must have the <literal>UPDATE</literal> privilege on the table,
+   or at least on the column(s) that are listed to be updated.
+   You must also have the <literal>SELECT</literal>
+   privilege on any column whose values are read in the
    <replaceable class="parameter">expressions</replaceable> or
    <replaceable class="parameter">condition</replaceable>.
   </para>
@@ -72,7 +74,19 @@ UPDATE [ ONLY ] <replaceable class="PARAMETER">table</replaceable> [ * ] [ [ AS 
 
   <variablelist>
    <varlistentry>
-    <term><replaceable class="PARAMETER">table</replaceable></term>
+    <term><replaceable class="parameter">with_query</replaceable></term>
+    <listitem>
+     <para>
+      The <literal>WITH</literal> clause allows you to specify one or more
+      subqueries that can be referenced by name in the <command>UPDATE</>
+      query. See <xref linkend="queries-with"> and <xref linkend="sql-select">
+      for details.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="PARAMETER">table_name</replaceable></term>
     <listitem>
      <para>
       The name (optionally schema-qualified) of the table to update.
@@ -99,11 +113,11 @@ UPDATE [ ONLY ] <replaceable class="PARAMETER">table</replaceable> [ * ] [ [ AS 
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">column</replaceable></term>
+    <term><replaceable class="PARAMETER">column_name</replaceable></term>
     <listitem>
      <para>
-      The name of a column in <replaceable
-      class="PARAMETER">table</replaceable>.
+      The name of a column in the table named by <replaceable
+      class="PARAMETER">table_name</replaceable>.
       The column name can be qualified with a subfield name or array
       subscript, if needed.  Do not include the table's name in the
       specification of a target column &mdash; for example,
@@ -133,7 +147,7 @@ UPDATE [ ONLY ] <replaceable class="PARAMETER">table</replaceable> [ * ] [ [ AS 
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">fromlist</replaceable></term>
+    <term><replaceable class="PARAMETER">from_list</replaceable></term>
     <listitem>
      <para>
       A list of table expressions, allowing columns from other tables
@@ -142,8 +156,8 @@ UPDATE [ ONLY ] <replaceable class="PARAMETER">table</replaceable> [ * ] [ [ AS 
       specified in the <xref linkend="sql-from"
       endterm="sql-from-title"> of a <command>SELECT</command>
       statement.  Note that the target table must not appear in the
-      <replaceable>fromlist</>, unless you intend a self-join (in which
-      case it must appear with an alias in the <replaceable>fromlist</>).
+      <replaceable>from_list</>, unless you intend a self-join (in which
+      case it must appear with an alias in the <replaceable>from_list</>).
      </para>
     </listitem>
    </varlistentry>
@@ -169,7 +183,7 @@ UPDATE [ ONLY ] <replaceable class="PARAMETER">table</replaceable> [ * ] [ [ AS 
       query on the <command>UPDATE</>'s target table.
       Note that <literal>WHERE CURRENT OF</> cannot be
       specified together with a Boolean condition.  See
-      <xref linkend="sql-declare" endterm="sql-declare-title">
+      <xref linkend="sql-declare">
       for more information about using cursors with
       <literal>WHERE CURRENT OF</>.
      </para>
@@ -182,7 +196,7 @@ UPDATE [ ONLY ] <replaceable class="PARAMETER">table</replaceable> [ * ] [ [ AS 
      <para>
       An expression to be computed and returned by the <command>UPDATE</>
       command after each row is updated.  The expression can use any
-      column names of the <replaceable class="PARAMETER">table</replaceable>
+      column names of the table named by <replaceable class="PARAMETER">table_name</replaceable>
       or table(s) listed in <literal>FROM</>.
       Write <literal>*</> to return all columns.
      </para>
@@ -210,10 +224,12 @@ UPDATE [ ONLY ] <replaceable class="PARAMETER">table</replaceable> [ * ] [ [ AS 
 UPDATE <replaceable class="parameter">count</replaceable>
 </screen>
    The <replaceable class="parameter">count</replaceable> is the number
-   of rows updated.  If <replaceable class="parameter">count</replaceable> is
-   0, no rows matched the <replaceable
-   class="parameter">condition</replaceable> (this is not considered
-   an error).
+   of rows updated, including matched rows whose values did not change.
+   Note that the number may be less than the number of rows that matched
+   the <replaceable class="parameter">condition</replaceable> when
+   updates were suppressed by a <literal>BEFORE UPDATE</> trigger.  If
+   <replaceable class="parameter">count</replaceable> is 0, no rows were
+   updated by the query (this is not considered an error).
   </para>
 
   <para>
@@ -231,7 +247,7 @@ UPDATE <replaceable class="parameter">count</replaceable>
   <para>
    When a <literal>FROM</> clause is present, what essentially happens
    is that the target table is joined to the tables mentioned in the
-   <replaceable>fromlist</replaceable>, and each output row of the join
+   <replaceable>from_list</replaceable>, and each output row of the join
    represents an update operation for the target table.  When using
    <literal>FROM</> you should ensure that the join
    produces at most one output row for each row to be modified.  In
@@ -332,8 +348,7 @@ COMMIT;
    <literal>c_films</> is currently positioned:
 <programlisting>
 UPDATE films SET kind = 'Dramatic' WHERE CURRENT OF c_films;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1>
@@ -342,7 +357,8 @@ UPDATE films SET kind = 'Dramatic' WHERE CURRENT OF c_films;
   <para>
    This command conforms to the <acronym>SQL</acronym> standard, except
    that the <literal>FROM</literal> and <literal>RETURNING</> clauses
-   are <productname>PostgreSQL</productname> extensions.
+   are <productname>PostgreSQL</productname> extensions, as is the ability
+   to use <literal>WITH</> with <command>UPDATE</>.
   </para>
 
   <para>

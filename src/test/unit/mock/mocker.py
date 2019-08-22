@@ -18,6 +18,8 @@ class CFile(object):
     # __attribute__((XXX)): it gets difficult to match arguments.
     # Remove it as it's a noisy keyword for us.
     attribute_pat = re.compile(r'__attribute__\s*\(\((format\s*\([^\)]+\)\s*|format_arg\s*\(\d+\)\s*|.+?)\)\)')
+    # #include <filename>.c
+    include_c_pat = re.compile(r'#include ".+\.c"')
 
     # function pattern
     func_pat = re.compile(
@@ -58,9 +60,15 @@ class CFile(object):
         """
         content = CFile.m_comment_pat.sub('', content)
         # backend/libpq/be-secure.c contains private key with '//'
-        if 'be-secure' not in self.path and 'guc.c' not in self.path:
+        if 'be-secure' not in self.path and 'guc_gp.c' not in self.path:
             content = CFile.s_comment_pat.sub('', content)
         content = CFile.attribute_pat.sub('', content)
+        # .c files included in other .c files can generally not be found from
+        # where the mock files are located which leads to compilation failure.
+        # Since we thus far arent interested in handling this anyways, let's
+        # skip this for now except for the guc special case
+        if 'guc' not in self.path:
+            content = CFile.include_c_pat.sub('', content)
         return content
 
     def skip_func_body(self, content, index):
@@ -69,9 +77,6 @@ class CFile(object):
            weird code block based on preprocessor directives.
         """
         pat = re.compile(r'^}\s*$', re.MULTILINE)
-        if 'cdbfilerepconnserver' in self.path:
-            # FIXIT!: some of the files have unpleasant format.
-            pat = re.compile(r'^ ?}', re.MULTILINE)
         m = pat.search(content, index)
         if m:
             if 'cdbgroup' in self.path:
@@ -106,7 +111,7 @@ class CFile(object):
             (modifier, rettype, funcname, args) = m.groups('')
             # 'else if(...){}' looks like a function.  Ignore it.
             if funcname in ['if', 'while', 'switch', 'for', 'foreach',
-                            'yysyntax_error', 'defined']:
+                            'yysyntax_error', 'defined', 'dlist_foreach']:
                 continue
             if rettype.strip() in ['define', 'select']:
                 continue

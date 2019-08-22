@@ -1,20 +1,9 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/close.sgml,v 1.28 2008/11/14 10:22:45 petere Exp $
+doc/src/sgml/ref/close.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-CLOSE">
- <refmeta>
-  <refentrytitle id="SQL-CLOSE-TITLE">CLOSE</refentrytitle>
-  <manvolnum>7</manvolnum>
-  <refmiscinfo>SQL - Language Statements</refmiscinfo>
- </refmeta>
-
- <refnamediv>
-  <refname>CLOSE</refname>
-  <refpurpose>close a cursor</refpurpose>
- </refnamediv>
-
  <indexterm zone="sql-close">
   <primary>CLOSE</primary>
  </indexterm>
@@ -23,6 +12,17 @@ PostgreSQL documentation
   <primary>cursor</primary>
   <secondary>CLOSE</secondary>
  </indexterm>
+
+ <refmeta>
+  <refentrytitle>CLOSE</refentrytitle>
+  <manvolnum>7</manvolnum>
+  <refmiscinfo>SQL - Language Statements</refmiscinfo>
+ </refmeta>
+
+ <refnamediv>
+  <refname>CLOSE</refname>
+  <refpurpose>close a cursor</refpurpose>
+ </refnamediv>
 
  <refsynopsisdiv>
 <synopsis>
@@ -51,7 +51,7 @@ CLOSE { <replaceable class="PARAMETER">name</replaceable> | ALL }
    disconnects.
   </para>
  </refsect1>
-  
+
  <refsect1>
   <title>Parameters</title>
 
@@ -84,7 +84,7 @@ CLOSE { <replaceable class="PARAMETER">name</replaceable> | ALL }
    <productname>PostgreSQL</productname> does not have an explicit
    <command>OPEN</command> cursor statement; a cursor is considered
    open when it is declared.  Use the
-   <xref linkend="sql-declare" endterm="sql-declare-title">
+   <xref linkend="sql-declare">
    statement to declare a cursor.
   </para>
 
@@ -107,13 +107,12 @@ CLOSE { <replaceable class="PARAMETER">name</replaceable> | ALL }
    Close the cursor <literal>liahona</literal>:
 <programlisting>
 CLOSE liahona;
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
- 
+
  <refsect1>
   <title>Compatibility</title>
-  
+
   <para>
    <command>CLOSE</command> is fully conforming with the SQL
    standard. <command>CLOSE ALL</> is a <productname>PostgreSQL</>
@@ -125,9 +124,9 @@ CLOSE liahona;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-declare" endterm="sql-declare-title"></member>
-   <member><xref linkend="sql-fetch" endterm="sql-fetch-title"></member>
-   <member><xref linkend="sql-move" endterm="sql-move-title"></member>
+   <member><xref linkend="sql-declare"></member>
+   <member><xref linkend="sql-fetch"></member>
+   <member><xref linkend="sql-move"></member>
   </simplelist>
  </refsect1>
 </refentry>

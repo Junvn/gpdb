@@ -67,7 +67,8 @@ insert into sale values
 
 
 --
--- Test case errors out when we define aggregates without preliminary functions and use it as an aggregate derived window function.
+-- Test case errors out when we define aggregates without combine functions
+-- and use it as an aggregate derived window function.
 --
 
 -- SETUP
@@ -77,7 +78,7 @@ drop aggregate if exists mysum1(int4);
 drop aggregate if exists mysum2(int4);
 -- end_ignore
 create table toy(id,val) as select i,i from generate_series(1,5) i;
-create aggregate mysum1(int4) (sfunc = int4_sum, prefunc=int8pl, stype=bigint);
+create aggregate mysum1(int4) (sfunc = int4_sum, combinefunc=int8pl, stype=bigint);
 create aggregate mysum2(int4) (sfunc = int4_sum, stype=bigint);
 
 -- TEST
@@ -136,7 +137,7 @@ create aggregate ema(float, float) (
     initcond = '(,)');
 
 create table ema_test (k int, v float ) distributed by (k);
-insert into ema_test select i, 4*random() + 10.0*(1+cos(radians(i*5))) from generate_series(0,19) i(i);
+insert into ema_test select i, 4*(i::float/20) + 10.0*(1+cos(radians(i*5))) from generate_series(0,19) i(i);
 
 -- TEST
 select k, v, ema(v, 0.9) over (order by k) from ema_test order by k;
@@ -347,6 +348,16 @@ GROUP BY ROLLUP( (sale.dt,sale.cn),(sale.pn),(sale.vn));
 
 
 --
+-- Another ROLLUP query, that hit a bug in setting up the planner-generated
+-- subquery's targetlist. (https://github.com/greenplum-db/gpdb/issues/6754)
+--
+SELECT sale.vn, rank() over (partition by sale.vn)
+FROM vendor, sale
+WHERE sale.vn=vendor.vn
+GROUP BY ROLLUP( sale.vn);
+
+
+--
 -- Test window function with constant PARTITION BY
 --
 CREATE TABLE testtab (a int4);
@@ -360,6 +371,15 @@ FROM (
   SELECT a, count(*) OVER (PARTITION BY a) FROM (VALUES (1,1)) AS foo(a)
 ) AS sup(c, d)
 WHERE c = 87 ;
+
+--
+-- This used to crash, and/or produce incorrect results. The culprit was that a Hash Agg
+-- was used, but the planner put a Gather Merge at the top, without a Sort, even though
+-- a Hash Agg doesn't preserve the sort order.
+--
+SELECT sale.qty
+FROM sale
+GROUP BY ROLLUP((qty)) order by 1;
 
 
 -- CLEANUP

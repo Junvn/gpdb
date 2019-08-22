@@ -8,7 +8,7 @@
 -- of the "old style" approach of making the functions first.
 --
 CREATE TYPE widget (
-   internallength = 24, 
+   internallength = 24,
    input = widget_in,
    output = widget_out,
    typmod_in = numerictypmodin,
@@ -16,10 +16,10 @@ CREATE TYPE widget (
    alignment = double
 );
 
-CREATE TYPE city_budget ( 
-   internallength = 16, 
-   input = int44in, 
-   output = int44out, 
+CREATE TYPE city_budget (
+   internallength = 16,
+   input = int44in,
+   output = int44out,
    element = int4,
    category = 'x',   -- just to verify the system will take it
    preferred = true  -- ditto
@@ -30,6 +30,9 @@ CREATE TYPE shell;
 CREATE TYPE shell;   -- fail, type already present
 DROP TYPE shell;
 DROP TYPE shell;     -- fail, type not exist
+
+-- also, let's leave one around for purposes of pg_dump testing
+CREATE TYPE myshell;
 
 --
 -- Test type-related default values (broken in releases before PG 7.2)
@@ -95,6 +98,9 @@ SELECT * FROM get_default_test();
 COMMENT ON TYPE bad IS 'bad comment';
 COMMENT ON TYPE default_test_row IS 'good comment';
 COMMENT ON TYPE default_test_row IS NULL;
+COMMENT ON COLUMN default_test_row.nope IS 'bad comment';
+COMMENT ON COLUMN default_test_row.f1 IS 'good comment';
+COMMENT ON COLUMN default_test_row.f1 IS NULL;
 
 -- Check shell type create for existing types
 CREATE TYPE text_w_default;		-- should fail
@@ -102,6 +108,23 @@ CREATE TYPE text_w_default;		-- should fail
 DROP TYPE default_test_row CASCADE;
 
 DROP TABLE default_test;
+
+-- Check type create with input/output incompatibility
+CREATE TYPE not_existing_type (INPUT = array_in,
+    OUTPUT = array_out,
+    ELEMENT = int,
+    INTERNALLENGTH = 32);
+
+-- Check dependency transfer of opaque functions when creating a new type
+CREATE FUNCTION base_fn_in(cstring) RETURNS opaque AS 'boolin'
+    LANGUAGE internal IMMUTABLE STRICT;
+CREATE FUNCTION base_fn_out(opaque) RETURNS opaque AS 'boolout'
+    LANGUAGE internal IMMUTABLE STRICT;
+CREATE TYPE base_type(INPUT = base_fn_in, OUTPUT = base_fn_out);
+DROP FUNCTION base_fn_in(cstring); -- error
+DROP FUNCTION base_fn_out(opaque); -- error
+DROP TYPE base_type; -- error
+DROP TYPE base_type CASCADE;
 
 -- Check usage of typmod with a user-defined type
 -- (we have borrowed numeric's typmod functions)

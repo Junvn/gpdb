@@ -52,8 +52,7 @@ typedef struct DispatchCommandDtxProtocolParms
  */
 static DtxContextInfo TempQDDtxContextInfo = DtxContextInfo_StaticInit;
 
-static char *buildGpDtxProtocolCommand(struct CdbDispatcherState *ds,
-						  DispatchCommandDtxProtocolParms *pDtxProtocolParms,
+static char *buildGpDtxProtocolCommand(DispatchCommandDtxProtocolParms *pDtxProtocolParms,
 						  int *finalLen);
 
 /*
@@ -64,9 +63,8 @@ static char *buildGpDtxProtocolCommand(struct CdbDispatcherState *ds,
  * produced; the caller must PQclear() them and free() the array.
  * A NULL entry follows the last used entry in the array.
  *
- * Any error messages - whether or not they are associated with
- * PGresult objects - are appended to a StringInfo buffer provided
- * by the caller.
+ * Any error message - whether or not it is associated with an
+ * PGresult object - is returned in *qeError.
  */
 struct pg_result **
 CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
@@ -74,16 +72,15 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 							  char *dtxProtocolCommandLoggingStr,
 							  char *gid,
 							  DistributedTransactionId gxid,
-							  StringInfo errmsgbuf,
+							  ErrorData **qeError,
 							  int *numresults,
 							  bool *badGangs,
-							  CdbDispatchDirectDesc *direct,
+							  List *twophaseSegments,
 							  char *serializedDtxContextInfo,
 							  int serializedDtxContextInfoLen)
 {
-	CdbDispatcherState ds = {NULL, NULL, NULL};
-
-	CdbDispatchResults *pr = NULL;
+	CdbDispatcherState *ds;
+	CdbDispatchResults *pr;
 	CdbPgResults cdb_pgresults = {NULL, 0};
 
 	DispatchCommandDtxProtocolParms dtxProtocolParms;
@@ -91,12 +88,8 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 	char	   *queryText = NULL;
 	int			queryTextLen = 0;
 
-	elog((Debug_print_full_dtm ? LOG : DEBUG5),
-		 "CdbDispatchDtxProtocolCommand: %s for gid = %s, direct content #: %d",
-		 dtxProtocolCommandLoggingStr, gid,
-		 direct->directed_dispatch ? direct->content[0] : -1);
-
 	*badGangs = false;
+	*qeError = NULL;
 
 	MemSet(&dtxProtocolParms, 0, sizeof(dtxProtocolParms));
 	dtxProtocolParms.dtxProtocolCommand = dtxProtocolCommand;
@@ -111,9 +104,13 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 	dtxProtocolParms.serializedDtxContextInfoLen = serializedDtxContextInfoLen;
 
 	/*
-	 * Allocate a primary QE for every available segDB in the system.
+	 * Dispatch the command.
 	 */
-	primaryGang = AllocateWriterGang();
+	ds = cdbdisp_makeDispatcherState(false);
+
+	queryText = buildGpDtxProtocolCommand(&dtxProtocolParms, &queryTextLen);
+
+	primaryGang = AllocateGang(ds, GANGTYPE_PRIMARY_WRITER, twophaseSegments);
 
 	Assert(primaryGang);
 
@@ -125,26 +122,20 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 				 errhint("dispatching DTX commands to a busy gang")));
 	}
 
-	/*
-	 * Dispatch the command.
-	 */
+	cdbdisp_makeDispatchResults(ds, 1, false);
+	cdbdisp_makeDispatchParams(ds, 1, queryText, queryTextLen);
 
-	queryText = buildGpDtxProtocolCommand(&ds, &dtxProtocolParms, &queryTextLen);
-	cdbdisp_makeDispatcherState(&ds, /* slice count */ 1, /* cancelOnError */ false,
-								queryText, queryTextLen);
-	ds.primaryResults->writer_gang = primaryGang;
+	cdbdisp_dispatchToGang(ds, primaryGang, -1);
+	addToGxactTwophaseSegments(primaryGang);
 
-	PG_TRY();
+	cdbdisp_waitDispatchFinish(ds);
+
+	cdbdisp_checkDispatchResult(ds, DISPATCH_WAIT_NONE);
+
+	pr = cdbdisp_getDispatchResults(ds, qeError);
+
+	if (!pr)
 	{
-		cdbdisp_dispatchToGang(&ds, primaryGang, -1, direct);
-
-		cdbdisp_waitDispatchFinish(&ds);
-
-		/*
-		 * Wait for all QEs to finish.	Don't cancel.
-		 */
-		pr = cdbdisp_getDispatchResults(&ds, errmsgbuf);
-
 		if (!GangOK(primaryGang))
 		{
 			*badGangs = true;
@@ -153,23 +144,13 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 				 dtxProtocolCommandLoggingStr, gid);
 		}
 
-		/*
-		 * No errors happens in QEs
-		 */
-		if (pr)
-		{
-			cdbdisp_returnResults(pr, &cdb_pgresults);
-		}
+		cdbdisp_destroyDispatcherState(ds);
+		return NULL;
+	}
 
-		cdbdisp_destroyDispatcherState(&ds);
-	}
-	PG_CATCH();
-	{
-		cdbdisp_cancelDispatch(&ds);
-		cdbdisp_destroyDispatcherState(&ds);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+	cdbdisp_returnResults(pr, &cdb_pgresults);
+
+	cdbdisp_destroyDispatcherState(ds);
 
 	*numresults = cdb_pgresults.numResults;
 	return cdb_pgresults.pg_results;
@@ -184,6 +165,7 @@ qdSerializeDtxContextInfo(int *size, bool wantSnapshot, bool inCursor,
 	Snapshot	snapshot = NULL;
 	int			serializedLen;
 	DtxContextInfo *pDtxContextInfo = NULL;
+	DtxContext currentDistributedTransactionContext = DistributedTransactionContext;
 
 	/*
 	 * If 'wantSnapshot' is set, then serialize the ActiveSnapshot. The
@@ -198,7 +180,7 @@ qdSerializeDtxContextInfo(int *size, bool wantSnapshot, bool inCursor,
 		snapshot = GetActiveSnapshot();
 	}
 
-	switch (DistributedTransactionContext)
+	switch (currentDistributedTransactionContext)
 	{
 		case DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE:
 		case DTX_CONTEXT_LOCAL_ONLY:
@@ -210,8 +192,11 @@ qdSerializeDtxContextInfo(int *size, bool wantSnapshot, bool inCursor,
 			if (DistributedTransactionContext ==
 				DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE && snapshot != NULL)
 			{
-				updateSharedLocalSnapshot(&TempQDDtxContextInfo, snapshot,
-										  "qdSerializeDtxContextInfo");
+				updateSharedLocalSnapshot(
+					&TempQDDtxContextInfo,
+					currentDistributedTransactionContext,
+					snapshot,
+					"qdSerializeDtxContextInfo");
 			}
 
 			pDtxContextInfo = &TempQDDtxContextInfo;
@@ -252,9 +237,8 @@ qdSerializeDtxContextInfo(int *size, bool wantSnapshot, bool inCursor,
  * Build a dtx protocol command string to be dispatched to QE.
  */
 static char *
-buildGpDtxProtocolCommand(struct CdbDispatcherState *ds,
-						  DispatchCommandDtxProtocolParms *pDtxProtocolParms,
-						  int *finalLen)
+buildGpDtxProtocolCommand(DispatchCommandDtxProtocolParms *pDtxProtocolParms,
+						 int *finalLen)
 {
 	int			dtxProtocolCommand = (int) pDtxProtocolParms->dtxProtocolCommand;
 	int			flags = pDtxProtocolParms->flags;
@@ -283,14 +267,10 @@ buildGpDtxProtocolCommand(struct CdbDispatcherState *ds,
 	char	   *shared_query = NULL;
 	char	   *pos = NULL;
 
-	if (ds->dispatchStateContext == NULL)
-		ds->dispatchStateContext = AllocSetContextCreate(TopMemoryContext,
-														 "Dispatch Context",
-														 ALLOCSET_DEFAULT_MINSIZE,
-														 ALLOCSET_DEFAULT_INITSIZE,
-														 ALLOCSET_DEFAULT_MAXSIZE);
-
-	shared_query = MemoryContextAlloc(ds->dispatchStateContext, total_query_len);
+	/* Allocate query text within DispatcherContext */
+	Assert(DispatcherContext);
+	MemoryContext oldContext = MemoryContextSwitchTo(DispatcherContext);
+	shared_query = palloc0(total_query_len);
 	pos = shared_query;
 
 	*pos++ = 'T';
@@ -344,5 +324,6 @@ buildGpDtxProtocolCommand(struct CdbDispatcherState *ds,
 	if (finalLen)
 		*finalLen = len + 1;
 
+	MemoryContextSwitchTo(oldContext);
 	return shared_query;
 }

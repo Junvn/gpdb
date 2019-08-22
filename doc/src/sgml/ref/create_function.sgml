@@ -1,10 +1,14 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/create_function.sgml,v 1.83 2008/12/18 18:20:33 tgl Exp $
+doc/src/sgml/ref/create_function.sgml
 -->
 
 <refentry id="SQL-CREATEFUNCTION">
+ <indexterm zone="sql-createfunction">
+  <primary>CREATE FUNCTION</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="SQL-CREATEFUNCTION-TITLE">CREATE FUNCTION</refentrytitle>
+  <refentrytitle>CREATE FUNCTION</refentrytitle>
   <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
@@ -14,18 +18,15 @@ $PostgreSQL: pgsql/doc/src/sgml/ref/create_function.sgml,v 1.83 2008/12/18 18:20
   <refpurpose>define a new function</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-createfunction">
-  <primary>CREATE FUNCTION</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 CREATE [ OR REPLACE ] FUNCTION
-    <replaceable class="parameter">name</replaceable> ( [ [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">argtype</replaceable> [ { DEFAULT | = } <replaceable class="parameter">defexpr</replaceable>] [, ...] ] )
-    [ RETURNS [SETOF] <replaceableclass="parameter">rettype</replaceable> |
-      | RETURNS TABLE ( <replaceable class="parameter">colname</replaceable> <replaceable class="parameter">coltype</replaceable> [, ...] ) ]
-  { LANGUAGE <replaceable class="parameter">langname</replaceable>
-    | IMMUTABLE | STABLE | VOLATILE
+    <replaceable class="parameter">name</replaceable> ( [ [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">argtype</replaceable> [ { DEFAULT | = } <replaceable class="parameter">default_expr</replaceable> ] [, ...] ] )
+    [ RETURNS <replaceable class="parameter">rettype</replaceable>
+      | RETURNS TABLE ( <replaceable class="parameter">column_name</replaceable> <replaceable class="parameter">column_type</replaceable> [, ...] ) ]
+  { LANGUAGE <replaceable class="parameter">lang_name</replaceable>
+    | WINDOW
+    | IMMUTABLE | STABLE | VOLATILE | [ NOT ] LEAKPROOF
     | CALLED ON NULL INPUT | RETURNS NULL ON NULL INPUT | STRICT
     | [ EXTERNAL ] SECURITY INVOKER | [ EXTERNAL ] SECURITY DEFINER
     | EXECUTE ON { ANY | MASTER | ALL SEGMENTS }
@@ -46,6 +47,8 @@ CREATE [ OR REPLACE ] FUNCTION
    <command>CREATE FUNCTION</command> defines a new function.
    <command>CREATE OR REPLACE FUNCTION</command> will either create a
    new function, or replace an existing definition.
+   To be able to define a function, the user must have the
+   <literal>USAGE</literal> privilege on the language.
   </para>
 
   <para>
@@ -65,8 +68,16 @@ CREATE [ OR REPLACE ] FUNCTION
    Also, <command>CREATE OR REPLACE FUNCTION</command> will not let
    you change the return type of an existing function.  To do that,
    you must drop and recreate the function.  (When using <literal>OUT</>
-   parameters, that means you cannot change the names or types of any
+   parameters, that means you cannot change the types of any
    <literal>OUT</> parameters except by dropping the function.)
+  </para>
+
+  <para>
+   When <command>CREATE OR REPLACE FUNCTION</> is used to replace an
+   existing function, the ownership and permissions of the function
+   do not change.  All other function properties are assigned the
+   values specified or implied in the command.  You must own the function
+   to replace it (this includes being a member of the owning role).
   </para>
 
   <para>
@@ -81,6 +92,11 @@ CREATE [ OR REPLACE ] FUNCTION
 
   <para>
    The user that creates the function becomes the owner of the function.
+  </para>
+
+  <para>
+   To be able to create a function, you must have <literal>USAGE</literal>
+   privilege on the argument types and the return type.
   </para>
  </refsect1>
 
@@ -119,10 +135,13 @@ CREATE [ OR REPLACE ] FUNCTION
 
      <listitem>
       <para>
-       The name of an argument. Some languages (currently only PL/pgSQL) let
-       you use the name in the function body.  For other languages the
-       name of an input argument is just extra documentation.  But the name
-       of an output argument is significant, since it defines the column
+       The name of an argument. Some languages (including SQL and PL/pgSQL)
+       let you use the name in the function body.  For other languages the
+       name of an input argument is just extra documentation, so far as
+       the function itself is concerned; but you can use input argument names
+       when calling a function to improve readability (see <xref
+       linkend="sql-syntax-calling-funcs">).  In any case, the name
+       of an output argument is significant, because it defines the column
        name in the result row type.  (If you omit the name for an output
        argument, the system will choose a default column name.)
       </para>
@@ -147,8 +166,8 @@ CREATE [ OR REPLACE ] FUNCTION
       <para>
        The type of a column is referenced by writing
        <literal><replaceable
-       class="parameter">tablename</replaceable>.<replaceable
-       class="parameter">columnname</replaceable>%TYPE</literal>.
+       class="parameter">table_name</replaceable>.<replaceable
+       class="parameter">column_name</replaceable>%TYPE</literal>.
        Using this feature can sometimes help make a function independent of
        changes to the definition of a table.
       </para>
@@ -156,7 +175,7 @@ CREATE [ OR REPLACE ] FUNCTION
     </varlistentry>
 
     <varlistentry>
-     <term><replaceable class="parameter">defexpr</replaceable></term>
+     <term><replaceable class="parameter">default_expr</replaceable></term>
 
      <listitem>
       <para>
@@ -198,14 +217,14 @@ CREATE [ OR REPLACE ] FUNCTION
       <para>
        The type of a column is referenced by writing
        <literal><replaceable
-       class="parameter">tablename</replaceable>.<replaceable
-       class="parameter">columnname</replaceable>%TYPE</literal>.
+       class="parameter">table_name</replaceable>.<replaceable
+       class="parameter">column_name</replaceable>%TYPE</literal>.
       </para>
      </listitem>
     </varlistentry>
 
     <varlistentry>
-     <term><replaceable class="parameter">colname</replaceable></term>
+     <term><replaceable class="parameter">column_name</replaceable></term>
 
      <listitem>
       <para>
@@ -218,7 +237,7 @@ CREATE [ OR REPLACE ] FUNCTION
     </varlistentry>
 
     <varlistentry>
-     <term><replaceable class="parameter">coltype</replaceable></term>
+     <term><replaceable class="parameter">column_type</replaceable></term>
 
      <listitem>
       <para>
@@ -229,15 +248,28 @@ CREATE [ OR REPLACE ] FUNCTION
     </varlistentry>
 
     <varlistentry>
-     <term><replaceable class="parameter">langname</replaceable></term>
+     <term><replaceable class="parameter">lang_name</replaceable></term>
 
      <listitem>
       <para>
        The name of the language that the function is implemented in.
-       Can be <literal>SQL</literal>, <literal>C</literal>,
+       It can be <literal>sql</literal>, <literal>c</literal>,
        <literal>internal</literal>, or the name of a user-defined
-       procedural language.  For backward compatibility,
-       the name can be enclosed by single quotes.
+       procedural language, e.g. <literal>plpgsql</literal>.  Enclosing the
+       name in single quotes is deprecated and requires matching case.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>WINDOW</literal></term>
+
+     <listitem>
+      <para><literal>WINDOW</literal> indicates that the function is a
+       <firstterm>window function</> rather than a plain function.
+       This is currently only useful for functions written in C.
+       The <literal>WINDOW</> attribute cannot be changed when
+       replacing an existing function definition.
       </para>
      </listitem>
     </varlistentry>
@@ -255,8 +287,7 @@ CREATE [ OR REPLACE ] FUNCTION
        <literal>VOLATILE</literal> is the default assumption.
       </para>
 
-      <para>
-       <literal>IMMUTABLE</literal> indicates that the function
+      <para><literal>IMMUTABLE</literal> indicates that the function
        cannot modify the database and always
        returns the same result when given the same argument values; that
        is, it does not do database lookups or otherwise use information not
@@ -265,20 +296,20 @@ CREATE [ OR REPLACE ] FUNCTION
        immediately replaced with the function value.
       </para>
 
-      <para>
-       <literal>STABLE</literal> indicates that the function
+      <para><literal>STABLE</literal> indicates that the function
        cannot modify the database,
        and that within a single table scan it will consistently
        return the same result for the same argument values, but that its
        result could change across SQL statements.  This is the appropriate
        selection for functions whose results depend on database lookups,
-       parameter variables (such as the current time zone), etc.  Also note
+       parameter variables (such as the current time zone), etc.  (It is
+       inappropriate for <literal>AFTER</> triggers that wish to
+       query rows modified by the current command.)  Also note
        that the <function>current_timestamp</> family of functions qualify
        as stable, since their values do not change within a transaction.
       </para>
 
-      <para>
-       <literal>VOLATILE</literal> indicates that the function value can
+      <para><literal>VOLATILE</literal> indicates that the function value can
        change even within a single table scan, so no optimizations can be
        made.  Relatively few database functions are volatile in this sense;
        some examples are <literal>random()</>, <literal>currval()</>,
@@ -295,21 +326,36 @@ CREATE [ OR REPLACE ] FUNCTION
     </varlistentry>
 
     <varlistentry>
+     <term><literal>LEAKPROOF</literal></term>
+     <listitem>
+      <para>
+       <literal>LEAKPROOF</literal> indicates that the function has no side
+       effects.  It reveals no information about its arguments other than by
+       its return value.  For example, a function which throws an error message
+       for some argument values but not others, or which includes the argument
+       values in any error message, is not leakproof.   The query planner may
+       push leakproof functions (but not others) into views created with the
+       <literal>security_barrier</literal> option.  See
+       <xref linkend="sql-createview"> and <xref linkend="rules-privileges">.
+       This option can only be set by the superuser.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
      <term><literal>CALLED ON NULL INPUT</literal></term>
      <term><literal>RETURNS NULL ON NULL INPUT</literal></term>
      <term><literal>STRICT</literal></term>
 
      <listitem>
-      <para>
-       <literal>CALLED ON NULL INPUT</literal> (the default) indicates
+      <para><literal>CALLED ON NULL INPUT</literal> (the default) indicates
        that the function will be called normally when some of its
        arguments are null.  It is then the function author's
        responsibility to check for null values if necessary and respond
        appropriately.
       </para>
 
-      <para>
-       <literal>RETURNS NULL ON NULL INPUT</literal> or
+      <para><literal>RETURNS NULL ON NULL INPUT</literal> or
        <literal>STRICT</literal> indicates that the function always
        returns null whenever any of its arguments are null.  If this
        parameter is specified, the function is not executed when there
@@ -324,8 +370,7 @@ CREATE [ OR REPLACE ] FUNCTION
     <term><literal><optional>EXTERNAL</optional> SECURITY DEFINER</literal></term>
 
     <listitem>
-     <para>
-      <literal>SECURITY INVOKER</literal> indicates that the function
+     <para><literal>SECURITY INVOKER</literal> indicates that the function
       is to be executed with the privileges of the user that calls it.
       That is the default.  <literal>SECURITY DEFINER</literal>
       specifies that the function is to be executed with the
@@ -377,12 +422,25 @@ CREATE [ OR REPLACE ] FUNCTION
        The <literal>SET</> clause causes the specified configuration
        parameter to be set to the specified value when the function is
        entered, and then restored to its prior value when the function exits.
-       <literal>SET FROM CURRENT</> saves the session's current value of
-       the parameter as the value to be applied when the function is entered.
+       <literal>SET FROM CURRENT</> saves the value of the parameter that
+       is current when <command>CREATE FUNCTION</> is executed as the value
+       to be applied when the function is entered.
       </para>
 
       <para>
-       See <xref linkend="sql-set" endterm="sql-set-title"> and
+       If a <literal>SET</> clause is attached to a function, then
+       the effects of a <command>SET LOCAL</> command executed inside the
+       function for the same variable are restricted to the function: the
+       configuration parameter's prior value is still restored at function exit.
+       However, an ordinary
+       <command>SET</> command (without <literal>LOCAL</>) overrides the
+       <literal>SET</> clause, much as it would do for a previous <command>SET
+       LOCAL</> command: the effects of such a command will persist after
+       function exit, unless the current transaction is rolled back.
+      </para>
+
+      <para>
+       See <xref linkend="sql-set"> and
        <xref linkend="runtime-config">
        for more information about allowed parameter names and values.
       </para>
@@ -398,6 +456,15 @@ CREATE [ OR REPLACE ] FUNCTION
        language.  It can be an internal function name, the path to an
        object file, an SQL command, or text in a procedural language.
       </para>
+
+      <para>
+       It is often helpful to use dollar quoting (see <xref
+       linkend="sql-syntax-dollar-quoting">) to write the function definition
+       string, rather than the normal single quote syntax.  Without dollar
+       quoting, any single quotes or backslashes in the function definition must
+       be escaped by doubling them.
+      </para>
+
      </listitem>
     </varlistentry>
 
@@ -414,9 +481,20 @@ CREATE [ OR REPLACE ] FUNCTION
        file containing the dynamically loadable object, and
        <replaceable class="parameter">link_symbol</replaceable> is the
        function's link symbol, that is, the name of the function in the C
-       language source code.  If the link symbol is omitted, it is assumed
-       to be the same as the name of the SQL function being defined.
+       language source code.  If the link symbol is omitted, it is assumed to
+       be the same as the name of the SQL function being defined.  The C names
+       of all functions must be different, so you must give overloaded C
+       functions different C names (for example, use the argument types as
+       part of the C names).
       </para>
+
+      <para>
+       When repeated <command>CREATE FUNCTION</command> calls refer to
+       the same object file, the file is only loaded once per session.
+       To unload and
+       reload the file (perhaps during development), start a new session.
+      </para>
+
      </listitem>
     </varlistentry>
 
@@ -441,8 +519,7 @@ CREATE [ OR REPLACE ] FUNCTION
        <varlistentry>
         <term><literal>isCachable</></term>
         <listitem>
-         <para>
-          <literal>isCachable</literal> is an obsolete equivalent of
+         <para><literal>isCachable</literal> is an obsolete equivalent of
           <literal>IMMUTABLE</literal>; it's still accepted for
           backwards-compatibility reasons.
          </para>
@@ -458,34 +535,23 @@ CREATE [ OR REPLACE ] FUNCTION
 
    </variablelist>
 
- </refsect1>
-
- <refsect1 id="sql-createfunction-notes">
-  <title>Notes</title>
-
    <para>
     Refer to <xref linkend="xfunc"> for further information on writing
     functions.
    </para>
 
-   <para>
-    The full <acronym>SQL</acronym> type syntax is allowed for
-    input arguments and return value. However, some details of the
-    type specification (e.g., the precision field for
-    type <type>numeric</type>) are the responsibility of the
-    underlying function implementation and are silently swallowed
-    (i.e., not recognized or
-    enforced) by the <command>CREATE FUNCTION</command> command.
-   </para>
+ </refsect1>
+
+ <refsect1 id="sql-createfunction-overloading">
+  <title>Overloading</title>
 
    <para>
     <productname>PostgreSQL</productname> allows function
     <firstterm>overloading</firstterm>; that is, the same name can be
     used for several different functions so long as they have distinct
-    input argument types.  However, the C names of all functions must be
-    different, so you must give overloaded C functions different C
-    names (for example, use the argument types as part of the C
-    names).
+    input argument types.  Whether or not you use it, this capability entails
+    security precautions when calling functions in databases where some users
+    mistrust other users; see <xref linkend="typeconv-func">.
    </para>
 
    <para>
@@ -510,50 +576,39 @@ CREATE FUNCTION foo(int, int default 42) ...
     function should be called.
    </para>
 
+ </refsect1>
+
+ <refsect1 id="sql-createfunction-notes">
+  <title>Notes</title>
+
    <para>
-    When repeated <command>CREATE FUNCTION</command> calls refer to
-    the same object file, the file is only loaded once per session.
-    To unload and
-    reload the file (perhaps during development), start a new session.
+    The full <acronym>SQL</acronym> type syntax is allowed for
+    declaring a function's arguments and return value.  However,
+    parenthesized type modifiers (e.g., the precision field for
+    type <type>numeric</type>) are discarded by <command>CREATE FUNCTION</>.
+    Thus for example
+    <literal>CREATE FUNCTION foo (varchar(10)) ...</>
+    is exactly the same as
+    <literal>CREATE FUNCTION foo (varchar) ...</>.
    </para>
 
    <para>
-    Use <xref linkend="sql-dropfunction"
-    endterm="sql-dropfunction-title"> to remove user-defined
-    functions.
+    When replacing an existing function with <command>CREATE OR REPLACE
+    FUNCTION</>, there are restrictions on changing parameter names.
+    You cannot change the name already assigned to any input parameter
+    (although you can add names to parameters that had none before).
+    If there is more than one output parameter, you cannot change the
+    names of the output parameters, because that would change the
+    column names of the anonymous composite type that describes the
+    function's result.  These restrictions are made to ensure that
+    existing calls of the function do not stop working when it is replaced.
    </para>
 
    <para>
-    It is often helpful to use dollar quoting (see <xref
-    linkend="sql-syntax-dollar-quoting">) to write the function definition
-    string, rather than the normal single quote syntax.  Without dollar
-    quoting, any single quotes or backslashes in the function definition must
-    be escaped by doubling them.
-   </para>
-
-   <para>
-    If a <literal>SET</> clause is attached to a function, then
-    the effects of a <command>SET LOCAL</> command executed inside the
-    function for the same variable are restricted to the function: the
-    configuration parameter's prior value is still restored at function exit.
-    However, an ordinary
-    <command>SET</> command (without <literal>LOCAL</>) overrides the
-    <literal>SET</> clause, much as it would do for a previous <command>SET
-    LOCAL</> command: the effects of such a command will persist after
-    function exit, unless the current transaction is rolled back.
-   </para>
-
-   <para>
-    To be able to define a function, the user must have the
-    <literal>USAGE</literal> privilege on the language.
-   </para>
-
-   <para>
-    When <command>CREATE OR REPLACE FUNCTION</> is used to replace an
-    existing function, the ownership and permissions of the function
-    do not change.  All other function properties are assigned the
-    values specified or implied in the command.  You must own the function
-    to replace it (this includes being a member of the owning role).
+    If a function is declared <literal>STRICT</> with a <literal>VARIADIC</>
+    argument, the strictness check tests that the variadic array <emphasis>as
+    a whole</> is non-null.  The function will still be called if the
+    array has null elements.
    </para>
 
  </refsect1>
@@ -623,6 +678,11 @@ SELECT * FROM dup(42);
  <refsect1 id="sql-createfunction-security">
   <title>Writing <literal>SECURITY DEFINER</literal> Functions Safely</title>
 
+  <indexterm>
+   <primary><varname>search_path</varname> configuration parameter</>
+   <secondary>use in securing functions</>
+  </indexterm>
+
    <para>
     Because a <literal>SECURITY DEFINER</literal> function is executed
     with the privileges of the user that created it, care is needed to
@@ -634,7 +694,7 @@ SELECT * FROM dup(42);
     temporary-table schema, which is searched first by default, and
     is normally writable by anyone.  A secure arrangement can be had
     by forcing the temporary schema to be searched last.  To do this,
-    write <literal>pg_temp</> as the last entry in <varname>search_path</>.
+    write <literal>pg_temp</><indexterm><primary>pg_temp</><secondary>securing functions</></> as the last entry in <varname>search_path</>.
     This function illustrates safe usage:
    </para>
 
@@ -677,7 +737,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
    <para>
     Another point to keep in mind is that by default, execute privilege
     is granted to <literal>PUBLIC</> for newly created functions
-    (see <xref linkend="sql-grant" endterm="sql-grant-title"> for more
+    (see <xref linkend="sql-grant"> for more
     information).  Frequently you will wish to restrict use of a security
     definer function to only some users.  To do that, you must revoke
     the default <literal>PUBLIC</> privileges and then grant execute
@@ -714,11 +774,9 @@ COMMIT;
   </para>
 
   <para>
-   The SQL standard does not specify parameter defaults.  The syntax
-   with the <literal>DEFAULT</literal> key word is from Oracle, and it
-   is somewhat in the spirit of the standard: SQL/PSM uses it for
-   variable default values.  The syntax with <literal>=</literal> is
-   used in T-SQL and Firebird.
+   For parameter defaults, the SQL standard specifies only the syntax with
+   the <literal>DEFAULT</literal> key word.  The syntax
+   with <literal>=</literal> is used in T-SQL and Firebird.
   </para>
  </refsect1>
 
@@ -727,12 +785,12 @@ COMMIT;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-alterfunction" endterm="sql-alterfunction-title"></member>
-   <member><xref linkend="sql-dropfunction" endterm="sql-dropfunction-title"></member>
-   <member><xref linkend="sql-grant" endterm="sql-grant-title"></member>
-   <member><xref linkend="sql-load" endterm="sql-load-title"></member>
-   <member><xref linkend="sql-revoke" endterm="sql-revoke-title"></member>
-   <member><xref linkend="app-createlang" endterm="app-createlang-title"></member>
+   <member><xref linkend="sql-alterfunction"></member>
+   <member><xref linkend="sql-dropfunction"></member>
+   <member><xref linkend="sql-grant"></member>
+   <member><xref linkend="sql-load"></member>
+   <member><xref linkend="sql-revoke"></member>
+   <member><xref linkend="app-createlang"></member>
   </simplelist>
  </refsect1>
 

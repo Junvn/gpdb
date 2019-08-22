@@ -5710,25 +5710,21 @@ select CITY12,POPULATION12 from
 ) FOO1
 ) FOO0 group by city12 order by city12;-- negative cases where queries have duplicate names in CTEs
 
---query1 having duplicates without specifying a column list. Should error out. 
+-- Tests for duplicate column aliases
 with capitals as 
 (select country.code,id,city.name,city.countrycode as code from city,country 
  where city.countrycode = country.code AND city.id = country.capital) 
+select * from capitals where id < 100;
 
-select * from capitals;
-
--- query2
 with allofficiallanguages as 
 (select countrylanguage.countrycode,city.countrycode,language from
  city,countrylanguage where countrylanguage.countrycode = city.countrycode and isofficial = 'True')
-select * from allofficiallanguages;
+select * from allofficiallanguages where language like 'A%';
 
--- query3 specifying duplicates explicitly in the column list
 with capitals(code,id,name,code) as 
 (select country.code,id,city.name,city.countrycode from city,country 
  where city.countrycode = country.code AND city.id = country.capital) 
-
-select * from capitals;
+select * from capitals where id < 100;
 
 -- query1 CTE referencing itself
 with lang_total as
@@ -9838,7 +9834,7 @@ CREATE TABLE foo (key INTEGER, value INTEGER);
 INSERT INTO foo SELECT i, i % 10 from generate_series(1, 100) i;
 
 CREATE TABLE bar(bar_key INTEGER, bar_value INTEGER);
-INSERT INTO bar SELECT i, i % 5 FROM generate_series(1, 100000) i;
+INSERT INTO bar SELECT i, i % 5 FROM generate_series(1, 1000) i;
 
 SET enable_hashjoin = OFF;
 SET enable_mergejoin = OFF;
@@ -10080,7 +10076,7 @@ SET gp_cte_sharing = ON;
 -------------------------------------------------------------------------------------------------------------------------------
 
 CREATE TABLE emp (ename CHARACTER VARYING(50), empno INTEGER, mgr INTEGER, deptno INTEGER);
-INSERT INTO emp SELECT i || 'NAME', i, i%6, i%16 FROM generate_series(1, 10000) i;
+INSERT INTO emp SELECT i || 'NAME', i, i%6, i%16 FROM generate_series(1, 100) i;
 
 CREATE TABLE manager (dept_mgr_no INTEGER);
 INSERT INTO manager SELECT i FROM generate_series(1, 100) i;

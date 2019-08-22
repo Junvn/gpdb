@@ -88,6 +88,36 @@ SELECT bool 'nay' AS error;
 ERROR:  invalid input syntax for type boolean: "nay"
 LINE 1: SELECT bool 'nay' AS error;
                     ^
+SELECT bool 'on' AS true;
+ true 
+------
+ t
+(1 row)
+
+SELECT bool 'off' AS false;
+ false 
+-------
+ f
+(1 row)
+
+SELECT bool 'of' AS false;
+ false 
+-------
+ f
+(1 row)
+
+SELECT bool 'o' AS error;
+ERROR:  invalid input syntax for type boolean: "o"
+LINE 1: SELECT bool 'o' AS error;
+                    ^
+SELECT bool 'on_' AS error;
+ERROR:  invalid input syntax for type boolean: "on_"
+LINE 1: SELECT bool 'on_' AS error;
+                    ^
+SELECT bool 'off_' AS error;
+ERROR:  invalid input syntax for type boolean: "off_"
+LINE 1: SELECT bool 'off_' AS error;
+                    ^
 SELECT bool '1' AS true;
  true 
 ------
@@ -197,7 +227,7 @@ HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sur
 INSERT INTO BOOLTBL1 (f1) VALUES (bool 't');
 INSERT INTO BOOLTBL1 (f1) VALUES (bool 'True');
 INSERT INTO BOOLTBL1 (f1) VALUES (bool 'true');
--- BOOLTBL1 should be full of true's at this point 
+-- BOOLTBL1 should be full of true's at this point
 SELECT '' AS t_3, BOOLTBL1.* FROM BOOLTBL1;
  t_3 | f1 
 -----+----
@@ -216,7 +246,7 @@ SELECT '' AS t_3, BOOLTBL1.*
      | t
 (3 rows)
 
-SELECT '' AS t_3, BOOLTBL1.* 
+SELECT '' AS t_3, BOOLTBL1.*
    FROM BOOLTBL1
    WHERE f1 <> bool 'false';
  t_3 | f1 
@@ -234,7 +264,7 @@ SELECT '' AS zero, BOOLTBL1.*
 (0 rows)
 
 INSERT INTO BOOLTBL1 (f1) VALUES (bool 'f');
-SELECT '' AS f_1, BOOLTBL1.* 
+SELECT '' AS f_1, BOOLTBL1.*
    FROM BOOLTBL1
    WHERE f1 = bool 'false';
  f_1 | f1 
@@ -251,12 +281,12 @@ INSERT INTO BOOLTBL2 (f1) VALUES (bool 'False');
 INSERT INTO BOOLTBL2 (f1) VALUES (bool 'FALSE');
 -- This is now an invalid expression
 -- For pre-v6.3 this evaluated to false - thomas 1997-10-23
-INSERT INTO BOOLTBL2 (f1) 
-   VALUES (bool 'XXX');  
+INSERT INTO BOOLTBL2 (f1)
+   VALUES (bool 'XXX');
 ERROR:  invalid input syntax for type boolean: "XXX"
 LINE 2:    VALUES (bool 'XXX');
                         ^
--- BOOLTBL2 should be full of false's at this point 
+-- BOOLTBL2 should be full of false's at this point
 SELECT '' AS f_4, BOOLTBL2.* FROM BOOLTBL2;
  f_4 | f1 
 -----+----
@@ -306,7 +336,7 @@ SELECT '' AS tf_12, BOOLTBL1.*, BOOLTBL2.*
 
 SELECT '' AS ff_4, BOOLTBL1.*, BOOLTBL2.*
    FROM BOOLTBL1, BOOLTBL2
-   WHERE BOOLTBL2.f1 = BOOLTBL1.f1 and BOOLTBL1.f1 = bool 'false' ;
+   WHERE BOOLTBL2.f1 = BOOLTBL1.f1 and BOOLTBL1.f1 = bool 'false';
  ff_4 | f1 | f1 
 ------+----+----
       | f  | f
@@ -318,7 +348,7 @@ SELECT '' AS ff_4, BOOLTBL1.*, BOOLTBL2.*
 SELECT '' AS tf_12_ff_4, BOOLTBL1.*, BOOLTBL2.*
    FROM BOOLTBL1, BOOLTBL2
    WHERE BOOLTBL2.f1 = BOOLTBL1.f1 or BOOLTBL1.f1 = bool 'true'
-   ORDER BY BOOLTBL1.f1, BOOLTBL2.f1 ;
+   ORDER BY BOOLTBL1.f1, BOOLTBL2.f1;
  tf_12_ff_4 | f1 | f1 
 ------------+----+----
             | f  | f
@@ -340,7 +370,7 @@ SELECT '' AS tf_12_ff_4, BOOLTBL1.*, BOOLTBL2.*
 (16 rows)
 
 --
--- SQL92 syntax
+-- SQL syntax
 -- Try all combinations to ensure that we get nothing when we expect nothing
 -- - thomas 2000-01-04
 --

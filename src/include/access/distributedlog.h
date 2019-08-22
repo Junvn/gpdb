@@ -57,26 +57,29 @@ extern bool DistributedLog_ScanForPrevCommitted(
 									TransactionId *indexXid,
 									DistributedTransactionTimeStamp *distribTimeStamp,
 									DistributedTransactionId *distribXid);
+extern TransactionId DistributedLog_AdvanceOldestXmin(TransactionId oldestInProgressLocalXid,
+								 DistributedTransactionTimeStamp distribTimeStamp,
+								 DistributedTransactionId oldestDistribXid);
+extern TransactionId DistributedLog_GetOldestXmin(TransactionId oldestLocalXmin);
 
 extern Size DistributedLog_ShmemSize(void);
 extern void DistributedLog_ShmemInit(void);
 extern void DistributedLog_BootStrap(void);
-extern bool DistributedLog_UpgradeCheck(bool inRecovery);
 extern void DistributedLog_Startup(
 					   TransactionId oldestActiveXid,
 					   TransactionId nextXid);
 extern void DistributedLog_Shutdown(void);
 extern void DistributedLog_CheckPoint(void);
 extern void DistributedLog_Extend(TransactionId newestXid);
-extern void DistributedLog_Truncate(TransactionId oldestXid);
 extern bool DistributedLog_GetLowWaterXid(
 							  TransactionId *lowWaterXid);
+extern void DistributedLog_InitOldestXmin(void);
 
 /* XLOG stuff */
 #define DISTRIBUTEDLOG_ZEROPAGE		0x00
 #define DISTRIBUTEDLOG_TRUNCATE		0x10
 
 extern void DistributedLog_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
-extern void DistributedLog_desc(StringInfo buf, XLogRecPtr beginLoc, XLogRecord *record);
+extern void DistributedLog_desc(StringInfo buf, XLogRecord *record);
 
 #endif							/* DISTRIBUTEDLOG_H */

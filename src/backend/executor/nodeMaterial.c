@@ -5,12 +5,12 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeMaterial.c,v 1.64 2008/12/27 17:39:00 tgl Exp $
+ *	  src/backend/executor/nodeMaterial.c
  *
  *-------------------------------------------------------------------------
  */
@@ -33,9 +33,10 @@
 #include "cdb/cdbvars.h"
 
 static void ExecMaterialExplainEnd(PlanState *planstate, struct StringInfoData *buf);
-static void ExecChildRescan(MaterialState *node, ExprContext *exprCtxt);
+static void ExecChildRescan(MaterialState *node);
 static void DestroyTupleStore(MaterialState *node);
 
+static void ExecEagerFreeMaterial(MaterialState *node);
 
 /* ----------------------------------------------------------------
  *		ExecMaterial
@@ -93,7 +94,7 @@ ExecMaterial(MaterialState *node)
 			}
 
 			shareinput_create_bufname_prefix(rwfile_prefix, sizeof(rwfile_prefix), ma->share_id);
-			elog(LOG, "Material node creates shareinput rwfile %s", rwfile_prefix);
+			elog(DEBUG1, "Material node creates shareinput rwfile %s", rwfile_prefix);
 
 			ts = ntuplestore_create_readerwriter(rwfile_prefix, PlanStateOperatorMemKB((PlanState *)node) * 1024, true);
 			tsa = ntuplestore_create_accessor(ts, true);
@@ -101,9 +102,7 @@ ExecMaterial(MaterialState *node)
 		else
 		{
 			/* Non-shared Materialize node */
-			workfile_set *work_set =  workfile_mgr_create_set(BUFFILE, false /* can_reuse */, &node->ss.ps);
-
-			ts = ntuplestore_create_workset(work_set, PlanStateOperatorMemKB((PlanState *) node) * 1024);
+			ts = ntuplestore_create(PlanStateOperatorMemKB((PlanState *) node) * 1024, "Materialize");
 			tsa = ntuplestore_create_accessor(ts, true /* isWriter */);
 		}
 
@@ -112,7 +111,7 @@ ExecMaterial(MaterialState *node)
 		node->ts_pos = (void *) tsa;
 
         /* CDB: Offer extra info for EXPLAIN ANALYZE. */
-        if (node->ss.ps.instrument)
+        if (node->ss.ps.instrument && node->ss.ps.instrument->need_cdb)
         {
             /* Let the tuplestore share our Instrumentation object. */
 			ntuplestore_setinstrument(ts, node->ss.ps.instrument);
@@ -220,7 +219,7 @@ ExecMaterial(MaterialState *node)
 		if (TupIsNull(outerslot))
 		{
 			node->eof_underlying = true;
-			if (!node->ss.ps.delayEagerFree)
+			if (!node->delayEagerFree)
 			{
 				ExecEagerFreeMaterial(node);
 			}
@@ -238,7 +237,7 @@ ExecMaterial(MaterialState *node)
 	}
 
 
-	if (!node->ss.ps.delayEagerFree)
+	if (!node->delayEagerFree)
 	{
 		ExecEagerFreeMaterial(node);
 	}
@@ -268,6 +267,19 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 
 	if (node->cdb_strict)
 		eflags |= EXEC_FLAG_REWIND;
+
+	/*
+	 * If the Material node was inserted to protect the child node from rescanning, don't
+	 * eager free.
+	 *
+	 * XXX: The planner doesn't always set the flag for Material nodes that are put
+	 * directly on top of Motion nodes, so check for that, too. (Or is this for ORCA?)
+	 */
+	if (node->cdb_shield_child_from_rescans ||
+		IsA(outerPlan((Plan *) node), Motion))
+	{
+		eflags |= EXEC_FLAG_REWIND;
+	}
 
 	/*
 	 * We must have a tuplestore buffering the subplan output to do backward
@@ -303,8 +315,6 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 	 * ExecQual or ExecProject.
 	 */
 
-#define MATERIAL_NSLOTS 2
-
 	/*
 	 * tuple table initialization
 	 *
@@ -317,7 +327,7 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 	 * If eflag contains EXEC_FLAG_REWIND or EXEC_FLAG_BACKWARD or EXEC_FLAG_MARK,
 	 * then this node is not eager free safe.
 	 */
-	matstate->ss.ps.delayEagerFree =
+	matstate->delayEagerFree =
 		((eflags & (EXEC_FLAG_REWIND | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)) != 0);
 
 	/*
@@ -347,18 +357,9 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 	 * index into range table, while the material may refer to the same relation as "outer" varno)
 	 * [JIRA: MPP-25365]
 	 */
-	insist_log(list_length(node->plan.targetlist) == list_length(outerPlan->targetlist),
-			"Material operator does not support projection");
+	if (list_length(node->plan.targetlist) != list_length(outerPlan->targetlist))
+		elog(ERROR, "Material operator does not support projection");
 	outerPlanState(matstate) = ExecInitNode(outerPlan, estate, eflags);
-
-	/*
-	 * If the child node of a Material is a Motion, then this Material node is
-	 * not eager free safe.
-	 */
-	if (IsA(outerPlan((Plan *)node), Motion))
-	{
-		matstate->ss.ps.delayEagerFree = true;
-	}
 
 	/*
 	 * initialize tuple type.  no need to initialize projection info because
@@ -380,15 +381,6 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 
 	return matstate;
 }
-
-int
-ExecCountSlotsMaterial(Material *node)
-{
-	return ExecCountSlotsNode(outerPlan((Plan *) node)) +
-		ExecCountSlotsNode(innerPlan((Plan *) node)) +
-		MATERIAL_NSLOTS;
-}
-
 
 /*
  * ExecMaterialExplainEnd
@@ -536,28 +528,28 @@ DestroyTupleStore(MaterialState *node)
  * ExecChildRescan
  *      Helper function for rescanning child of materialize node
  */
-void
-ExecChildRescan(MaterialState *node, ExprContext *exprCtxt)
+static void
+ExecChildRescan(MaterialState *node)
 {
 	Assert(node);
 	/*
 	 * if parameters of subplan have changed, then subplan will be rescanned by
 	 * first ExecProcNode. Otherwise, we need to rescan subplan here
 	 */
-	if (((PlanState *) node)->lefttree->chgParam == NULL)
-		ExecReScan(((PlanState *) node)->lefttree, exprCtxt);
+	if (node->ss.ps.lefttree->chgParam == NULL)
+		ExecReScan(node->ss.ps.lefttree);
 
 	node->eof_underlying = false;
 }
 
 /* ----------------------------------------------------------------
- *		ExecMaterialReScan
+ *		ExecReScanMaterial
  *
  *		Rescans the materialized relation.
  * ----------------------------------------------------------------
  */
 void
-ExecMaterialReScan(MaterialState *node, ExprContext *exprCtxt)
+ExecReScanMaterial(MaterialState *node)
 {
 	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 
@@ -575,7 +567,7 @@ ExecMaterialReScan(MaterialState *node, ExprContext *exprCtxt)
 			 */
 			if (node->ts_destroyed)
 			{
-				ExecChildRescan(node, exprCtxt);
+				ExecChildRescan(node);
 			}
 			return;
 		}
@@ -590,12 +582,12 @@ ExecMaterialReScan(MaterialState *node, ExprContext *exprCtxt)
 		 * Otherwise we can just rewind and rescan the stored output. The
 		 * state of the subnode does not change.
 		 */
-		if (((PlanState *) node)->lefttree->chgParam != NULL ||
+		if (node->ss.ps.lefttree->chgParam != NULL ||
 			(node->eflags & EXEC_FLAG_REWIND) == 0)
 		{
 			DestroyTupleStore(node);
-			if (((PlanState *) node)->lefttree->chgParam == NULL)
-				ExecReScan(((PlanState *) node)->lefttree, exprCtxt);
+			if (node->ss.ps.lefttree->chgParam == NULL)
+				ExecReScan(node->ss.ps.lefttree);
 		}
 		else
 		{
@@ -605,11 +597,11 @@ ExecMaterialReScan(MaterialState *node, ExprContext *exprCtxt)
 	else
 	{
 		/* In this case we are just passing on the subquery's output */
-		ExecChildRescan(node, exprCtxt);
+		ExecChildRescan(node);
 	}
 }
 
-void
+static void
 ExecEagerFreeMaterial(MaterialState *node)
 {
 	Material   *ma = (Material *) node->ss.ps.plan;
@@ -650,5 +642,24 @@ ExecEagerFreeMaterial(MaterialState *node)
 		Assert(node->ts_pos);
 
 		DestroyTupleStore(node);
+	}
+}
+
+void
+ExecSquelchMaterial(MaterialState *node)
+{
+	/*
+	 * If this Material is shielding the underlying nodes from rescanning (for
+	 * example, if there is a Motion node below), then keep the tuplestore.
+	 * Also, don't recurse to the subtree in that case, because we might need
+	 * to read more tuples from it after a ReScan. Most likely we have already
+	 * read all the tuples from the underlying node in that case, but it's
+	 * possible that ExecMaterial hasn't been called even once yet, and we
+	 * haven't created the tuplestore yet.
+	 */
+	if (!node->delayEagerFree)
+	{
+		ExecEagerFreeMaterial(node);
+		ExecSquelchNode(outerPlanState(node));
 	}
 }

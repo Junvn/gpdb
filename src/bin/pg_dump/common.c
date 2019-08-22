@@ -1,38 +1,24 @@
 /*-------------------------------------------------------------------------
  *
  * common.c
- *	  common routines between pg_dump and pg4_dump
+ *	Catalog routines used by pg_dump; long ago these were shared
+ *	by another dump tool, but not anymore.
  *
- * Since pg4_dump is long-dead code, there is no longer any useful distinction
- * between this file and pg_dump.c.
- *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/bin/pg_dump/common.c,v 1.105 2008/12/19 16:25:17 petere Exp $
+ *	  src/bin/pg_dump/common.c
  *
  *-------------------------------------------------------------------------
  */
-#include "postgres_fe.h"
+#include "pg_backup_archiver.h"
+#include "pg_backup_utils.h"
 
-/*
- * GPDB_84_MERGE_FIXME: need to clean up these header includes. Some are
- * gpdb-specific, others appear to have been taken from older postgres versions,
- * some are duplicated.
- */
 #include <ctype.h>
-#include <time.h>
-#include "dumputils.h"
-#include "postgres.h"
-#include "catalog/pg_class.h"
-
-#include "pg_backup_archiver.h"
 
 #include "catalog/pg_class.h"
-
-#include "pg_backup_archiver.h"
 
 
 /*
@@ -51,22 +37,25 @@ static int	numCatalogIds = 0;
 
 /*
  * These variables are static to avoid the notational cruft of having to pass
- * them into findTableByOid() and friends.	For each of these arrays, we
- * build a sorted-by-OID index array immediately after it's built, and then
- * we use binary search in findTableByOid() and friends.  (qsort'ing the base
- * arrays themselves would be simpler, but it doesn't work because pg_dump.c
- * may have already established pointers between items.)
+ * them into findTableByOid() and friends.  For each of these arrays, we build
+ * a sorted-by-OID index array immediately after the objects are fetched,
+ * and then we use binary search in findTableByOid() and friends.  (qsort'ing
+ * the object arrays themselves would be simpler, but it doesn't work because
+ * pg_dump.c may have already established pointers between items.)
  */
 static DumpableObject **tblinfoindex;
 static DumpableObject **typinfoindex;
 static DumpableObject **funinfoindex;
 static DumpableObject **oprinfoindex;
+static DumpableObject **collinfoindex;
 static DumpableObject **nspinfoindex;
 static DumpableObject **extinfoindex;
+static DumpableObject **binaryupgradeinfoindex;
 static int	numTables;
 static int	numTypes;
 static int	numFuncs;
 static int	numOperators;
+static int	numCollations;
 static int	numNamespaces;
 static int	numExtensions;
 static int  numTypeStorageOptions;
@@ -75,12 +64,10 @@ static int  numTypeStorageOptions;
 static ExtensionMemberId *extmembers;
 static int	numextmembers;
 
-bool is_gpdump = false; /* determines whether to print extra logging messages in getSchemaData */
-
 static void flagInhTables(TableInfo *tbinfo, int numTables,
 			  InhInfo *inhinfo, int numInherits);
 static void flagInhAttrs(TableInfo *tblinfo, int numTables);
-DumpableObject **buildIndexArray(void *objArray, int numObjs,
+static DumpableObject **buildIndexArray(void *objArray, int numObjs,
 				Size objSize);
 static int	DOCatalogIdCompare(const void *p1, const void *p2);
 static int	ExtensionMemberIdCompare(const void *p1, const void *p2);
@@ -88,20 +75,19 @@ static void findParentsByOid(TableInfo *self,
 				 InhInfo *inhinfo, int numInherits);
 static int	strInArray(const char *pattern, char **arr, int arr_size);
 
-void status_log_msg(const char *loglevel, const char *prog, const char *fmt,...);
 
-void		reset(void);
 /*
  * getSchemaData
  *	  Collect information about all potentially dumpable objects
  */
 TableInfo *
-getSchemaData(int *numTablesPtr, int g_role)
+getSchemaData(Archive *fout, int *numTablesPtr, int binary_upgrade)
 {
 	TableInfo  *tblinfo;
 	TypeInfo   *typinfo;
 	FuncInfo   *funinfo;
 	OprInfo    *oprinfo;
+	CollInfo   *collinfo;
 	NamespaceInfo *nspinfo;
 	ExtensionInfo *extinfo;
 	InhInfo    *inhinfo;
@@ -113,14 +99,28 @@ getSchemaData(int *numTablesPtr, int g_role)
 	int			numOpclasses;
 	int			numOpfamilies;
 	int			numConversions;
-	int			numExtProtocols;
 	int			numTSParsers;
 	int			numTSTemplates;
 	int			numTSDicts;
 	int			numTSConfigs;
 	int			numForeignDataWrappers;
 	int			numForeignServers;
-	const char *LOGGER_INFO = "INFO";
+	int			numDefaultACLs;
+	int			numEventTriggers;
+
+	/* GPDB specific variables */
+	int			numExtProtocols;
+
+	if (binary_upgrade)
+	{
+		BinaryUpgradeInfo *binfo;
+
+		if (g_verbose)
+			write_msg(NULL, "identifying required binary upgrade calls\n");
+
+		binfo = getBinaryUpgradeObjects();
+		binaryupgradeinfoindex = buildIndexArray(binfo, 1, sizeof(BinaryUpgradeInfo));
+	}
 
 	/*
 	 * We must read extensions and extension membership info first, because
@@ -129,16 +129,16 @@ getSchemaData(int *numTablesPtr, int g_role)
 	 */
 	if (g_verbose)
 		write_msg(NULL, "reading extensions\n");
-	extinfo = getExtensions(&numExtensions);
+	extinfo = getExtensions(fout, &numExtensions);
 	extinfoindex = buildIndexArray(extinfo, numExtensions, sizeof(ExtensionInfo));
 
 	if (g_verbose)
 		write_msg(NULL, "identifying extension members\n");
-	getExtensionMembership(extinfo, numExtensions);
+	getExtensionMembership(fout, extinfo, numExtensions);
 
-	if (is_gpdump || g_verbose)
-		status_log_msg(LOGGER_INFO, progname, "reading schemas\n");
-	nspinfo = getNamespaces(&numNamespaces);
+	if (g_verbose)
+		write_msg(NULL, "reading schemas\n");
+	nspinfo = getNamespaces(fout, &numNamespaces);
 	nspinfoindex = buildIndexArray(nspinfo, numNamespaces, sizeof(NamespaceInfo));
 
 	/*
@@ -147,137 +147,141 @@ getSchemaData(int *numTablesPtr, int g_role)
 	 * However, we have to do getNamespaces first because the tables get
 	 * linked to their containing namespaces during getTables.
 	 */
-	if (is_gpdump || g_verbose)
+	if (g_verbose)
 		write_msg(NULL, "reading user-defined tables\n");
-	tblinfo = getTables(&numTables);
+	tblinfo = getTables(fout, &numTables);
 	tblinfoindex = buildIndexArray(tblinfo, numTables, sizeof(TableInfo));
 
-	/*
-	 * ROLE_MASTER
-	 */
-	if (g_role == 1)
+	/* Do this after we've built tblinfoindex */
+	getOwnedSeqs(fout, tblinfo, numTables);
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined functions\n");
+	funinfo = getFuncs(fout, &numFuncs);
+	funinfoindex = buildIndexArray(funinfo, numFuncs, sizeof(FuncInfo));
+
+	/* this must be after getTables and getFuncs */
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined types\n");
+	typinfo = getTypes(fout, &numTypes);
+	typinfoindex = buildIndexArray(typinfo, numTypes, sizeof(TypeInfo));
+
+	/* this must be after getFuncs */
+	if (g_verbose)
+		write_msg(NULL, "reading type storage options\n");
+	getTypeStorageOptions(fout, &numTypeStorageOptions);
+
+	/* this must be after getFuncs, too */
+	if (g_verbose)
+		write_msg(NULL, "reading procedural languages\n");
+	getProcLangs(fout, &numProcLangs);
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined aggregate functions\n");
+	getAggregates(fout, &numAggregates);
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined operators\n");
+	oprinfo = getOperators(fout, &numOperators);
+	oprinfoindex = buildIndexArray(oprinfo, numOperators, sizeof(OprInfo));
+
+	if (testExtProtocolSupport(fout))
 	{
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading user-defined functions\n");
-		funinfo = getFuncs(&numFuncs);
-		funinfoindex = buildIndexArray(funinfo, numFuncs, sizeof(FuncInfo));
-
-		/* this must be after getFuncs */
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading user-defined types\n");
-		typinfo = getTypes(&numTypes);
-		typinfoindex = buildIndexArray(typinfo, numTypes, sizeof(TypeInfo));
-
-		/* this must be after getFuncs */
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading type storage options\n");
-		getTypeStorageOptions(&numTypeStorageOptions);
-
-		/* this must be after getFuncs, too */
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading procedural languages\n");
-		getProcLangs(&numProcLangs);
-
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading user-defined aggregate functions\n");
-		getAggregates(&numAggregates);
-
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading user-defined operators\n");
-		oprinfo = getOperators(&numOperators);
-		oprinfoindex = buildIndexArray(oprinfo, numOperators, sizeof(OprInfo));
-
-		if (testExtProtocolSupport())
-		{
-			if (is_gpdump || g_verbose)
-				status_log_msg(LOGGER_INFO, progname, "reading user-defined external protocols\n");
-			getExtProtocols(&numExtProtocols);
-		}
-
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading user-defined operator classes\n");
-		getOpclasses(&numOpclasses);
-
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading user-defined operator families\n");
-		getOpfamilies(&numOpfamilies);
-
-		if (is_gpdump || g_verbose)
-			write_msg(NULL, "reading user-defined text search parsers\n");
-		getTSParsers(&numTSParsers);
-
-		if (is_gpdump || g_verbose)
-			write_msg(NULL, "reading user-defined text search templates\n");
-		getTSTemplates(&numTSTemplates);
-
-		if (is_gpdump || g_verbose)
-			write_msg(NULL, "reading user-defined text search dictionaries\n");
-		getTSDictionaries(&numTSDicts);
-
-		if (is_gpdump || g_verbose)
-			write_msg(NULL, "reading user-defined text search configurations\n");
-		getTSConfigurations(&numTSConfigs);
-
-		if (is_gpdump || g_verbose)
-			write_msg(NULL, "reading user-defined foreign-data wrappers\n");
-		getForeignDataWrappers(&numForeignDataWrappers);
-
-		if (is_gpdump || g_verbose)
-			write_msg(NULL, "reading user-defined foreign servers\n");
-		getForeignServers(&numForeignServers);
-
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading user-defined conversions\n");
-		getConversions(&numConversions);
+		if (g_verbose)
+			write_msg(NULL, "reading user-defined external protocols\n");
+		getExtProtocols(fout, &numExtProtocols);
 	}
 
-	if (is_gpdump || g_verbose)
-		status_log_msg(LOGGER_INFO, progname, "reading type casts\n");
-	getCasts(&numCasts);
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined operator classes\n");
+	getOpclasses(fout, &numOpclasses);
 
-	if (is_gpdump || g_verbose)
-		status_log_msg(LOGGER_INFO, progname, "reading table inheritance information\n");
-	inhinfo = getInherits(&numInherits);
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined operator families\n");
+	getOpfamilies(fout, &numOpfamilies);
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined text search parsers\n");
+	getTSParsers(fout, &numTSParsers);
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined text search templates\n");
+	getTSTemplates(fout, &numTSTemplates);
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined text search dictionaries\n");
+	getTSDictionaries(fout, &numTSDicts);
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined text search configurations\n");
+	getTSConfigurations(fout, &numTSConfigs);
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined foreign-data wrappers\n");
+	getForeignDataWrappers(fout, &numForeignDataWrappers);
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined foreign servers\n");
+	getForeignServers(fout, &numForeignServers);
+
+	if (g_verbose)
+		write_msg(NULL, "reading default privileges\n");
+	getDefaultACLs(fout, &numDefaultACLs);
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined collations\n");
+	collinfo = getCollations(fout, &numCollations);
+	collinfoindex = buildIndexArray(collinfo, numCollations, sizeof(CollInfo));
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined conversions\n");
+	getConversions(fout, &numConversions);
+
+	if (g_verbose)
+		write_msg(NULL, "reading type casts\n");
+	getCasts(fout, &numCasts);
+
+	if (g_verbose)
+		write_msg(NULL, "reading table inheritance information\n");
+	inhinfo = getInherits(fout, &numInherits);
+
+	if (g_verbose)
+		write_msg(NULL, "reading event triggers\n");
+	getEventTriggers(fout, &numEventTriggers);
 
 	/* Identify extension configuration tables that should be dumped */
 	if (g_verbose)
 		write_msg(NULL, "finding extension tables\n");
-	processExtensionTables(extinfo, numExtensions);
-
-	if (is_gpdump || g_verbose)
-		status_log_msg(LOGGER_INFO, progname, "reading rewrite rules\n");
-	getRules(&numRules);
+	processExtensionTables(fout, extinfo, numExtensions);
 
 	/* Link tables to parents, mark parents of target tables interesting */
-	if (is_gpdump || g_verbose)
-		status_log_msg(LOGGER_INFO, progname, "finding inheritance relationships\n");
+	if (g_verbose)
+		write_msg(NULL, "finding inheritance relationships\n");
 	flagInhTables(tblinfo, numTables, inhinfo, numInherits);
 
-	if (is_gpdump || g_verbose)
-		status_log_msg(LOGGER_INFO, progname, "reading column info for interesting tables\n");
-	getTableAttrs(tblinfo, numTables);
+	if (g_verbose)
+		write_msg(NULL, "reading column info for interesting tables\n");
+	getTableAttrs(fout, tblinfo, numTables);
 
-	if (is_gpdump || g_verbose)
-		status_log_msg(LOGGER_INFO, progname, "flagging inherited columns in subtables\n");
+	if (g_verbose)
+		write_msg(NULL, "flagging inherited columns in subtables\n");
 	flagInhAttrs(tblinfo, numTables);
 
-	/*
-	 * ROLE_MASTER
-	 */
-	if (g_role == 1)
-	{
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading indexes\n");
-		getIndexes(tblinfo, numTables);
+	if (g_verbose)
+		write_msg(NULL, "reading indexes\n");
+	getIndexes(fout, tblinfo, numTables);
 
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading constraints\n");
-		getConstraints(tblinfo, numTables);
+	if (g_verbose)
+		write_msg(NULL, "reading constraints\n");
+	getConstraints(fout, tblinfo, numTables);
 
-		if (is_gpdump || g_verbose)
-			status_log_msg(LOGGER_INFO, progname, "reading triggers\n");
-		getTriggers(tblinfo, numTables);
-	}
+	if (g_verbose)
+		write_msg(NULL, "reading triggers\n");
+	getTriggers(fout, tblinfo, numTables);
+
+	if (g_verbose)
+		write_msg(NULL, "reading rewrite rules\n");
+	getRules(fout, &numRules);
 
 	*numTablesPtr = numTables;
 	return tblinfo;
@@ -304,9 +308,10 @@ flagInhTables(TableInfo *tblinfo, int numTables,
 
 	for (i = 0; i < numTables; i++)
 	{
-		/* Sequences, views and external tables never have parents */
+		/* Some kinds never have parents */
 		if (tblinfo[i].relkind == RELKIND_SEQUENCE ||
 			tblinfo[i].relkind == RELKIND_VIEW ||
+			tblinfo[i].relkind == RELKIND_MATVIEW ||
 			tblinfo[i].relstorage == RELSTORAGE_EXTERNAL ||
 			tblinfo[i].relstorage == RELSTORAGE_FOREIGN)
 			continue;
@@ -351,9 +356,10 @@ flagInhAttrs(TableInfo *tblinfo, int numTables)
 		int			numParents;
 		TableInfo **parents;
 
-		/* Sequences, views and external tables never have parents */
+		/* Some kinds never have parents */
 		if (tbinfo->relkind == RELKIND_SEQUENCE ||
 			tbinfo->relkind == RELKIND_VIEW ||
+			tbinfo->relkind == RELKIND_MATVIEW ||
 			tbinfo->relstorage == RELSTORAGE_EXTERNAL ||
 			tbinfo->relstorage == RELSTORAGE_FOREIGN)
 			continue;
@@ -435,72 +441,6 @@ flagInhAttrs(TableInfo *tblinfo, int numTables)
 			}
 		}
 	}
-}
-
-/*
- * MPP-1890
- *
- * If the user explicitly DROP'ed a CHECK constraint on a child but it
- * still exists on the parent when they dump and restore that constraint
- * will exist on the child since it will again inherit it from the
- * parent. Therefore we look here for constraints that exist on the
- * parent but not on the child and mark them to be dropped from the
- * child after the child table is defined.
- *
- * Loop through each parent and for each parent constraint see if it
- * exists on the child as well. If it doesn't it means that the child
- * dropped it. Mark it.
- */
-void
-DetectChildConstraintDropped(TableInfo *tbinfo, PQExpBuffer q)
-{
-	TableInfo  *parent;
-	TableInfo **parents = tbinfo->parents;
-	int			j,
-				k,
-				l;
-	int			numParents = tbinfo->numParents;
-
-	for (k = 0; k < numParents; k++)
-	{
-		parent = parents[k];
-
-		/* for each CHECK constraint of this parent */
-		for (l = 0; l < parent->ncheck; l++)
-		{
-			ConstraintInfo *pconstr = &(parent->checkexprs[l]);
-			ConstraintInfo *cconstr;
-			bool		constr_on_child = false;
-
-			/* for each child CHECK constraint */
-			for (j = 0; j < tbinfo->ncheck; j++)
-			{
-				cconstr = &(tbinfo->checkexprs[j]);
-
-				if (strcmp(pconstr->dobj.name, cconstr->dobj.name) == 0)
-				{
-					/* parent constr exists on child. hence wasn't dropped */
-					constr_on_child = true;
-					break;
-				}
-
-			}
-
-			/* this parent constr is not on child, issue a DROP for it */
-			if (!constr_on_child)
-			{
-				appendPQExpBuffer(q, "ALTER TABLE %s.",
-								  fmtId(tbinfo->dobj.namespace->dobj.name));
-				appendPQExpBuffer(q, "%s ",
-								  fmtId(tbinfo->dobj.name));
-				appendPQExpBuffer(q, "DROP CONSTRAINT %s;\n",
-								  fmtId(pconstr->dobj.name));
-
-				constr_on_child = false;
-			}
-		}
-	}
-
 }
 
 /*
@@ -589,9 +529,9 @@ findObjectByDumpId(DumpId dumpId)
  * Returns NULL for unknown ID
  *
  * We use binary search in a sorted list that is built on first call.
- * If AssignDumpId() and findObjectByCatalogId() calls were intermixed,
- * the code would work, but possibly be very slow.	In the current usage
- * pattern that does not happen, indeed we only need to build the list once.
+ * If AssignDumpId() and findObjectByCatalogId() calls were freely intermixed,
+ * the code would work, but possibly be very slow.  In the current usage
+ * pattern that does not happen, indeed we build the list at most twice.
  */
 DumpableObject *
 findObjectByCatalogId(CatalogId catalogId)
@@ -682,13 +622,13 @@ findObjectByOid(Oid oid, DumpableObject **indexArray, int numObjs)
 /*
  * Build an index array of DumpableObject pointers, sorted by OID
  */
-DumpableObject **
+static DumpableObject **
 buildIndexArray(void *objArray, int numObjs, Size objSize)
 {
 	DumpableObject **ptrs;
 	int			i;
 
-	ptrs = (DumpableObject **) malloc(numObjs * sizeof(DumpableObject *));
+	ptrs = (DumpableObject **) pg_malloc(numObjs * sizeof(DumpableObject *));
 	for (i = 0; i < numObjs; i++)
 		ptrs[i] = (DumpableObject *) ((char *) objArray + i * objSize);
 
@@ -706,8 +646,8 @@ buildIndexArray(void *objArray, int numObjs, Size objSize)
 static int
 DOCatalogIdCompare(const void *p1, const void *p2)
 {
-	DumpableObject *obj1 = *(DumpableObject **) p1;
-	DumpableObject *obj2 = *(DumpableObject **) p2;
+	const DumpableObject *obj1 = *(DumpableObject *const *) p1;
+	const DumpableObject *obj2 = *(DumpableObject *const *) p2;
 	int			cmpval;
 
 	/*
@@ -831,6 +771,17 @@ OprInfo *
 findOprByOid(Oid oid)
 {
 	return (OprInfo *) findObjectByOid(oid, oprinfoindex, numOperators);
+}
+
+/*
+ * findCollationByOid
+ *	  finds the entry (in collinfo) of the collation with the given oid
+ *	  returns NULL if not found
+ */
+CollInfo *
+findCollationByOid(Oid oid)
+{
+	return (CollInfo *) findObjectByOid(oid, collinfoindex, numCollations);
 }
 
 /*
@@ -972,7 +923,7 @@ findParentsByOid(TableInfo *self,
 							  inhinfo[i].inhparent,
 							  self->dobj.name,
 							  oid);
-					exit_nicely();
+					exit_nicely(1);
 				}
 				self->parents[j++] = parent;
 			}
@@ -1011,7 +962,7 @@ parseOidArray(const char *str, Oid *array, int arraysize)
 				if (argNum >= arraysize)
 				{
 					write_msg(NULL, "could not parse numeric array \"%s\": too many numbers\n", str);
-					exit_nicely();
+					exit_nicely(1);
 				}
 				temp[j] = '\0';
 				array[argNum++] = atooid(temp);
@@ -1026,7 +977,7 @@ parseOidArray(const char *str, Oid *array, int arraysize)
 				j >= sizeof(temp) - 1)
 			{
 				write_msg(NULL, "could not parse numeric array \"%s\": invalid character in number\n", str);
-				exit_nicely();
+				exit_nicely(1);
 			}
 			temp[j++] = s;
 		}
@@ -1058,32 +1009,6 @@ strInArray(const char *pattern, char **arr, int arr_size)
 }
 
 
-/* cdb addition */
-void
-reset(void)
-{
-	free(dumpIdMap);
-	dumpIdMap = NULL;
-	allocedDumpIds = 0;
-	lastDumpId = 0;
-
-/*
- * Variables for mapping CatalogId to DumpableObject
- */
-	catalogIdMapValid = false;
-	free(catalogIdMap);
-	catalogIdMap = NULL;
-	numCatalogIds = 0;
-
-	numTables = 0;
-	numTypes = 0;
-	numFuncs = 0;
-	numOperators = 0;
-}
-
-/* end cdb_addition */
-
-
 /*
  * Support for simple list operations
  */
@@ -1096,24 +1021,6 @@ simple_oid_list_append(SimpleOidList *list, Oid val)
 	cell = (SimpleOidListCell *) pg_malloc(sizeof(SimpleOidListCell));
 	cell->next = NULL;
 	cell->val = val;
-
-	if (list->tail)
-		list->tail->next = cell;
-	else
-		list->head = cell;
-	list->tail = cell;
-}
-
-void
-simple_string_list_append(SimpleStringList *list, const char *val)
-{
-	SimpleStringListCell *cell;
-
-	/* this calculation correctly accounts for the null trailing byte */
-	cell = (SimpleStringListCell *)
-		pg_malloc(sizeof(SimpleStringListCell) + strlen(val));
-	cell->next = NULL;
-	strcpy(cell->val, val);
 
 	if (list->tail)
 		list->tail->next = cell;
@@ -1135,132 +1042,68 @@ simple_oid_list_member(SimpleOidList *list, Oid val)
 	return false;
 }
 
-bool
-simple_string_list_member(SimpleStringList *list, const char *val)
-{
-	SimpleStringListCell *cell;
-
-	for (cell = list->head; cell; cell = cell->next)
-	{
-		if (strcmp(cell->val, val) == 0)
-			return true;
-	}
-	return false;
-}
-
-
 /*
- * openFileAndAppendToList: Read parameters from file
- * and append values to given list.
- * (Used to read multiple include/exclude tables.)
+ * MPP-1890
  *
- * reason - list name, to be logged.
+ * If the user explicitly DROP'ed a CHECK constraint on a child but it
+ * still exists on the parent when they dump and restore that constraint
+ * will exist on the child since it will again inherit it from the
+ * parent. Therefore we look here for constraints that exist on the
+ * parent but not on the child and mark them to be dropped from the
+ * child after the child table is defined.
  *
- * File format: one value per line.
+ * Loop through each parent and for each parent constraint see if it
+ * exists on the child as well. If it doesn't it means that the child
+ * dropped it. Mark it.
  */
-bool
-open_file_and_append_to_list(const char *fileName, SimpleStringList *list, const char *reason)
-{
-
-	char buf[1024];
-
-	write_msg(NULL, "Opening file %s for %s\n", fileName, reason);
-
-	FILE* file = fopen(fileName, "r");
-
-	if (file == NULL)
-		return false;
-
-	int lineNum = 0;
-	while (fgets(buf, sizeof(buf), file) != NULL)
-	{
-		int size = strlen(buf);
-		if (buf[size-1] == '\n')
-			buf[size-1] = '\0'; /* remove new line */
-
-		write_msg(NULL, "Line #%d, value: %s\n", ++lineNum, buf);
-		simple_string_list_append(list, buf);
-	}
-	write_msg(NULL, "Got %d lines from file %s\n", lineNum, fileName);
-	if (fclose(file) != 0)
-		return false;
-
-	write_msg(NULL, "Finished reading file %s successfully\n", fileName);
-
-	return true;
-
-}
-
-
-/*
- * Safer versions of some standard C library functions. If an
- * out-of-memory condition occurs, these functions will bail out
- * safely; therefore, their return value is guaranteed to be non-NULL.
- *
- * XXX need to refactor things so that these can be in a file that can be
- * shared by pg_dumpall and pg_restore as well as pg_dump.
- */
-
-char *
-pg_strdup(const char *string)
-{
-	char	   *tmp;
-
-	if (!string)
-		exit_horribly(NULL, NULL, "cannot duplicate null pointer\n");
-	tmp = strdup(string);
-	if (!tmp)
-		exit_horribly(NULL, NULL, "out of memory\n");
-	return tmp;
-}
-
-void *
-pg_malloc(size_t size)
-{
-	void	   *tmp;
-
-	tmp = malloc(size);
-	if (!tmp)
-		exit_horribly(NULL, NULL, "out of memory\n");
-	return tmp;
-}
-
-void *
-pg_calloc(size_t nmemb, size_t size)
-{
-	void	   *tmp;
-
-	tmp = calloc(nmemb, size);
-	if (!tmp)
-		exit_horribly(NULL, NULL, "out of memory\n");
-	return tmp;
-}
-
-void *
-pg_realloc(void *ptr, size_t size)
-{
-	void	   *tmp;
-
-	tmp = realloc(ptr, size);
-	if (!tmp)
-		exit_horribly(NULL, NULL, "out of memory\n");
-	return tmp;
-}
-
 void
-status_log_msg(const char *loglevel, const char *prog, const char *fmt,...)
+DetectChildConstraintDropped(TableInfo *tbinfo, PQExpBuffer q)
 {
-    va_list     ap;  
-    char        szTimeNow[18];
-    struct tm   pNow;
-    time_t      tNow = time(NULL);
-    char       *format = "%Y%m%d:%H:%M:%S";
+	TableInfo  *parent;
+	TableInfo **parents = tbinfo->parents;
+	int			j,
+				k,
+				l;
+	int			numParents = tbinfo->numParents;
 
-    localtime_r(&tNow, &pNow);
-    strftime(szTimeNow, 18, format, &pNow);
+	for (k = 0; k < numParents; k++)
+	{
+		parent = parents[k];
 
-    va_start(ap, fmt);
-    fprintf(stderr, "%s|%s-[%s]:-", szTimeNow, prog, loglevel);
-    vfprintf(stderr, gettext(fmt), ap); 
-    va_end(ap);
+		/* for each CHECK constraint of this parent */
+		for (l = 0; l < parent->ncheck; l++)
+		{
+			ConstraintInfo *pconstr = &(parent->checkexprs[l]);
+			ConstraintInfo *cconstr;
+			bool		constr_on_child = false;
+
+			/* for each child CHECK constraint */
+			for (j = 0; j < tbinfo->ncheck; j++)
+			{
+				cconstr = &(tbinfo->checkexprs[j]);
+
+				if (strcmp(pconstr->dobj.name, cconstr->dobj.name) == 0)
+				{
+					/* parent constr exists on child. hence wasn't dropped */
+					constr_on_child = true;
+					break;
+				}
+
+			}
+
+			/* this parent constr is not on child, issue a DROP for it */
+			if (!constr_on_child)
+			{
+				appendPQExpBuffer(q, "ALTER TABLE %s.",
+								  fmtId(tbinfo->dobj.namespace->dobj.name));
+				appendPQExpBuffer(q, "%s ",
+								  fmtId(tbinfo->dobj.name));
+				appendPQExpBuffer(q, "DROP CONSTRAINT %s;\n",
+								  fmtId(pconstr->dobj.name));
+
+				constr_on_child = false;
+			}
+		}
+	}
+
 }

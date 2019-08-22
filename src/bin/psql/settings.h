@@ -1,14 +1,13 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2014, PostgreSQL Global Development Group
  *
  * src/bin/psql/settings.h
  */
 #ifndef SETTINGS_H
 #define SETTINGS_H
 
-#include "libpq-fe.h"
 
 #include "variables.h"
 #include "print.h"
@@ -18,13 +17,20 @@
 
 #if defined(WIN32) || defined(__CYGWIN__)
 #define DEFAULT_EDITOR	"notepad.exe"
+/* no DEFAULT_EDITOR_LINENUMBER_ARG for Notepad */
 #else
 #define DEFAULT_EDITOR	"vi"
+#define DEFAULT_EDITOR_LINENUMBER_ARG "+"
 #endif
 
 #define DEFAULT_PROMPT1 "%/%R%# "
 #define DEFAULT_PROMPT2 "%/%R%# "
 #define DEFAULT_PROMPT3 ">> "
+
+/*
+ * Note: these enums should generally be chosen so that zero corresponds
+ * to the default behavior.
+ */
 
 typedef enum
 {
@@ -49,6 +55,14 @@ typedef enum
 
 typedef enum
 {
+	PSQL_COMP_CASE_PRESERVE_UPPER,
+	PSQL_COMP_CASE_PRESERVE_LOWER,
+	PSQL_COMP_CASE_UPPER,
+	PSQL_COMP_CASE_LOWER
+} PSQL_COMP_CASE;
+
+typedef enum
+{
 	hctl_none = 0,
 	hctl_ignorespace = 1,
 	hctl_ignoredups = 2,
@@ -69,9 +83,12 @@ typedef struct _psqlSettings
 	FILE	   *queryFout;		/* where to send the query results */
 	bool		queryFoutPipe;	/* queryFout is from a popen() */
 
+	FILE	   *copyStream;		/* Stream to read/write for \copy command */
+
 	printQueryOpt popt;
 
 	char	   *gfname;			/* one-shot file output argument for \g */
+	char	   *gset_prefix;	/* one-shot prefix argument for \gset */
 
 	bool		notty;			/* stdin or stdout is not a tty (as determined
 								 * on startup) */
@@ -81,9 +98,7 @@ typedef struct _psqlSettings
 	bool		cur_cmd_interactive;
 	int			sversion;		/* backend server version */
 	const char *progname;		/* in case you renamed psql */
-	char	   *inputfile;		/* for error reporting */
-	char	   *dirname;		/* current directory for \s display */
-
+	char	   *inputfile;		/* file being currently processed, if any */
 	uint64		lineno;			/* also for error reporting */
 
 	bool		timing;			/* enable timing of all queries */
@@ -94,7 +109,7 @@ typedef struct _psqlSettings
 
 	/*
 	 * The remaining fields are set by assign hooks associated with entries in
-	 * "vars".	They should not be set directly except by those hook
+	 * "vars".  They should not be set directly except by those hook
 	 * functions.
 	 */
 	bool		autocommit;
@@ -106,6 +121,7 @@ typedef struct _psqlSettings
 	PSQL_ECHO	echo;
 	PSQL_ECHO_HIDDEN echo_hidden;
 	PSQL_ERROR_ROLLBACK on_error_rollback;
+	PSQL_COMP_CASE comp_case;
 	HistControl histcontrol;
 	const char *prompt1;
 	const char *prompt2;

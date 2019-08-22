@@ -3,12 +3,12 @@
  * geo_ops.c
  *	  2D geometric operations
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/geo_ops.c,v 1.100 2008/04/11 22:52:05 tgl Exp $
+ *	  src/backend/utils/adt/geo_ops.c
  *
  *-------------------------------------------------------------------------
  */
@@ -20,6 +20,7 @@
 #include <ctype.h>
 
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/geo_decls.h"
 
@@ -31,6 +32,11 @@
 /*
  * Internal routines
  */
+
+enum path_delim
+{
+	PATH_NONE, PATH_OPEN, PATH_CLOSED
+};
 
 static int	point_inside(Point *p, int npts, Point *plist);
 static int	lseg_crossing(double x, double y, double px, double py);
@@ -57,7 +63,7 @@ static int	pair_decode(char *str, float8 *x, float8 *y, char **s);
 static int	pair_encode(float8 x, float8 y, char *str);
 static int	pair_count(char *s, char delim);
 static int	path_decode(int opentype, int npts, char *str, int *isopen, char **ss, Point *p);
-static char *path_encode(bool closed, int npts, Point *pt);
+static char *path_encode(enum path_delim path_delim, int npts, Point *pt);
 static void statlseg_construct(LSEG *lseg, Point *pt1, Point *pt2);
 static double box_ar(BOX *box);
 static void box_cn(Point *center, BOX *box);
@@ -66,6 +72,8 @@ static bool has_interpt_sl(LSEG *lseg, LINE *line);
 static double dist_pl_internal(Point *pt, LINE *line);
 static double dist_ps_internal(Point *pt, LSEG *lseg);
 static Point *line_interpt_internal(LINE *l1, LINE *l2);
+static bool lseg_inside_poly(Point *a, Point *b, POLYGON *poly, int start);
+static Point *lseg_interpt_internal(LSEG *l1, LSEG *l2);
 
 
 /*
@@ -83,8 +91,8 @@ static Point *line_interpt_internal(LINE *l1, LINE *l2);
 #define RDELIM_C		'>'
 
 /* Maximum number of characters printed by pair_encode() */
-/* ...+2+7 : 2 accounts for extra_float_digits max value */
-#define P_MAXLEN (2*(DBL_DIG+2+7)+1)
+/* ...+3+7 : 3 accounts for extra_float_digits max value */
+#define P_MAXLEN (2*(DBL_DIG+3+7)+1)
 
 
 /*
@@ -120,19 +128,19 @@ single_decode(char *str, float8 *x, char **s)
 	if (!PointerIsValid(str))
 		return FALSE;
 
-	while (isspace((unsigned char) *str))
-		str++;
 	*x = strtod(str, &cp);
+
 #ifdef GEODEBUG
-	printf("single_decode- (%x) try decoding %s to %g\n", (cp - str), str, *x);
+	printf("single_decode- decoded first %d chars of \"%s\" to %g\n",
+		   (int) (cp - str), str, *x);
 #endif
-	if (cp <= str)
-		return FALSE;
-	while (isspace((unsigned char) *cp))
-		cp++;
 
 	if (s != NULL)
+	{
+		while (isspace((unsigned char) *cp))
+			cp++;
 		*s = cp;
+	}
 
 	return TRUE;
 }	/* single_decode() */
@@ -280,7 +288,7 @@ path_decode(int opentype, int npts, char *str, int *isopen, char **ss, Point *p)
 }	/* path_decode() */
 
 static char *
-path_encode(bool closed, int npts, Point *pt)
+path_encode(enum path_delim path_delim, int npts, Point *pt)
 {
 	int			size = npts * (P_MAXLEN + 3) + 2;
 	char	   *result;
@@ -296,15 +304,15 @@ path_encode(bool closed, int npts, Point *pt)
 	result = palloc(size);
 
 	cp = result;
-	switch (closed)
+	switch (path_delim)
 	{
-		case TRUE:
+		case PATH_CLOSED:
 			*cp++ = LDELIM;
 			break;
-		case FALSE:
+		case PATH_OPEN:
 			*cp++ = LDELIM_EP;
 			break;
-		default:
+		case PATH_NONE:
 			break;
 	}
 
@@ -322,15 +330,15 @@ path_encode(bool closed, int npts, Point *pt)
 		pt++;
 	}
 	cp--;
-	switch (closed)
+	switch (path_delim)
 	{
-		case TRUE:
+		case PATH_CLOSED:
 			*cp++ = RDELIM;
 			break;
-		case FALSE:
+		case PATH_OPEN:
 			*cp++ = RDELIM_EP;
 			break;
-		default:
+		case PATH_NONE:
 			break;
 	}
 	*cp = '\0';
@@ -415,7 +423,7 @@ box_out(PG_FUNCTION_ARGS)
 {
 	BOX		   *box = PG_GETARG_BOX_P(0);
 
-	PG_RETURN_CSTRING(path_encode(-1, 2, &(box->high)));
+	PG_RETURN_CSTRING(path_encode(PATH_NONE, 2, &(box->high)));
 }
 
 /*
@@ -558,15 +566,10 @@ box_overlap(PG_FUNCTION_ARGS)
 static bool
 box_ov(BOX *box1, BOX *box2)
 {
-	return ((FPge(box1->high.x, box2->high.x) &&
-			 FPle(box1->low.x, box2->high.x)) ||
-			(FPge(box2->high.x, box1->high.x) &&
-			 FPle(box2->low.x, box1->high.x)))
-		&&
-		((FPge(box1->high.y, box2->high.y) &&
-		  FPle(box1->low.y, box2->high.y)) ||
-		 (FPge(box2->high.y, box1->high.y) &&
-		  FPle(box2->low.y, box1->high.y)));
+	return (FPle(box1->low.x, box2->high.x) &&
+			FPle(box2->low.x, box1->high.x) &&
+			FPle(box1->low.y, box2->high.y) &&
+			FPle(box2->low.y, box1->high.y));
 }
 
 /*		box_left		-		is box1 strictly left of box2?
@@ -929,41 +932,81 @@ box_diagonal(PG_FUNCTION_ARGS)
 /***********************************************************************
  **
  **		Routines for 2D lines.
- **				Lines are not intended to be used as ADTs per se,
- **				but their ops are useful tools for other ADT ops.  Thus,
- **				there are few relops.
  **
  ***********************************************************************/
+
+static bool
+line_decode(const char *str, LINE *line)
+{
+	char	   *tail;
+
+	while (isspace((unsigned char) *str))
+		str++;
+	if (*str++ != '{')
+		return false;
+	line->A = strtod(str, &tail);
+	if (tail <= str)
+		return false;
+	str = tail;
+	while (isspace((unsigned char) *str))
+		str++;
+	if (*str++ != DELIM)
+		return false;
+	line->B = strtod(str, &tail);
+	if (tail <= str)
+		return false;
+	str = tail;
+	while (isspace((unsigned char) *str))
+		str++;
+	if (*str++ != DELIM)
+		return false;
+	line->C = strtod(str, &tail);
+	if (tail <= str)
+		return false;
+	str = tail;
+	while (isspace((unsigned char) *str))
+		str++;
+	if (*str++ != '}')
+		return false;
+	while (isspace((unsigned char) *str))
+		str++;
+	if (*str)
+		return false;
+
+	return true;
+}
 
 Datum
 line_in(PG_FUNCTION_ARGS)
 {
-#ifdef ENABLE_LINE_TYPE
 	char	   *str = PG_GETARG_CSTRING(0);
-#endif
 	LINE	   *line;
-
-#ifdef ENABLE_LINE_TYPE
-	/* when fixed, modify "not implemented", catalog/pg_type.h and SGML */
 	LSEG		lseg;
 	int			isopen;
 	char	   *s;
 
-	if ((!path_decode(TRUE, 2, str, &isopen, &s, &(lseg.p[0])))
-		|| (*s != '\0'))
+	line = (LINE *) palloc(sizeof(LINE));
+
+	if (path_decode(TRUE, 2, str, &isopen, &s, &(lseg.p[0])) && *s == '\0')
+	{
+		if (FPeq(lseg.p[0].x, lseg.p[1].x) && FPeq(lseg.p[0].y, lseg.p[1].y))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid line specification: must be two distinct points")));
+
+		line_construct_pts(line, &lseg.p[0], &lseg.p[1]);
+	}
+	else if (line_decode(str, line))
+	{
+		if (FPzero(line->A) && FPzero(line->B))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid line specification: A and B cannot both be zero")));
+	}
+	else
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type line: \"%s\"", str)));
-
-	line = (LINE *) palloc(sizeof(LINE));
-	line_construct_pts(line, &lseg.p[0], &lseg.p[1]);
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("type \"line\" not yet implemented")));
-
-	line = NULL;
-#endif
 
 	PG_RETURN_LINE_P(line);
 }
@@ -972,66 +1015,13 @@ line_in(PG_FUNCTION_ARGS)
 Datum
 line_out(PG_FUNCTION_ARGS)
 {
-#ifdef ENABLE_LINE_TYPE
 	LINE	   *line = PG_GETARG_LINE_P(0);
-#endif
-	char	   *result;
+	int			ndig = DBL_DIG + extra_float_digits;
 
-#ifdef ENABLE_LINE_TYPE
-	/* when fixed, modify "not implemented", catalog/pg_type.h and SGML */
-	LSEG		lseg;
+	if (ndig < 1)
+		ndig = 1;
 
-	if (FPzero(line->B))
-	{							/* vertical */
-		/* use "x = C" */
-		result->A = -1;
-		result->B = 0;
-		result->C = pt1->x;
-#ifdef GEODEBUG
-		printf("line_out- line is vertical\n");
-#endif
-#ifdef NOT_USED
-		result->m = DBL_MAX;
-#endif
-
-	}
-	else if (FPzero(line->A))
-	{							/* horizontal */
-		/* use "x = C" */
-		result->A = 0;
-		result->B = -1;
-		result->C = pt1->y;
-#ifdef GEODEBUG
-		printf("line_out- line is horizontal\n");
-#endif
-#ifdef NOT_USED
-		result->m = 0.0;
-#endif
-
-	}
-	else
-	{
-	}
-
-	if (FPzero(line->A))		/* horizontal? */
-	{
-	}
-	else if (FPzero(line->B))	/* vertical? */
-	{
-	}
-	else
-	{
-	}
-
-	return path_encode(TRUE, 2, (Point *) &(ls->p[0]));
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("type \"line\" not yet implemented")));
-	result = NULL;
-#endif
-
-	PG_RETURN_CSTRING(result);
+	PG_RETURN_CSTRING(psprintf("{%.*g,%.*g,%.*g}", ndig, line->A, ndig, line->B, ndig, line->C));
 }
 
 /*
@@ -1040,10 +1030,16 @@ line_out(PG_FUNCTION_ARGS)
 Datum
 line_recv(PG_FUNCTION_ARGS)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("type \"line\" not yet implemented")));
-	return 0;
+	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
+	LINE	   *line;
+
+	line = (LINE *) palloc(sizeof(LINE));
+
+	line->A = pq_getmsgfloat8(buf);
+	line->B = pq_getmsgfloat8(buf);
+	line->C = pq_getmsgfloat8(buf);
+
+	PG_RETURN_LINE_P(line);
 }
 
 /*
@@ -1052,10 +1048,14 @@ line_recv(PG_FUNCTION_ARGS)
 Datum
 line_send(PG_FUNCTION_ARGS)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("type \"line\" not yet implemented")));
-	return 0;
+	LINE	   *line = PG_GETARG_LINE_P(0);
+	StringInfoData buf;
+
+	pq_begintypsend(&buf);
+	pq_sendfloat8(&buf, line->A);
+	pq_sendfloat8(&buf, line->B);
+	pq_sendfloat8(&buf, line->C);
+	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
 }
 
 
@@ -1087,10 +1087,6 @@ line_construct_pm(Point *pt, double m)
 		result->C = pt->y - m * pt->x;
 	}
 
-#ifdef NOT_USED
-	result->m = m;
-#endif
-
 	return result;
 }
 
@@ -1106,9 +1102,6 @@ line_construct_pts(LINE *line, Point *pt1, Point *pt2)
 		line->A = -1;
 		line->B = 0;
 		line->C = pt1->x;
-#ifdef NOT_USED
-		line->m = DBL_MAX;
-#endif
 #ifdef GEODEBUG
 		printf("line_construct_pts- line is vertical\n");
 #endif
@@ -1119,9 +1112,6 @@ line_construct_pts(LINE *line, Point *pt1, Point *pt2)
 		line->A = 0;
 		line->B = -1;
 		line->C = pt1->y;
-#ifdef NOT_USED
-		line->m = 0.0;
-#endif
 #ifdef GEODEBUG
 		printf("line_construct_pts- line is horizontal\n");
 #endif
@@ -1132,9 +1122,9 @@ line_construct_pts(LINE *line, Point *pt1, Point *pt2)
 		line->A = (pt2->y - pt1->y) / (pt2->x - pt1->x);
 		line->B = -1.0;
 		line->C = pt1->y - line->A * pt1->x;
-#ifdef NOT_USED
-		line->m = line->A;
-#endif
+		/* on some platforms, the preceding expression tends to produce -0 */
+		if (line->C == 0.0)
+			line->C = 0.0;
 #ifdef GEODEBUG
 		printf("line_construct_pts- line is neither vertical nor horizontal (diffs x=%.*g, y=%.*g\n",
 			   DBL_DIG, (pt2->x - pt1->x), DBL_DIG, (pt2->y - pt1->y));
@@ -1178,9 +1168,6 @@ line_parallel(PG_FUNCTION_ARGS)
 	LINE	   *l1 = PG_GETARG_LINE_P(0);
 	LINE	   *l2 = PG_GETARG_LINE_P(1);
 
-#ifdef NOT_USED
-	PG_RETURN_BOOL(FPeq(l1->m, l2->m));
-#endif
 	if (FPzero(l1->B))
 		PG_RETURN_BOOL(FPzero(l2->B));
 
@@ -1193,12 +1180,6 @@ line_perp(PG_FUNCTION_ARGS)
 	LINE	   *l1 = PG_GETARG_LINE_P(0);
 	LINE	   *l2 = PG_GETARG_LINE_P(1);
 
-#ifdef NOT_USED
-	if (l1->m)
-		PG_RETURN_BOOL(FPeq(l2->m / l1->m, -1.0));
-	else if (l2->m)
-		PG_RETURN_BOOL(FPeq(l1->m / l2->m, -1.0));
-#endif
 	if (FPzero(l1->A))
 		PG_RETURN_BOOL(FPzero(l2->B));
 	else if (FPzero(l1->B))
@@ -1309,18 +1290,6 @@ line_interpt_internal(LINE *l1, LINE *l2)
 										 LinePGetDatum(l1),
 										 LinePGetDatum(l2))))
 		return NULL;
-
-#ifdef NOT_USED
-	if (FPzero(l1->B))			/* l1 vertical? */
-		result = point_construct(l2->m * l1->C + l2->C, l1->C);
-	else if (FPzero(l2->B))		/* l2 vertical? */
-		result = point_construct(l1->m * l2->C + l1->C, l2->C);
-	else
-	{
-		x = (l1->C - l2->C) / (l2->A - l1->A);
-		result = point_construct(x, l1->m * x + l1->C);
-	}
-#endif
 
 	if (FPzero(l1->B))			/* l1 vertical? */
 	{
@@ -1455,7 +1424,7 @@ path_out(PG_FUNCTION_ARGS)
 {
 	PATH	   *path = PG_GETARG_PATH_P(0);
 
-	PG_RETURN_CSTRING(path_encode(path->closed, path->npts, path->p));
+	PG_RETURN_CSTRING(path_encode(path->closed ? PATH_CLOSED : PATH_OPEN, path->npts, path->p));
 }
 
 /*
@@ -1837,7 +1806,7 @@ point_out(PG_FUNCTION_ARGS)
 {
 	Point	   *pt = PG_GETARG_POINT_P(0);
 
-	PG_RETURN_CSTRING(path_encode(-1, 1, pt));
+	PG_RETURN_CSTRING(path_encode(PATH_NONE, 1, pt));
 }
 
 /*
@@ -2065,7 +2034,7 @@ lseg_out(PG_FUNCTION_ARGS)
 {
 	LSEG	   *ls = PG_GETARG_LSEG_P(0);
 
-	PG_RETURN_CSTRING(path_encode(FALSE, 2, (Point *) &(ls->p[0])));
+	PG_RETURN_CSTRING(path_encode(PATH_OPEN, 2, (Point *) &(ls->p[0])));
 }
 
 /*
@@ -2372,15 +2341,9 @@ lseg_center(PG_FUNCTION_ARGS)
 	PG_RETURN_POINT_P(result);
 }
 
-
-/* lseg_interpt -
- *		Find the intersection point of two segments (if any).
- */
-Datum
-lseg_interpt(PG_FUNCTION_ARGS)
+static Point *
+lseg_interpt_internal(LSEG *l1, LSEG *l2)
 {
-	LSEG	   *l1 = PG_GETARG_LSEG_P(0);
-	LSEG	   *l2 = PG_GETARG_LSEG_P(1);
 	Point	   *result;
 	LINE		tmp1,
 				tmp2;
@@ -2392,7 +2355,7 @@ lseg_interpt(PG_FUNCTION_ARGS)
 	line_construct_pts(&tmp2, &l2->p[0], &l2->p[1]);
 	result = line_interpt_internal(&tmp1, &tmp2);
 	if (!PointerIsValid(result))
-		PG_RETURN_NULL();
+		return NULL;
 
 	/*
 	 * If the line intersection point isn't within l1 (or equivalently l2),
@@ -2400,7 +2363,10 @@ lseg_interpt(PG_FUNCTION_ARGS)
 	 */
 	if (!on_ps_internal(result, l1) ||
 		!on_ps_internal(result, l2))
-		PG_RETURN_NULL();
+	{
+		pfree(result);
+		return NULL;
+	}
 
 	/*
 	 * If there is an intersection, then check explicitly for matching
@@ -2419,6 +2385,23 @@ lseg_interpt(PG_FUNCTION_ARGS)
 		result->x = l1->p[1].x;
 		result->y = l1->p[1].y;
 	}
+
+	return result;
+}
+
+/* lseg_interpt -
+ *		Find the intersection point of two segments (if any).
+ */
+Datum
+lseg_interpt(PG_FUNCTION_ARGS)
+{
+	LSEG	   *l1 = PG_GETARG_LSEG_P(0);
+	LSEG	   *l2 = PG_GETARG_LSEG_P(1);
+	Point	   *result;
+
+	result = lseg_interpt_internal(l1, l2);
+	if (!PointerIsValid(result))
+		PG_RETURN_NULL();
 
 	PG_RETURN_POINT_P(result);
 }
@@ -2447,8 +2430,8 @@ dist_pl(PG_FUNCTION_ARGS)
 static double
 dist_pl_internal(Point *pt, LINE *line)
 {
-	return (line->A * pt->x + line->B * pt->y + line->C) /
-		HYPOT(line->A, line->B);
+	return fabs((line->A * pt->x + line->B * pt->y + line->C) /
+				HYPOT(line->A, line->B));
 }
 
 Datum
@@ -2470,8 +2453,8 @@ dist_ps_internal(Point *pt, LSEG *lseg)
 	Point	   *ip;
 
 	/*
-	 * Construct a line perpendicular to the input segment
-	 * and through the input point
+	 * Construct a line perpendicular to the input segment and through the
+	 * input point
 	 */
 	if (lseg->p[1].x == lseg->p[0].x)
 		m = 0;
@@ -2769,11 +2752,6 @@ close_pl(PG_FUNCTION_ARGS)
 
 	result = (Point *) palloc(sizeof(Point));
 
-#ifdef NOT_USED
-	if (FPeq(line->A, -1.0) && FPzero(line->B))
-	{							/* vertical */
-	}
-#endif
 	if (FPzero(line->B))		/* vertical? */
 	{
 		result->x = line->C;
@@ -2787,9 +2765,7 @@ close_pl(PG_FUNCTION_ARGS)
 		PG_RETURN_POINT_P(result);
 	}
 	/* drop a perpendicular and find the intersection point */
-#ifdef NOT_USED
-	invm = -1.0 / line->m;
-#endif
+
 	/* invert and flip the sign on the slope to get a perpendicular */
 	invm = line->B / line->A;
 	tmp = line_construct_pm(pt, invm);
@@ -2884,8 +2860,8 @@ close_ps(PG_FUNCTION_ARGS)
 		result = point_copy(&lseg->p[!yh]);		/* below the lseg, take lower
 												 * end pt */
 #ifdef GEODEBUG
-		printf("close_ps below: tmp A %f  B %f   C %f    m %f\n",
-			   tmp->A, tmp->B, tmp->C, tmp->m);
+		printf("close_ps below: tmp A %f  B %f   C %f\n",
+			   tmp->A, tmp->B, tmp->C);
 #endif
 		PG_RETURN_POINT_P(result);
 	}
@@ -2896,23 +2872,31 @@ close_ps(PG_FUNCTION_ARGS)
 		result = point_copy(&lseg->p[yh]);		/* above the lseg, take higher
 												 * end pt */
 #ifdef GEODEBUG
-		printf("close_ps above: tmp A %f  B %f   C %f    m %f\n",
-			   tmp->A, tmp->B, tmp->C, tmp->m);
+		printf("close_ps above: tmp A %f  B %f   C %f\n",
+			   tmp->A, tmp->B, tmp->C);
 #endif
 		PG_RETURN_POINT_P(result);
 	}
 
 	/*
-	 * at this point the "normal" from point will hit lseg. The closet point
+	 * at this point the "normal" from point will hit lseg. The closest point
 	 * will be somewhere on the lseg
 	 */
 	tmp = line_construct_pm(pt, invm);
 #ifdef GEODEBUG
-	printf("close_ps- tmp A %f  B %f   C %f    m %f\n",
-		   tmp->A, tmp->B, tmp->C, tmp->m);
+	printf("close_ps- tmp A %f  B %f   C %f\n",
+		   tmp->A, tmp->B, tmp->C);
 #endif
 	result = interpt_sl(lseg, tmp);
-	Assert(result != NULL);
+
+	/*
+	 * ordinarily we should always find an intersection point, but that could
+	 * fail in the presence of NaN coordinates, and perhaps even from simple
+	 * roundoff issues.  Return a SQL NULL if so.
+	 */
+	if (result == NULL)
+		PG_RETURN_NULL();
+
 #ifdef GEODEBUG
 	printf("close_ps- result.x %f  result.y %f\n", result->x, result->y);
 #endif
@@ -2943,7 +2927,7 @@ close_lseg(PG_FUNCTION_ARGS)
 		memcpy(&point, &l1->p[1], sizeof(Point));
 	}
 
-	if ((d = dist_ps_internal(&l2->p[0], l1)) < dist)
+	if (dist_ps_internal(&l2->p[0], l1) < dist)
 	{
 		result = DatumGetPointP(DirectFunctionCall2(close_ps,
 													PointPGetDatum(&l2->p[0]),
@@ -2954,7 +2938,7 @@ close_lseg(PG_FUNCTION_ARGS)
 													LsegPGetDatum(l2)));
 	}
 
-	if ((d = dist_ps_internal(&l2->p[1], l1)) < dist)
+	if (dist_ps_internal(&l2->p[1], l1) < dist)
 	{
 		result = DatumGetPointP(DirectFunctionCall2(close_ps,
 													PointPGetDatum(&l2->p[1]),
@@ -2994,7 +2978,7 @@ close_pb(PG_FUNCTION_ARGS)
 	point.x = box->low.x;
 	point.y = box->high.y;
 	statlseg_construct(&lseg, &box->low, &point);
-	dist = d = dist_ps_internal(pt, &lseg);
+	dist = dist_ps_internal(pt, &lseg);
 
 	statlseg_construct(&seg, &box->high, &point);
 	if ((d = dist_ps_internal(pt, &seg)) < dist)
@@ -3036,6 +3020,7 @@ close_pb(PG_FUNCTION_ARGS)
 Datum
 close_sl(PG_FUNCTION_ARGS)
 {
+#ifdef NOT_USED
 	LSEG	   *lseg = PG_GETARG_LSEG_P(0);
 	LINE	   *line = PG_GETARG_LINE_P(1);
 	Point	   *result;
@@ -3054,6 +3039,13 @@ close_sl(PG_FUNCTION_ARGS)
 		result = point_copy(&lseg->p[1]);
 
 	PG_RETURN_POINT_P(result);
+#endif
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("function \"close_sl\" not implemented")));
+
+	PG_RETURN_NULL();
 }
 
 /* close_ls()
@@ -3201,6 +3193,16 @@ on_pb(PG_FUNCTION_ARGS)
 {
 	Point	   *pt = PG_GETARG_POINT_P(0);
 	BOX		   *box = PG_GETARG_BOX_P(1);
+
+	PG_RETURN_BOOL(pt->x <= box->high.x && pt->x >= box->low.x &&
+				   pt->y <= box->high.y && pt->y >= box->low.y);
+}
+
+Datum
+box_contain_pt(PG_FUNCTION_ARGS)
+{
+	BOX		   *box = PG_GETARG_BOX_P(0);
+	Point	   *pt = PG_GETARG_POINT_P(1);
 
 	PG_RETURN_BOOL(pt->x <= box->high.x && pt->x >= box->low.x &&
 				   pt->y <= box->high.y && pt->y >= box->low.y);
@@ -3493,7 +3495,7 @@ poly_out(PG_FUNCTION_ARGS)
 {
 	POLYGON    *poly = PG_GETARG_POLYGON_P(0);
 
-	PG_RETURN_CSTRING(path_encode(TRUE, poly->npts, poly->p));
+	PG_RETURN_CSTRING(path_encode(PATH_CLOSED, poly->npts, poly->p));
 }
 
 /*
@@ -3771,10 +3773,7 @@ poly_same(PG_FUNCTION_ARGS)
 }
 
 /*-----------------------------------------------------------------
- * Determine if polygon A overlaps polygon B by determining if
- * their bounding boxes overlap.
- *
- * XXX ought to do a more correct check!
+ * Determine if polygon A overlaps polygon B
  *-----------------------------------------------------------------*/
 Datum
 poly_overlap(PG_FUNCTION_ARGS)
@@ -3783,7 +3782,54 @@ poly_overlap(PG_FUNCTION_ARGS)
 	POLYGON    *polyb = PG_GETARG_POLYGON_P(1);
 	bool		result;
 
-	result = box_ov(&polya->boundbox, &polyb->boundbox);
+	/* Quick check by bounding box */
+	result = (polya->npts > 0 && polyb->npts > 0 &&
+			  box_ov(&polya->boundbox, &polyb->boundbox)) ? true : false;
+
+	/*
+	 * Brute-force algorithm - try to find intersected edges, if so then
+	 * polygons are overlapped else check is one polygon inside other or not
+	 * by testing single point of them.
+	 */
+	if (result)
+	{
+		int			ia,
+					ib;
+		LSEG		sa,
+					sb;
+
+		/* Init first of polya's edge with last point */
+		sa.p[0] = polya->p[polya->npts - 1];
+		result = false;
+
+		for (ia = 0; ia < polya->npts && result == false; ia++)
+		{
+			/* Second point of polya's edge is a current one */
+			sa.p[1] = polya->p[ia];
+
+			/* Init first of polyb's edge with last point */
+			sb.p[0] = polyb->p[polyb->npts - 1];
+
+			for (ib = 0; ib < polyb->npts && result == false; ib++)
+			{
+				sb.p[1] = polyb->p[ib];
+				result = lseg_intersect_internal(&sa, &sb);
+				sb.p[0] = sb.p[1];
+			}
+
+			/*
+			 * move current endpoint to the first point of next edge
+			 */
+			sa.p[0] = sa.p[1];
+		}
+
+		if (result == false)
+		{
+			result = (point_inside(polya->p, polyb->npts, polyb->p)
+					  ||
+					  point_inside(polyb->p, polya->npts, polya->p));
+		}
+	}
 
 	/*
 	 * Avoid leaking memory for toasted inputs ... needed for rtree indexes
@@ -3794,6 +3840,120 @@ poly_overlap(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(result);
 }
 
+/*
+ * Tests special kind of segment for in/out of polygon.
+ * Special kind means:
+ *	- point a should be on segment s
+ *	- segment (a,b) should not be contained by s
+ * Returns true if:
+ *	- segment (a,b) is collinear to s and (a,b) is in polygon
+ *	- segment (a,b) s not collinear to s. Note: that doesn't
+ *	  mean that segment is in polygon!
+ */
+
+static bool
+touched_lseg_inside_poly(Point *a, Point *b, LSEG *s, POLYGON *poly, int start)
+{
+	/* point a is on s, b is not */
+	LSEG		t;
+
+	t.p[0] = *a;
+	t.p[1] = *b;
+
+#define POINTEQ(pt1, pt2)	(FPeq((pt1)->x, (pt2)->x) && FPeq((pt1)->y, (pt2)->y))
+	if (POINTEQ(a, s->p))
+	{
+		if (on_ps_internal(s->p + 1, &t))
+			return lseg_inside_poly(b, s->p + 1, poly, start);
+	}
+	else if (POINTEQ(a, s->p + 1))
+	{
+		if (on_ps_internal(s->p, &t))
+			return lseg_inside_poly(b, s->p, poly, start);
+	}
+	else if (on_ps_internal(s->p, &t))
+	{
+		return lseg_inside_poly(b, s->p, poly, start);
+	}
+	else if (on_ps_internal(s->p + 1, &t))
+	{
+		return lseg_inside_poly(b, s->p + 1, poly, start);
+	}
+
+	return true;				/* may be not true, but that will check later */
+}
+
+/*
+ * Returns true if segment (a,b) is in polygon, option
+ * start is used for optimization - function checks
+ * polygon's edges started from start
+ */
+static bool
+lseg_inside_poly(Point *a, Point *b, POLYGON *poly, int start)
+{
+	LSEG		s,
+				t;
+	int			i;
+	bool		res = true,
+				intersection = false;
+
+	t.p[0] = *a;
+	t.p[1] = *b;
+	s.p[0] = poly->p[(start == 0) ? (poly->npts - 1) : (start - 1)];
+
+	for (i = start; i < poly->npts && res; i++)
+	{
+		Point	   *interpt;
+
+		CHECK_FOR_INTERRUPTS();
+
+		s.p[1] = poly->p[i];
+
+		if (on_ps_internal(t.p, &s))
+		{
+			if (on_ps_internal(t.p + 1, &s))
+				return true;	/* t is contained by s */
+
+			/* Y-cross */
+			res = touched_lseg_inside_poly(t.p, t.p + 1, &s, poly, i + 1);
+		}
+		else if (on_ps_internal(t.p + 1, &s))
+		{
+			/* Y-cross */
+			res = touched_lseg_inside_poly(t.p + 1, t.p, &s, poly, i + 1);
+		}
+		else if ((interpt = lseg_interpt_internal(&t, &s)) != NULL)
+		{
+			/*
+			 * segments are X-crossing, go to check each subsegment
+			 */
+
+			intersection = true;
+			res = lseg_inside_poly(t.p, interpt, poly, i + 1);
+			if (res)
+				res = lseg_inside_poly(t.p + 1, interpt, poly, i + 1);
+			pfree(interpt);
+		}
+
+		s.p[0] = s.p[1];
+	}
+
+	if (res && !intersection)
+	{
+		Point		p;
+
+		/*
+		 * if X-intersection wasn't found  then check central point of tested
+		 * segment. In opposite case we already check all subsegments
+		 */
+		p.x = (t.p[0].x + t.p[1].x) / 2.0;
+		p.y = (t.p[0].y + t.p[1].y) / 2.0;
+
+		res = point_inside(&p, poly->npts, poly->p);
+	}
+
+	return res;
+}
 
 /*-----------------------------------------------------------------
  * Determine if polygon A contains polygon B.
@@ -3804,49 +3964,30 @@ poly_contain(PG_FUNCTION_ARGS)
 	POLYGON    *polya = PG_GETARG_POLYGON_P(0);
 	POLYGON    *polyb = PG_GETARG_POLYGON_P(1);
 	bool		result;
-	int			i;
 
 	/*
 	 * Quick check to see if bounding box is contained.
 	 */
-	if (DatumGetBool(DirectFunctionCall2(box_contain,
+	if (polya->npts > 0 && polyb->npts > 0 &&
+		DatumGetBool(DirectFunctionCall2(box_contain,
 										 BoxPGetDatum(&polya->boundbox),
 										 BoxPGetDatum(&polyb->boundbox))))
 	{
-		result = true;			/* assume true for now */
-		for (i = 0; i < polyb->npts; i++)
+		int			i;
+		LSEG		s;
+
+		s.p[0] = polyb->p[polyb->npts - 1];
+		result = true;
+
+		for (i = 0; i < polyb->npts && result; i++)
 		{
-			if (point_inside(&(polyb->p[i]), polya->npts, &(polya->p[0])) == 0)
-			{
-#ifdef GEODEBUG
-				printf("poly_contain- point (%f,%f) not in polygon\n", polyb->p[i].x, polyb->p[i].y);
-#endif
-				result = false;
-				break;
-			}
-		}
-		if (result)
-		{
-			for (i = 0; i < polya->npts; i++)
-			{
-				if (point_inside(&(polya->p[i]), polyb->npts, &(polyb->p[0])) == 1)
-				{
-#ifdef GEODEBUG
-					printf("poly_contain- point (%f,%f) in polygon\n", polya->p[i].x, polya->p[i].y);
-#endif
-					result = false;
-					break;
-				}
-			}
+			s.p[1] = polyb->p[i];
+			result = lseg_inside_poly(s.p, s.p + 1, polya, 0);
+			s.p[0] = s.p[1];
 		}
 	}
 	else
 	{
-#ifdef GEODEBUG
-		printf("poly_contain- bound box ((%f,%f),(%f,%f)) not inside ((%f,%f),(%f,%f))\n",
-			   polyb->boundbox.low.x, polyb->boundbox.low.y, polyb->boundbox.high.x, polyb->boundbox.high.y,
-			   polya->boundbox.low.x, polya->boundbox.low.y, polya->boundbox.high.x, polya->boundbox.high.y);
-#endif
 		result = false;
 	}
 
@@ -5066,7 +5207,7 @@ poly_circle(PG_FUNCTION_ARGS)
 	CIRCLE	   *circle;
 	int			i;
 
-	if (poly->npts < 2)
+	if (poly->npts < 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("cannot convert empty polygon to circle")));
@@ -5088,11 +5229,6 @@ poly_circle(PG_FUNCTION_ARGS)
 	for (i = 0; i < poly->npts; i++)
 		circle->radius += point_dt(&poly->p[i], &circle->center);
 	circle->radius /= poly->npts;
-
-	if (FPzero(circle->radius))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cannot convert empty polygon to circle")));
 
 	PG_RETURN_CIRCLE_P(circle);
 }
@@ -5287,4 +5423,64 @@ plist_same(int npts, Point *p1, Point *p2)
 	}
 
 	return FALSE;
+}
+
+
+/*-------------------------------------------------------------------------
+ * Determine the hypotenuse.
+ *
+ * If required, x and y are swapped to make x the larger number. The
+ * traditional formula of x^2+y^2 is rearranged to factor x outside the
+ * sqrt. This allows computation of the hypotenuse for significantly
+ * larger values, and with a higher precision than when using the naive
+ * formula.  In particular, this cannot overflow unless the final result
+ * would be out-of-range.
+ *
+ * sqrt( x^2 + y^2 ) = sqrt( x^2( 1 + y^2/x^2) )
+ *					 = x * sqrt( 1 + y^2/x^2 )
+ *					 = x * sqrt( 1 + y/x * y/x )
+ *
+ * It is expected that this routine will eventually be replaced with the
+ * C99 hypot() function.
+ *
+ * This implementation conforms to IEEE Std 1003.1 and GLIBC, in that the
+ * case of hypot(inf,nan) results in INF, and not NAN.
+ *-----------------------------------------------------------------------
+ */
+double
+pg_hypot(double x, double y)
+{
+	double		yx;
+
+	/* Handle INF and NaN properly */
+	if (isinf(x) || isinf(y))
+		return get_float8_infinity();
+
+	if (isnan(x) || isnan(y))
+		return get_float8_nan();
+
+	/* Else, drop any minus signs */
+	x = fabs(x);
+	y = fabs(y);
+
+	/* Swap x and y if needed to make x the larger one */
+	if (x < y)
+	{
+		double		temp = x;
+
+		x = y;
+		y = temp;
+	}
+
+	/*
+	 * If y is zero, the hypotenuse is x.  This test saves a few cycles in
+	 * such cases, but more importantly it also protects against
+	 * divide-by-zero errors, since now x >= y.
+	 */
+	if (y == 0.0)
+		return x;
+
+	/* Determine the hypotenuse */
+	yx = y / x;
+	return x * sqrt(1.0 + (yx * yx));
 }

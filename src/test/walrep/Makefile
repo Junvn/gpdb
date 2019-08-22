@@ -6,19 +6,13 @@ top_builddir = ../../..
 
 include $(top_builddir)/src/Makefile.global
 
-WITH_MIRRORS ?= true
-REGRESS = setup walreceiver
-
-# These two tests can only run without mirrors due to limit of 1
-# walsender-walreceiver connection only
-ifeq ($(enable_segwalrep), yes)
-ifeq ($(WITH_MIRRORS), false)
-REGRESS += generate_ao_xlog generate_aoco_xlog replication_views_mirrorless
-else
-REGRESS += replication_views_mirrored
-endif
-endif
-REGRESS_OPTS = --dbname="walrep_regression"
+REGRESS = setup
+REGRESS += replication_views_mirrored missing_xlog walreceiver generate_ao_xlog generate_aoco_xlog
+REGRESS_OPTS = --dbname="walrep_regression" --load-extension=gp_inject_fault
 
 NO_PGXS = 1
 include $(top_srcdir)/src/makefiles/pgxs.mk
+
+# Ease the top-level Makefile's job a little bit, and install supporting
+# libraries as part of installcheck.
+installcheck: install

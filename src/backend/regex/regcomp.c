@@ -2,7 +2,7 @@
  * re_*comp and friends - compile REs
  * This file #includes several others (see the bottom).
  *
- * Copyright (c) 1998, 1999 Henry Spencer.	All rights reserved.
+ * Copyright (c) 1998, 1999 Henry Spencer.  All rights reserved.
  *
  * Development of this software was funded, in part, by Cray Research Inc.,
  * UUNET Communications Services Inc., Sun Microsystems Inc., and Scriptics
@@ -28,11 +28,13 @@
  * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * $PostgreSQL: pgsql/src/backend/regex/regcomp.c,v 1.46 2008/02/14 17:33:37 tgl Exp $
+ * src/backend/regex/regcomp.c
  *
  */
 
 #include "regex/regguts.h"
+
+#include "miscadmin.h"			/* needed by rcancelrequested/rstacktoodeep */
 
 /*
  * forward declarations, up here so forward datatypes etc. are defined early
@@ -67,6 +69,8 @@ static long nfanode(struct vars *, struct subre *, FILE *);
 static int	newlacon(struct vars *, struct state *, struct state *, int);
 static void freelacons(struct subre *, int);
 static void rfree(regex_t *);
+static int	rcancelrequested(void);
+static int	rstacktoodeep(void);
 
 #ifdef REG_DEBUG
 static void dump(regex_t *, FILE *);
@@ -120,12 +124,20 @@ static void dropstate(struct nfa *, struct state *);
 static void freestate(struct nfa *, struct state *);
 static void destroystate(struct nfa *, struct state *);
 static void newarc(struct nfa *, int, pcolor, struct state *, struct state *);
+static void createarc(struct nfa *, int, pcolor, struct state *, struct state *);
 static struct arc *allocarc(struct nfa *, struct state *);
 static void freearc(struct nfa *, struct arc *);
+static void changearctarget(struct arc *, struct state *);
+static int	hasnonemptyout(struct state *);
 static struct arc *findarc(struct state *, int, pcolor);
 static void cparc(struct nfa *, struct arc *, struct state *, struct state *);
+static void sortins(struct nfa *, struct state *);
+static int	sortins_cmp(const void *, const void *);
+static void sortouts(struct nfa *, struct state *);
+static int	sortouts_cmp(const void *, const void *);
 static void moveins(struct nfa *, struct state *, struct state *);
 static void copyins(struct nfa *, struct state *, struct state *);
+static void mergeins(struct nfa *, struct state *, struct arc **, int);
 static void moveouts(struct nfa *, struct state *, struct state *);
 static void copyouts(struct nfa *, struct state *, struct state *);
 static void cloneouts(struct nfa *, struct state *, struct state *, struct state *, int);
@@ -137,29 +149,38 @@ static void cleartraverse(struct nfa *, struct state *);
 static void specialcolors(struct nfa *);
 static long optimize(struct nfa *, FILE *);
 static void pullback(struct nfa *, FILE *);
-static int	pull(struct nfa *, struct arc *);
+static int	pull(struct nfa *, struct arc *, struct state **);
 static void pushfwd(struct nfa *, FILE *);
-static int	push(struct nfa *, struct arc *);
+static int	push(struct nfa *, struct arc *, struct state **);
 
 #define INCOMPATIBLE	1		/* destroys arc */
 #define SATISFIED	2			/* constraint satisfied */
 #define COMPATIBLE	3			/* compatible but not satisfied yet */
 static int	combine(struct arc *, struct arc *);
 static void fixempties(struct nfa *, FILE *);
-static int	unempty(struct nfa *, struct arc *);
+static struct state *emptyreachable(struct nfa *, struct state *,
+			   struct state *, struct arc **);
+static int	isconstraintarc(struct arc *);
+static int	hasconstraintout(struct state *);
+static void fixconstraintloops(struct nfa *, FILE *);
+static int	findconstraintloop(struct nfa *, struct state *);
+static void breakconstraintloop(struct nfa *, struct state *);
+static void clonesuccessorstates(struct nfa *, struct state *, struct state *,
+					 struct state *, struct arc *,
+					 char *, char *, int);
 static void cleanup(struct nfa *);
 static void markreachable(struct nfa *, struct state *, struct state *, struct state *);
 static void markcanreach(struct nfa *, struct state *, struct state *, struct state *);
 static long analyze(struct nfa *);
 static void compact(struct nfa *, struct cnfa *);
-static void carcsort(struct carc *, struct carc *);
+static void carcsort(struct carc *, size_t);
+static int	carc_cmp(const void *, const void *);
 static void freecnfa(struct cnfa *);
 static void dumpnfa(struct nfa *, FILE *);
 
 #ifdef REG_DEBUG
 static void dumpstate(struct state *, FILE *);
 static void dumparcs(struct state *, FILE *);
-static int	dumprarcs(struct arc *, struct state *, FILE *, int);
 static void dumparc(struct arc *, struct state *, FILE *);
 static void dumpcnfa(struct cnfa *, FILE *);
 static void dumpcstate(int, struct cnfa *, FILE *);
@@ -172,7 +193,7 @@ static void addrange(struct cvec *, chr, chr);
 static struct cvec *getcvec(struct vars *, int, int);
 static void freecvec(struct cvec *);
 
-/* === regc_locale.c === */
+/* === regc_pg_locale.c === */
 static int	pg_wc_isdigit(pg_wchar c);
 static int	pg_wc_isalpha(pg_wchar c);
 static int	pg_wc_isalnum(pg_wchar c);
@@ -184,6 +205,8 @@ static int	pg_wc_ispunct(pg_wchar c);
 static int	pg_wc_isspace(pg_wchar c);
 static pg_wchar pg_wc_toupper(pg_wchar c);
 static pg_wchar pg_wc_tolower(pg_wchar c);
+
+/* === regc_locale.c === */
 static celt element(struct vars *, const chr *, const chr *);
 static struct cvec *range(struct vars *, celt, celt, int);
 static int	before(celt, celt);
@@ -219,11 +242,12 @@ struct vars
 	struct subre *tree;			/* subexpression tree */
 	struct subre *treechain;	/* all tree nodes allocated */
 	struct subre *treefree;		/* any free tree nodes */
-	int			ntree;			/* number of tree nodes */
+	int			ntree;			/* number of tree nodes, plus one */
 	struct cvec *cv;			/* interface cvec */
 	struct cvec *cv2;			/* utility cvec */
 	struct subre *lacons;		/* lookahead-constraint vector */
 	int			nlacons;		/* size of lacons */
+	size_t		spaceused;		/* approx. space used for compilation */
 };
 
 /* parsing macros; most know that `v' is the struct vars pointer */
@@ -232,14 +256,13 @@ struct vars
 #define EAT(t)	(SEE(t) && next(v))		/* if next is this, swallow it */
 #define VISERR(vv)	((vv)->err != 0)	/* have we seen an error yet? */
 #define ISERR() VISERR(v)
-#define VERR(vv,e)	((vv)->nexttype = EOS, ((vv)->err) ? (vv)->err :\
-							((vv)->err = (e)))
-#undef ERR
+#define VERR(vv,e)	((vv)->nexttype = EOS, \
+					 (vv)->err = ((vv)->err ? (vv)->err : (e)))
 #define ERR(e)	VERR(v, e)		/* record an error */
 #define NOERR() {if (ISERR()) return;}	/* if error seen, return */
 #define NOERRN()	{if (ISERR()) return NULL;} /* NOERR with retval */
 #define NOERRZ()	{if (ISERR()) return 0;}	/* NOERR with retval */
-#define INSIST(c, e)	((c) ? 0 : ERR(e))		/* if condition false, error */
+#define INSIST(c, e) do { if (!(c)) ERR(e); } while (0) /* error if c false */
 #define NOTE(b) (v->re->re_info |= (b)) /* note visible condition */
 #define EMPTYARC(x, y)	newarc(v->nfa, EMPTY, 0, x, y)
 
@@ -269,8 +292,10 @@ struct vars
 
 
 /* static function list */
-static struct fns functions = {
+static const struct fns functions = {
 	rfree,						/* regfree insides */
+	rcancelrequested,			/* check for cancel request */
+	rstacktoodeep				/* check for stack getting dangerously deep */
 };
 
 
@@ -285,7 +310,8 @@ int
 pg_regcomp(regex_t *re,
 		   const chr *string,
 		   size_t len,
-		   int flags)
+		   int flags,
+		   Oid collation)
 {
 	struct vars var;
 	struct vars *v = &var;
@@ -311,6 +337,9 @@ pg_regcomp(regex_t *re,
 	if (!(flags & REG_EXTENDED) && (flags & REG_ADVF))
 		return REG_INVARG;
 
+	/* Initialize locale-dependent support */
+	pg_set_regex_collation(collation);
+
 	/* initial setup (after which freev() is callable) */
 	v->re = re;
 	v->now = string;
@@ -334,9 +363,11 @@ pg_regcomp(regex_t *re,
 	v->cv2 = NULL;
 	v->lacons = NULL;
 	v->nlacons = 0;
+	v->spaceused = 0;
 	re->re_magic = REMAGIC;
 	re->re_info = 0;			/* bits get set during parse */
 	re->re_csize = sizeof(chr);
+	re->re_collation = collation;
 	re->re_guts = NULL;
 	re->re_fns = VS(&functions);
 
@@ -353,6 +384,7 @@ pg_regcomp(regex_t *re,
 	ZAPCNFA(g->search);
 	v->nfa = newnfa(v, v->cm, (struct nfa *) NULL);
 	CNOERR();
+	/* set up a reasonably-sized transient cvec for getcvec usage */
 	v->cv = newcvec(100, 20);
 	if (v->cv == NULL)
 		return freev(v, REG_ESPACE);
@@ -549,25 +581,30 @@ makesearch(struct vars * v,
 	 * constraints, often knowing when you were in the pre state tells you
 	 * little; it's the next state(s) that are informative.  But some of them
 	 * may have other inarcs, i.e. it may be possible to make actual progress
-	 * and then return to one of them.	We must de-optimize such cases,
+	 * and then return to one of them.  We must de-optimize such cases,
 	 * splitting each such state into progress and no-progress states.
 	 */
 
-	/* first, make a list of the states */
+	/* first, make a list of the states reachable from pre and elsewhere */
 	slist = NULL;
 	for (a = pre->outs; a != NULL; a = a->outchain)
 	{
 		s = a->to;
 		for (b = s->ins; b != NULL; b = b->inchain)
+		{
 			if (b->from != pre)
 				break;
+		}
+
+		/*
+		 * We want to mark states as being in the list already by having non
+		 * NULL tmp fields, but we can't just store the old slist value in tmp
+		 * because that doesn't work for the first such state.  Instead, the
+		 * first list entry gets its own address in tmp.
+		 */
 		if (b != NULL && s->tmp == NULL)
 		{
-			/*
-			 * Must be split if not already in the list (fixes bugs 505048,
-			 * 230589, 840258, 504785).
-			 */
-			s->tmp = slist;
+			s->tmp = (slist != NULL) ? slist : s;
 			slist = s;
 		}
 	}
@@ -576,7 +613,9 @@ makesearch(struct vars * v,
 	for (s = slist; s != NULL; s = s2)
 	{
 		s2 = newstate(nfa);
+		NOERR();
 		copyouts(nfa, s, s2);
+		NOERR();
 		for (a = s->ins; a != NULL; a = b)
 		{
 			b = a->inchain;
@@ -586,7 +625,7 @@ makesearch(struct vars * v,
 				freearc(nfa, a);
 			}
 		}
-		s2 = s->tmp;
+		s2 = (s->tmp != s) ? s->tmp : NULL;
 		s->tmp = NULL;			/* clean up while we're at it */
 	}
 }
@@ -595,7 +634,7 @@ makesearch(struct vars * v,
  * parse - parse an RE
  *
  * This is actually just the top level, which parses a bunch of branches
- * tied together with '|'.	They appear in the tree as the left children
+ * tied together with '|'.  They appear in the tree as the left children
  * of a chain of '|' subres.
  */
 static struct subre *
@@ -705,6 +744,7 @@ parsebranch(struct vars * v,
 
 		/* NB, recursion in parseqatom() may swallow rest of branch */
 		parseqatom(v, stopper, type, lp, right, t);
+		NOERRN();
 	}
 
 	if (!seencontent)
@@ -904,7 +944,7 @@ parseqatom(struct vars * v,
 			EMPTYARC(lp, s);
 			EMPTYARC(s2, rp);
 			NOERR();
-			atom = parse(v, ')', PLAIN, s, s2);
+			atom = parse(v, ')', type, s, s2);
 			assert(SEE(')') || ISERR());
 			NEXT();
 			NOERR();
@@ -926,6 +966,7 @@ parseqatom(struct vars * v,
 			NOERR();
 			assert(v->nextvalue > 0);
 			atom = subre(v, 'b', BACKR, lp, rp);
+			NOERR();
 			subno = v->nextvalue;
 			atom->subno = subno;
 			EMPTYARC(lp, rp);	/* temporarily, so there's something */
@@ -1016,8 +1057,10 @@ parseqatom(struct vars * v,
 	}
 
 	/*
-	 * hard part:  something messy That is, capturing parens, back reference,
-	 * short/long clash, or an atom with substructure containing one of those.
+	 * hard part:  something messy
+	 *
+	 * That is, capturing parens, back reference, short/long clash, or an atom
+	 * with substructure containing one of those.
 	 */
 
 	/* now we'll need a subre for the contents even if they're boring */
@@ -1027,13 +1070,21 @@ parseqatom(struct vars * v,
 		NOERR();
 	}
 
-	/*
-	 * prepare a general-purpose state skeleton
+	/*----------
+	 * Prepare a general-purpose state skeleton.
 	 *
-	 * ---> [s] ---prefix---> [begin] ---atom---> [end] ----rest---> [rp] / /
-	 * [lp] ----> [s2] ----bypass---------------------
+	 * In the no-backrefs case, we want this:
 	 *
-	 * where bypass is an empty, and prefix is some repetitions of atom
+	 * [lp] ---> [s] ---prefix---> [begin] ---atom---> [end] ---rest---> [rp]
+	 *
+	 * where prefix is some repetitions of atom.  In the general case we need
+	 *
+	 * [lp] ---> [s] ---iterator---> [s2] ---rest---> [rp]
+	 *
+	 * where the iterator wraps around [begin] ---atom---> [end]
+	 *
+	 * We make the s state here for both cases; s2 is made below if needed
+	 *----------
 	 */
 	s = newstate(v->nfa);		/* first, new endpoints for the atom */
 	s2 = newstate(v->nfa);
@@ -1043,22 +1094,23 @@ parseqatom(struct vars * v,
 	NOERR();
 	atom->begin = s;
 	atom->end = s2;
-	s = newstate(v->nfa);		/* and spots for prefix and bypass */
-	s2 = newstate(v->nfa);
+	s = newstate(v->nfa);		/* set up starting state */
 	NOERR();
 	EMPTYARC(lp, s);
-	EMPTYARC(lp, s2);
 	NOERR();
 
 	/* break remaining subRE into x{...} and what follows */
 	t = subre(v, '.', COMBINE(qprefer, atom->flags), lp, rp);
+	NOERR();
 	t->left = atom;
 	atomp = &t->left;
+
 	/* here we should recurse... but we must postpone that to the end */
 
 	/* split top into prefix and remaining */
 	assert(top->op == '=' && top->left == NULL && top->right == NULL);
 	top->left = subre(v, '=', top->flags, top->begin, lp);
+	NOERR();
 	top->op = '.';
 	top->right = t;
 
@@ -1068,37 +1120,21 @@ parseqatom(struct vars * v,
 		assert(atom->begin->nouts == 1);		/* just the EMPTY */
 		delsub(v->nfa, atom->begin, atom->end);
 		assert(v->subs[subno] != NULL);
-		/* and here's why the recursion got postponed:  it must */
-		/* wait until the skeleton is filled in, because it may */
-		/* hit a backref that wants to copy the filled-in skeleton */
+
+		/*
+		 * And here's why the recursion got postponed: it must wait until the
+		 * skeleton is filled in, because it may hit a backref that wants to
+		 * copy the filled-in skeleton.
+		 */
 		dupnfa(v->nfa, v->subs[subno]->begin, v->subs[subno]->end,
 			   atom->begin, atom->end);
 		NOERR();
 	}
 
 	/*
-	 * It's quantifier time.  If the atom is just a BACKREF, we'll let it deal
-	 * with quantifiers internally.  Otherwise, the first step is to turn
-	 * x{0,...} into x{1,...}|empty
+	 * It's quantifier time.  If the atom is just a backref, we'll let it deal
+	 * with quantifiers internally.
 	 */
-	if (m == 0 && atomtype != BACKREF)
-	{
-		EMPTYARC(s2, atom->end);	/* the bypass */
-		assert(PREF(qprefer) != 0);
-		f = COMBINE(qprefer, atom->flags);
-		t = subre(v, '|', f, lp, atom->end);
-		NOERR();
-		t->left = atom;
-		t->right = subre(v, '|', PREF(f), s2, atom->end);
-		NOERR();
-		t->right->left = subre(v, '=', 0, s2, atom->end);
-		NOERR();
-		*atomp = t;
-		atomp = &t->left;
-		m = 1;
-	}
-
-	/* deal with the rest of the quantifier */
 	if (atomtype == BACKREF)
 	{
 		/* special case:  backrefs have internal quantifiers */
@@ -1108,16 +1144,26 @@ parseqatom(struct vars * v,
 		atom->min = (short) m;
 		atom->max = (short) n;
 		atom->flags |= COMBINE(qprefer, atom->flags);
+		/* rest of branch can be strung starting from atom->end */
+		s2 = atom->end;
 	}
 	else if (m == 1 && n == 1)
 	{
 		/* no/vacuous quantifier:  done */
 		EMPTYARC(s, atom->begin);		/* empty prefix */
+		/* rest of branch can be strung starting from atom->end */
+		s2 = atom->end;
 	}
-	else
+	else if (m > 0 && !(atom->flags & BACKR))
 	{
-		/* turn x{m,n} into x{m-1,n-1}x, with capturing */
-		/* parens in only second x */
+		/*
+		 * If there's no backrefs involved, we can turn x{m,n} into
+		 * x{m-1,n-1}x, with capturing parens in only the second x.  This is
+		 * valid because we only care about capturing matches from the final
+		 * iteration of the quantifier.  It's a win because we can implement
+		 * the backref-free left side as a plain DFA node, since we don't
+		 * really care where its submatches are.
+		 */
 		dupnfa(v->nfa, atom->begin, atom->end, s, atom->begin);
 		assert(m >= 1 && m != INFINITY && n >= 1);
 		repeat(v, s, atom->begin, m - 1, (n == INFINITY) ? n : n - 1);
@@ -1128,17 +1174,38 @@ parseqatom(struct vars * v,
 		NOERR();
 		t->right = atom;
 		*atomp = t;
+		/* rest of branch can be strung starting from atom->end */
+		s2 = atom->end;
+	}
+	else
+	{
+		/* general case: need an iteration node */
+		s2 = newstate(v->nfa);
+		NOERR();
+		moveouts(v->nfa, atom->end, s2);
+		NOERR();
+		dupnfa(v->nfa, atom->begin, atom->end, s, s2);
+		repeat(v, s, s2, m, n);
+		f = COMBINE(qprefer, atom->flags);
+		t = subre(v, '*', f, s, s2);
+		NOERR();
+		t->min = (short) m;
+		t->max = (short) n;
+		t->left = atom;
+		*atomp = t;
+		/* rest of branch is to be strung from iteration's end state */
 	}
 
 	/* and finally, look after that postponed recursion */
 	t = top->right;
 	if (!(SEE('|') || SEE(stopper) || SEE(EOS)))
-		t->right = parsebranch(v, stopper, type, atom->end, rp, 1);
+		t->right = parsebranch(v, stopper, type, s2, rp, 1);
 	else
 	{
-		EMPTYARC(atom->end, rp);
-		t->right = subre(v, '=', 0, atom->end, rp);
+		EMPTYARC(s2, rp);
+		t->right = subre(v, '=', 0, s2, rp);
 	}
+	NOERR();
 	assert(SEE('|') || SEE(stopper) || SEE(EOS));
 	t->flags |= COMBINE(t->flags, t->right->flags);
 	top->flags |= COMBINE(top->flags, t->flags);
@@ -1200,6 +1267,9 @@ scannum(struct vars * v)
 /*
  * repeat - replicate subNFA for quantifiers
  *
+ * The sub-NFA strung from lp to rp is modified to represent m to n
+ * repetitions of its initial contents.
+ *
  * The duplication sequences used here are chosen carefully so that any
  * pointers starting out pointing into the subexpression end up pointing into
  * the last occurrence.  (Note that it may not be strung between the same
@@ -1215,7 +1285,7 @@ repeat(struct vars * v,
 	   int n)
 {
 #define  SOME	 2
-#define  INF 3
+#define  INF	 3
 #define  PAIR(x, y)  ((x)*4 + (y))
 #define  REDUCE(x)	 ( ((x) == INFINITY) ? INF : (((x) > 1) ? SOME : (x)) )
 	const int	rm = REDUCE(m);
@@ -1309,7 +1379,7 @@ bracket(struct vars * v,
 /*
  * cbracket - handle complemented bracket expression
  * We do it by calling bracket() with dummy endpoints, and then complementing
- * the result.	The alternative would be to invoke rainbow(), and then delete
+ * the result.  The alternative would be to invoke rainbow(), and then delete
  * arcs as the b.e. is seen... but that gets messy.
  */
 static void
@@ -1516,6 +1586,7 @@ dovec(struct vars * v,
 	{
 		ch = *p;
 		newarc(v->nfa, PLAIN, subcolor(v->cm, ch), lp, rp);
+		NOERR();
 	}
 
 	/* and the ranges */
@@ -1525,6 +1596,7 @@ dovec(struct vars * v,
 		to = *(p + 1);
 		if (from <= to)
 			subrange(v, from, to, lp, rp);
+		NOERR();
 	}
 }
 
@@ -1575,6 +1647,16 @@ subre(struct vars * v,
 {
 	struct subre *ret = v->treefree;
 
+	/*
+	 * Checking for stack overflow here is sufficient to protect parse() and
+	 * its recursive subroutines.
+	 */
+	if (STACK_TOO_DEEP(v->re))
+	{
+		ERR(REG_ETOOBIG);
+		return NULL;
+	}
+
 	if (ret != NULL)
 		v->treefree = ret->left;
 	else
@@ -1589,11 +1671,11 @@ subre(struct vars * v,
 		v->treechain = ret;
 	}
 
-	assert(strchr("|.b(=", op) != NULL);
+	assert(strchr("=b|.*(", op) != NULL);
 
 	ret->op = op;
 	ret->flags = flags;
-	ret->retry = 0;
+	ret->id = 0;				/* will be assigned later */
 	ret->subno = 0;
 	ret->min = ret->max = 1;
 	ret->left = NULL;
@@ -1637,8 +1719,9 @@ freesrnode(struct vars * v,		/* might be NULL */
 		freecnfa(&sr->cnfa);
 	sr->flags = 0;
 
-	if (v != NULL)
+	if (v != NULL && v->treechain != NULL)
 	{
+		/* we're still parsing, maybe we can reuse the subre */
 		sr->left = v->treefree;
 		v->treefree = sr;
 	}
@@ -1663,7 +1746,7 @@ optst(struct vars * v,
 }
 
 /*
- * numst - number tree nodes (assigning retry indexes)
+ * numst - number tree nodes (assigning "id" indexes)
  */
 static int						/* next number */
 numst(struct subre * t,
@@ -1674,7 +1757,7 @@ numst(struct subre * t,
 	assert(t != NULL);
 
 	i = start;
-	t->retry = (short) i++;
+	t->id = (short) i++;
 	if (t->left != NULL)
 		i = numst(t->left, i);
 	if (t->right != NULL)
@@ -1684,6 +1767,20 @@ numst(struct subre * t,
 
 /*
  * markst - mark tree nodes as INUSE
+ *
+ * Note: this is a great deal more subtle than it looks.  During initial
+ * parsing of a regex, all subres are linked into the treechain list;
+ * discarded ones are also linked into the treefree list for possible reuse.
+ * After we are done creating all subres required for a regex, we run markst()
+ * then cleanst(), which results in discarding all subres not reachable from
+ * v->tree.  We then clear v->treechain, indicating that subres must be found
+ * by descending from v->tree.  This changes the behavior of freesubre(): it
+ * will henceforth FREE() unwanted subres rather than sticking them into the
+ * treefree list.  (Doing that any earlier would result in dangling links in
+ * the treechain list.)  This all means that freev() will clean up correctly
+ * if invoked before or after markst()+cleanst(); but it would not work if
+ * called partway through this state conversion, so we mustn't error out
+ * in or between these two functions.
  */
 static void
 markst(struct subre * t)
@@ -1781,25 +1878,27 @@ newlacon(struct vars * v,
 		 int pos)
 {
 	int			n;
+	struct subre *newlacons;
 	struct subre *sub;
 
 	if (v->nlacons == 0)
 	{
-		v->lacons = (struct subre *) MALLOC(2 * sizeof(struct subre));
 		n = 1;					/* skip 0th */
-		v->nlacons = 2;
+		newlacons = (struct subre *) MALLOC(2 * sizeof(struct subre));
 	}
 	else
 	{
-		v->lacons = (struct subre *) REALLOC(v->lacons,
-									(v->nlacons + 1) * sizeof(struct subre));
-		n = v->nlacons++;
+		n = v->nlacons;
+		newlacons = (struct subre *) REALLOC(v->lacons,
+											 (n + 1) * sizeof(struct subre));
 	}
-	if (v->lacons == NULL)
+	if (newlacons == NULL)
 	{
 		ERR(REG_ESPACE);
 		return 0;
 	}
+	v->lacons = newlacons;
+	v->nlacons = n + 1;
 	sub = &v->lacons[n];
 	sub->begin = begin;
 	sub->end = end;
@@ -1854,6 +1953,38 @@ rfree(regex_t *re)
 	}
 }
 
+/*
+ * rcancelrequested - check for external request to cancel regex operation
+ *
+ * Return nonzero to fail the operation with error code REG_CANCEL,
+ * zero to keep going
+ *
+ * The current implementation is Postgres-specific.  If we ever get around
+ * to splitting the regex code out as a standalone library, there will need
+ * to be some API to let applications define a callback function for this.
+ */
+static int
+rcancelrequested(void)
+{
+	return InterruptPending && (QueryCancelPending || ProcDiePending);
+}
+
+/*
+ * rstacktoodeep - check for stack getting dangerously deep
+ *
+ * Return nonzero to fail the operation with error code REG_ETOOBIG,
+ * zero to keep going
+ *
+ * The current implementation is Postgres-specific.  If we ever get around
+ * to splitting the regex code out as a standalone library, there will need
+ * to be some API to let applications define a callback function for this.
+ */
+static int
+rstacktoodeep(void)
+{
+	return stack_is_too_deep();
+}
+
 #ifdef REG_DEBUG
 
 /*
@@ -1886,7 +2017,7 @@ dump(regex_t *re,
 	dumpcolors(&g->cmap, f);
 	if (!NULLCNFA(g->search))
 	{
-		printf("\nsearch:\n");
+		fprintf(f, "\nsearch:\n");
 		dumpcnfa(&g->search, f);
 	}
 	for (i = 1; i < g->nlacons; i++)
@@ -1972,11 +2103,11 @@ stid(struct subre * t,
 	 char *buf,
 	 size_t bufsize)
 {
-	/* big enough for hex int or decimal t->retry? */
-	if (bufsize < sizeof(void *) * 2 + 3 || bufsize < sizeof(t->retry) * 3 + 1)
+	/* big enough for hex int or decimal t->id? */
+	if (bufsize < sizeof(void *) * 2 + 3 || bufsize < sizeof(t->id) * 3 + 1)
 		return "unable";
-	if (t->retry != 0)
-		sprintf(buf, "%d", t->retry);
+	if (t->id != 0)
+		sprintf(buf, "%d", t->id);
 	else
 		sprintf(buf, "%p", t);
 	return buf;
@@ -1988,4 +2119,5 @@ stid(struct subre * t,
 #include "regc_color.c"
 #include "regc_nfa.c"
 #include "regc_cvec.c"
+#include "regc_pg_locale.c"
 #include "regc_locale.c"

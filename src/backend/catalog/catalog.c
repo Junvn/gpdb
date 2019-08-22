@@ -5,12 +5,12 @@
  *		bits of hard-wired knowledge
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/catalog/catalog.c,v 1.80 2008/12/03 13:05:22 heikki Exp $
+ *	  src/backend/catalog/catalog.c
  *
  *-------------------------------------------------------------------------
  */
@@ -26,6 +26,7 @@
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/oid_dispatch.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_auth_members.h"
@@ -36,12 +37,14 @@
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_pltemplate.h"
+#include "catalog/pg_resourcetype.h"
 #include "catalog/pg_resqueue.h"
+#include "catalog/pg_resqueuecapability.h"
 #include "catalog/pg_resgroup.h"
+#include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shdescription.h"
-#include "catalog/pg_filespace.h"
-#include "catalog/pg_filespace_entry.h"
+#include "catalog/pg_shseclabel.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_statistic.h"
@@ -49,417 +52,93 @@
 
 #include "catalog/gp_configuration_history.h"
 #include "catalog/gp_segment_config.h"
+#include "catalog/pg_stat_last_operation.h"
+#include "catalog/pg_stat_last_shoperation.h"
 
-#include "catalog/gp_persistent.h"
-#include "catalog/gp_global_sequence.h"
 #include "catalog/gp_id.h"
 #include "catalog/gp_version.h"
 #include "catalog/toasting.h"
-
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
 #include "utils/tqual.h"
 
-#include "cdb/cdbpersistenttablespace.h"
 #include "cdb/cdbvars.h"
 
-#define OIDCHARS		10			/* max chars printed by %u */
-#define FORKNAMECHARS	4			/* max chars for a fork name */
+static bool IsAoSegmentClass(Form_pg_class reltuple);
 
-static char *
-GetFilespacePathForTablespace(Oid tablespaceOid)
+/*
+ * Like relpath(), but gets the directory containing the data file
+ * and the filename separately.
+ */
+void
+reldir_and_filename(RelFileNode node, BackendId backend, ForkNumber forknum,
+					char **dir, char **filename)
 {
-	PersistentTablespaceGetFilespaces tablespaceGetFilespaces;
-	Oid filespaceOid;
+	char	   *path;
+	int			i;
 
-	/* All other tablespaces are accessed via filespace locations */
-	char *primary_path;
-	char *mirror_path;	/* unused */
+	path = relpathbackend(node, backend, forknum);
 
-	Assert(tablespaceOid != GLOBALTABLESPACE_OID);
-	Assert(tablespaceOid != DEFAULTTABLESPACE_OID);
-	
-	/* Lookup filespace location from the persistent object layer. */
-	tablespaceGetFilespaces = 
-			PersistentTablespace_TryGetPrimaryAndMirrorFilespaces(
-														tablespaceOid, 
-														&primary_path, 
-														&mirror_path,
-														&filespaceOid);
-	switch (tablespaceGetFilespaces)
-	{
-	case PersistentTablespaceGetFilespaces_TablespaceNotFound:
-		ereport(ERROR, 
-				(errcode(ERRCODE_CDB_INTERNAL_ERROR),
-				 errmsg("Unable to find entry for tablespace OID = %u when forming file-system path",
-						tablespaceOid)));
-		break;
-			
-	case PersistentTablespaceGetFilespaces_FilespaceNotFound:
-		ereport(ERROR, 
-				(errcode(ERRCODE_CDB_INTERNAL_ERROR),
-				 errmsg("Unable to find entry for filespace OID = %u when forming file-system path for tablespace OID = %u",
-				 		filespaceOid,
-						tablespaceOid)));
-		break;
-					
-	case PersistentTablespaceGetFilespaces_Ok:
-		// Go below and pass back the result.
-		break;
-		
-	default:
-		elog(ERROR, "Unexpected tablespace filespace fetch result: %d",
-			 tablespaceGetFilespaces);
-	}
-	
 	/*
-	 * We immediately throw out the mirror_path because it is not
-	 * relevant here.
+	 * The base path is like "<path>/<rnode>". Split it into
+	 * path and filename parts.
 	 */
-	if (mirror_path)
-		pfree(mirror_path);
-	Assert(primary_path != NULL);
+	for (i = strlen(path) - 1; i >= 0; i--)
+	{
+		if (path[i] == '/')
+			break;
+	}
+	if (i <= 0 || path[i] != '/')
+		elog(ERROR, "unexpected path: \"%s\"", path);
 
-	return primary_path;
+	*dir = pnstrdup(path, i);
+	*filename = pstrdup(&path[i + 1]);
+
+	pfree(path);
 }
 
 /*
- * Lookup table of fork name by fork number.
- *
- * If you add a new entry, remember to update the errhint below, and the
- * documentation for pg_relation_size(). Also keep FORKNAMECHARS above
- * up-to-date.
- */
-const char *forkNames[] = {
-	"main", /* MAIN_FORKNUM */
-	"fsm",   /* FSM_FORKNUM */
-	"vm"   /* VISIBILITYMAP_FORKNUM */
-};
-
-/*
- * forkname_to_number - look up fork number by name
- */
-ForkNumber
-forkname_to_number(char *forkName)
-{
-	ForkNumber forkNum;
-
-	for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
-		if (strcmp(forkNames[forkNum], forkName) == 0)
-			return forkNum;
-
-	ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("invalid fork name"),
-			 errhint("Valid fork names are 'main' and 'fsm'")));
-	return InvalidForkNumber; /* keep compiler quiet */
-}
-
-/*
- * relpath			- construct path to a relation's file
- *
- * Result is a palloc'd string.
+ * Like relpathbackend(), but more convenient when dealing with
+ * AO relations. The filename pattern is the same as for heap
+ * tables, but this variant takes also 'segno' as argument.
  */
 char *
-relpath(RelFileNode rnode, ForkNumber forknum)
+aorelpathbackend(RelFileNode node, BackendId backend, int32 segno)
 {
-	int			pathlen;
+	char	   *fullpath;
 	char	   *path;
-	int 		snprintfResult;
 
-	if (rnode.spcNode == GLOBALTABLESPACE_OID)
-	{
-		/* Shared system relations live in {datadir}/global */
-		Assert(rnode.dbNode == 0);
-		pathlen = 7 + OIDCHARS + 1 + FORKNAMECHARS + 1;
-		path = (char *) palloc(pathlen);
-		if (forknum != MAIN_FORKNUM)
-			snprintfResult = snprintf(path, pathlen, "global/%u_%s",
-									  rnode.relNode, forkNames[forknum]);
-		else
-			snprintfResult = snprintf(path, pathlen, "global/%u",
-									  rnode.relNode);
-	}
-	else if (rnode.spcNode == DEFAULTTABLESPACE_OID)
-	{
-		/* The default tablespace is {datadir}/base */
-		pathlen = 5 + OIDCHARS + 1 + OIDCHARS + 1 + FORKNAMECHARS + 1;
-		path = (char *) palloc(pathlen);
-		if (forknum != MAIN_FORKNUM)
-			snprintfResult = snprintf(path, pathlen, "base/%u/%u_%s",
-									  rnode.dbNode, rnode.relNode,
-									  forkNames[forknum]);
-		else
-			snprintfResult = snprintf(path, pathlen, "base/%u/%u",
-									  rnode.dbNode, rnode.relNode);
-	}
+	path = relpathbackend(node, backend, MAIN_FORKNUM);
+	if (segno == 0)
+		fullpath = path;
 	else
 	{
-		char *primary_path;
-
-		/* All other tablespaces are accessed via filespace locations */
-		primary_path = GetFilespacePathForTablespace(rnode.spcNode);
-
-		/* 
-		 * We should develop an interface for the above that doesn't
-		 * require reallocating to a slightly larger size...
-		 */
-		pathlen = strlen(primary_path) + 1 + OIDCHARS + 1 + OIDCHARS + 1
-			+ OIDCHARS + 1 + FORKNAMECHARS + 1;
-		path = (char *) palloc(pathlen);
-		if (forknum != MAIN_FORKNUM)
-			snprintfResult = snprintf(path, pathlen, "%s/%u/%u/%u_%s",
-									  primary_path, rnode.spcNode, rnode.dbNode,
-									  rnode.relNode, forkNames[forknum]);
-		else
-			snprintfResult = snprintf(path, pathlen, "%s/%u/%u/%u",
-									  primary_path, rnode.spcNode, rnode.dbNode,
-									  rnode.relNode);
-
-		/* Throw away the allocation we got from persistent layer */
-		pfree(primary_path);
+		/* be sure we have enough space for the '.segno' */
+		fullpath = (char *) palloc(strlen(path) + 12);
+		sprintf(fullpath, "%s.%u", path, segno);
+		pfree(path);
 	}
-	
-	Assert(snprintfResult >= 0);
-	Assert(snprintfResult < pathlen);
-
-	return path;
-}
-
-/*
- * GetDatabasePath			- construct path to a database dir
- *
- * Result is a palloc'd string.
- *
- * XXX this must agree with relpath()!
- */
-char *
-GetDatabasePath(Oid dbNode, Oid spcNode)
-{
-	int			pathlen;
-	char	   *path;
-	int 		snprintfResult;
-
-	if (spcNode == GLOBALTABLESPACE_OID)
-	{
-		/* Shared system relations live in {datadir}/global */
-		Assert(dbNode == 0);
-		pathlen = 6 + 1;
-		path = (char *) palloc(pathlen);
-
-		// Using strncpy is error prone.
-		snprintfResult =
-			snprintf(path, pathlen, "global");
-	}
-	else if (spcNode == DEFAULTTABLESPACE_OID)
-	{
-		/* The default tablespace is {datadir}/base */
-		pathlen = 5 + OIDCHARS + 1;
-		path = (char *) palloc(pathlen);
-		snprintfResult =
-			snprintf(path, pathlen, "base/%u",
-					 dbNode);
-	}
-	else
-	{
-		char *primary_path;
-
-		/* All other tablespaces are accessed via filespace locations */
-		primary_path = GetFilespacePathForTablespace(spcNode);
-
-		/* 
-		 * We should develop an interface for the above that doesn't
-		 * require reallocating to a slightly larger size...
-		 */
-		pathlen = strlen(primary_path)+1+OIDCHARS+1+OIDCHARS+1;
-		path = (char *) palloc(pathlen);
-		snprintfResult =
-			snprintf(path, pathlen, "%s/%u/%u",
-					 primary_path, spcNode, dbNode);
-
-		/* Throw away the allocation we got from persistent layer */
-		pfree(primary_path);
-	}
-	
-	Assert(snprintfResult >= 0);
-	Assert(snprintfResult < pathlen);
-
-	return path;
-}
-
-
-void FormDatabasePath(
-	char *databasePath,
-
-	char *filespaceLocation,
-
-	Oid tablespaceOid,
-
-	Oid databaseOid)
-{
-	int			targetMaxLen = MAXPGPATH + 1;
-	int 		snprintfResult;
-
-	if (tablespaceOid == GLOBALTABLESPACE_OID)
-	{
-		/* Shared system relations live in {datadir}/global */
-		Assert(databaseOid == 0);
-		Assert(filespaceLocation == NULL);
-
-		// Using strncpy is error prone.
-		snprintfResult =
-			snprintf(databasePath, targetMaxLen, "global");
-	}
-	else if (tablespaceOid == DEFAULTTABLESPACE_OID)
-	{
-		/* The default tablespace is {datadir}/base */
-		Assert(filespaceLocation == NULL);
-
-		snprintfResult =
-			snprintf(databasePath, targetMaxLen, "base/%u",
-					 databaseOid);
-	}
-	else
-	{
-		/* All other tablespaces are in filespace locations */
-		Assert(filespaceLocation != NULL);
-
-		snprintfResult =
-			snprintf(databasePath, targetMaxLen, "%s/%u/%u",
-					 filespaceLocation, tablespaceOid, databaseOid);
-	}
-
-	if (snprintfResult < 0)
-		elog(ERROR, "FormDatabasePath formatting error");
-
-	/*
-	 * Magically truncating the result to fit in the target string is unacceptable here
-	 * because it can result in the wrong file-system object being referenced.
-	 */
-	if (snprintfResult >= targetMaxLen)
-		elog(ERROR, "FormDatabasePath formatting result length %d exceeded the maximum length %d",
-					snprintfResult,
-					targetMaxLen);
-}
-
-void FormTablespacePath(
-	char *tablespacePath,
-
-	char *filespaceLocation,
-
-	Oid tablespaceOid)
-{
-	int			targetMaxLen = MAXPGPATH + 1;
-	int 		snprintfResult;
-
-	if (tablespaceOid == GLOBALTABLESPACE_OID)
-	{
-		/* Shared system relations live in {datadir}/global */
-		Assert(filespaceLocation == NULL);
-
-		// Using strncpy is error prone.
-		snprintfResult =
-			snprintf(tablespacePath, targetMaxLen, "global");
-	}
-	else if (tablespaceOid == DEFAULTTABLESPACE_OID)
-	{
-		/* The default tablespace is {datadir}/base */
-		Assert(filespaceLocation == NULL);
-
-		// Using strncpy is error prone.
-		snprintfResult =
-			snprintf(tablespacePath, targetMaxLen, "base");
-	}
-	else
-	{
-		/* All other tablespaces are in filespace locations */
-		Assert(filespaceLocation != NULL);
-		snprintfResult =
-			snprintf(tablespacePath, targetMaxLen, "%s/%u",
-					 filespaceLocation, tablespaceOid);
-	}
-
-	if (snprintfResult < 0)
-		elog(ERROR, "FormTablespacePath formatting error");
-
-	/*
-	 * Magically truncating the result to fit in the target string is unacceptable here
-	 * because it can result in the wrong file-system object being referenced.
-	 */
-	if (snprintfResult >= targetMaxLen)
-		elog(ERROR, "FormTablespacePath formatting result length %d exceeded the maximum length %d",
-					snprintfResult,
-					targetMaxLen);
-}
-
-
-void 
-FormRelationPath(char *relationPath, char *filespaceLocation, RelFileNode rnode)
-{
-	int			targetMaxLen = MAXPGPATH + 1;
-	int 		snprintfResult;
-
-	if (rnode.spcNode == GLOBALTABLESPACE_OID)
-	{
-		/* Shared system relations live in {datadir}/global */
-		Assert(rnode.dbNode == 0);
-		
-		snprintfResult =
-			snprintf(relationPath, targetMaxLen, "global/%u",
-					 rnode.relNode);
-	}
-	else if (rnode.spcNode == DEFAULTTABLESPACE_OID)
-	{
-		/* The default tablespace is {datadir}/base */
-		
-		snprintfResult =
-			snprintf(relationPath, targetMaxLen, "base/%u/%u",
-					 rnode.dbNode, rnode.relNode);
-	}
-	else
-	{
-		snprintfResult =
-			snprintf(relationPath, targetMaxLen, "%s/%u/%u/%u",
-				filespaceLocation,
-				rnode.spcNode,
-				rnode.dbNode,
-				rnode.relNode);
-	}	
-
-	if (snprintfResult < 0)
-		elog(ERROR, "FormRelationPath formatting error");
-
-	/*
-	 * Magically truncating the result to fit in the target string is unacceptable here
-	 * because it can result in the wrong file-system object being referenced.
-	 */
-	if (snprintfResult >= targetMaxLen)
-		elog(ERROR, "FormRelationPath formatting result length %d exceeded the maximum length %d",
-					snprintfResult,
-					targetMaxLen);
+	return fullpath;
 }
 
 /*
  * IsSystemRelation
- *		True iff the relation is a system catalog relation.
+ *		True iff the relation is either a system catalog or toast table.
+ *		By a system catalog, we mean one that created in the pg_catalog schema
+ *		during initdb.  User-created relations in pg_catalog don't count as
+ *		system catalogs.
  *
  *		NB: TOAST relations are considered system relations by this test
  *		for compatibility with the old IsSystemRelationName function.
  *		This is appropriate in many places but not all.  Where it's not,
- *		also check IsToastRelation.
- *
- *		We now just test if the relation is in the system catalog namespace;
- *		so it's no longer necessary to forbid user relations from having
- *		names starting with pg_.
+ *		also check IsToastRelation or use IsCatalogRelation().
  */
 bool
 IsSystemRelation(Relation relation)
 {
-	return IsSystemNamespace(RelationGetNamespace(relation)) ||
-		   IsToastNamespace(RelationGetNamespace(relation)) ||
-		   IsAoSegmentNamespace(RelationGetNamespace(relation));
+	return IsSystemClass(RelationGetRelid(relation), relation->rd_rel);
 }
 
 /*
@@ -469,13 +148,62 @@ IsSystemRelation(Relation relation)
  *		search pg_class directly.
  */
 bool
-IsSystemClass(Form_pg_class reltuple)
+IsSystemClass(Oid relid, Form_pg_class reltuple)
+{
+	return IsToastClass(reltuple) || IsCatalogClass(relid, reltuple) ||
+		IsAoSegmentClass(reltuple);
+}
+
+/*
+ * IsCatalogRelation
+ *		True iff the relation is a system catalog, or the toast table for
+ *		a system catalog.  By a system catalog, we mean one that created
+ *		in the pg_catalog schema during initdb.  As with IsSystemRelation(),
+ *		user-created relations in pg_catalog don't count as system catalogs.
+ *
+ *		Note that IsSystemRelation() returns true for ALL toast relations,
+ *		but this function returns true only for toast relations of system
+ *		catalogs.
+ */
+bool
+IsCatalogRelation(Relation relation)
+{
+	return IsCatalogClass(RelationGetRelid(relation), relation->rd_rel);
+}
+
+/*
+ * IsCatalogClass
+ *		True iff the relation is a system catalog relation.
+ *
+ * Check IsCatalogRelation() for details.
+ */
+bool
+IsCatalogClass(Oid relid, Form_pg_class reltuple)
 {
 	Oid			relnamespace = reltuple->relnamespace;
 
-	return IsSystemNamespace(relnamespace) ||
-		IsToastNamespace(relnamespace) ||
-		IsAoSegmentNamespace(relnamespace);
+	/*
+	 * Never consider relations outside pg_catalog/pg_toast to be catalog
+	 * relations.
+	 */
+	if (!IsSystemNamespace(relnamespace) && !IsToastNamespace(relnamespace) &&
+		!IsAoSegmentNamespace(relnamespace))
+		return false;
+
+	/* ----
+	 * Check whether the oid was assigned during initdb, when creating the
+	 * initial template database. Minus the relations in information_schema
+	 * excluded above, these are integral part of the system.
+	 * We could instead check whether the relation is pinned in pg_depend, but
+	 * this is noticeably cheaper and doesn't require catalog access.
+	 *
+	 * This test is safe since even a oid wraparound will preserve this
+	 * property (c.f. GetNewObjectId()) and it has the advantage that it works
+	 * correctly even if a user decides to create a relation in the pg_catalog
+	 * namespace.
+	 * ----
+	 */
+	return relid < FirstNormalObjectId;
 }
 
 /*
@@ -500,6 +228,20 @@ IsToastClass(Form_pg_class reltuple)
 	Oid			relnamespace = reltuple->relnamespace;
 
 	return IsToastNamespace(relnamespace);
+}
+
+/*
+ * IsAoSegmentClass
+ *		Like the above, but takes a Form_pg_class as argument.
+ *		Used when we do not want to open the relation and have to
+ *		search pg_class directly.
+ */
+static bool
+IsAoSegmentClass(Form_pg_class reltuple)
+{
+	Oid			relnamespace = reltuple->relnamespace;
+
+	return IsAoSegmentNamespace(relnamespace);
 }
 
 /*
@@ -588,20 +330,16 @@ GetReservedPrefix(const char *name)
  *		Given the OID of a relation, determine whether it's supposed to be
  *		shared across an entire database cluster.
  *
- * Hard-wiring this list is pretty grotty, but we really need it so that
- * we can compute the locktag for a relation (and then lock it) without
- * having already read its pg_class entry.	If we try to retrieve relisshared
- * from pg_class with no pre-existing lock, there is a race condition against
- * anyone who is concurrently committing a change to the pg_class entry:
- * since we read system catalog entries under SnapshotNow, it's possible
- * that both the old and new versions of the row are invalid at the instants
- * we scan them.  We fix this by insisting that updaters of a pg_class
- * row must hold exclusive lock on the corresponding rel, and that users
- * of a relation must hold at least AccessShareLock on the rel *before*
- * trying to open its relcache entry.  But to lock a rel, you have to
- * know if it's shared.  Fortunately, the set of shared relations is
- * fairly static, so a hand-maintained list of their OIDs isn't completely
- * impractical.
+ * In older releases, this had to be hard-wired so that we could compute the
+ * locktag for a relation and lock it before examining its catalog entry.
+ * Since we now have MVCC catalog access, the race conditions that made that
+ * a hard requirement are gone, so we could look at relaxing this restriction.
+ * However, if we scanned the pg_class entry to find relisshared, and only
+ * then locked the relation, pg_class could get updated in the meantime,
+ * forcing us to scan the relation again, which would definitely be complex
+ * and might have undesirable performance consequences.  Fortunately, the set
+ * of shared relations is fairly static, so a hand-maintained list of their
+ * OIDs isn't completely impractical.
  */
 bool
 IsSharedRelation(Oid relationId)
@@ -613,19 +351,14 @@ IsSharedRelation(Oid relationId)
 		relationId == PLTemplateRelationId ||
 		relationId == SharedDescriptionRelationId ||
 		relationId == SharedDependRelationId ||
-		relationId == TableSpaceRelationId)
+		relationId == SharedSecLabelRelationId ||
+		relationId == TableSpaceRelationId ||
+		relationId == DbRoleSettingRelationId)
 		return true;
 
 	/* GPDB additions */
-	if (relationId == FileSpaceRelationId ||
-		relationId == GpIdRelationId ||
+	if (relationId == GpIdRelationId ||
 		relationId == GpVersionRelationId ||
-
-		relationId == GpPersistentRelationNodeRelationId ||
-		relationId == GpPersistentDatabaseNodeRelationId ||
-		relationId == GpPersistentTablespaceNodeRelationId ||
-		relationId == GpPersistentFilespaceNodeRelationId ||
-		relationId == GpGlobalSequenceRelationId ||
 
 		/* MPP-6929: metadata tracking */
 		relationId == StatLastShOpRelationId ||
@@ -637,7 +370,6 @@ IsSharedRelation(Oid relationId)
 		relationId == ResGroupCapabilityRelationId ||
 		relationId == GpConfigHistoryRelationId ||
 		relationId == GpSegmentConfigRelationId ||
-		relationId == FileSpaceEntryRelationId ||
 
 		relationId == AuthTimeConstraintRelationId)
 		return true;
@@ -653,15 +385,14 @@ IsSharedRelation(Oid relationId)
 		relationId == SharedDescriptionObjIndexId ||
 		relationId == SharedDependDependerIndexId ||
 		relationId == SharedDependReferenceIndexId ||
+		relationId == SharedSecLabelObjectIndexId ||
 		relationId == TablespaceOidIndexId ||
-		relationId == TablespaceNameIndexId)
+		relationId == TablespaceNameIndexId ||
+		relationId == DbRoleSettingDatidRolidIndexId)
 		return true;
 
 	/* GPDB added indexes */
-	if (relationId == FilespaceOidIndexId ||
-		relationId == FilespaceNameIndexId ||
-
-		/* MPP-6929: metadata tracking */
+	if (/* MPP-6929: metadata tracking */
 		relationId == StatLastShOpClassidObjidIndexId ||
 		relationId == StatLastShOpClassidObjidStaactionnameIndexId ||
 
@@ -682,27 +413,21 @@ IsSharedRelation(Oid relationId)
 		relationId == AuthIdRolResGroupIndexId ||
 		relationId == GpSegmentConfigContentPreferred_roleIndexId ||
 		relationId == GpSegmentConfigDbidIndexId ||
-		relationId == FileSpaceEntryFsefsoidIndexId ||
-		relationId == FileSpaceEntryFsefsoidFsedbidIndexId)
+		relationId == AuthTimeConstraintAuthIdIndexId)
 	{
 		return true;
 	}
 
 	/* These are their toast tables and toast indexes (see toasting.h) */
-	if (relationId == PgAuthidToastTable ||
-		relationId == PgAuthidToastIndex ||
-		relationId == PgDatabaseToastTable ||
-		relationId == PgDatabaseToastIndex ||
-		relationId == PgShdescriptionToastTable ||
-		relationId == PgShdescriptionToastIndex)
+	if (relationId == PgShdescriptionToastTable ||
+		relationId == PgShdescriptionToastIndex ||
+		relationId == PgDbRoleSettingToastTable ||
+		relationId == PgDbRoleSettingToastIndex)
 		return true;
 
 	/* GPDB added toast tables and their indexes */
 	if (relationId == GpSegmentConfigToastTable ||
-		relationId == GpSegmentConfigToastIndex ||
-
-		relationId == PgFileSpaceEntryToastTable ||
-		relationId == PgFileSpaceEntryToastIndex)
+		relationId == GpSegmentConfigToastIndex)
 	{
 		return true;
 	}
@@ -767,10 +492,14 @@ RelationNeedsSynchronizedOIDs(Relation relation)
  * Since the OID is not immediately inserted into the table, there is a
  * race condition here; but a problem could occur only if someone else
  * managed to cycle through 2^32 OIDs and generate the same OID before we
- * finish inserting our row.  This seems unlikely to be a problem.	Note
+ * finish inserting our row.  This seems unlikely to be a problem.  Note
  * that if we had to *commit* the row to end the race condition, the risk
- * would be rather higher; therefore we use SnapshotDirty in the test,
- * so that we will see uncommitted rows.
+ * would be rather higher; therefore we use SnapshotAny in the test, so that
+ * we will see uncommitted rows.  (We used to use SnapshotDirty, but that has
+ * the disadvantage that it ignores recently-deleted rows, creating a risk
+ * of transient conflicts for as long as our own MVCC snapshots think a
+ * recently-deleted row is live.  The risk is far higher when selecting TOAST
+ * OIDs, because SnapshotToast considers dead rows as active indefinitely.)
  */
 Oid
 GetNewOid(Relation relation)
@@ -829,10 +558,10 @@ GetNewOid(Relation relation)
  *
  * This is exported separately because there are cases where we want to use
  * an index that will not be recognized by RelationGetOidIndex: TOAST tables
- * and pg_largeobject have indexes that are usable, but have multiple columns
- * and are on ordinary columns rather than a true OID column.  This code
- * will work anyway, so long as the OID is the index's first column.  The
- * caller must pass in the actual heap attnum of the OID column, however.
+ * have indexes that are usable, but have multiple columns and are on
+ * ordinary columns rather than a true OID column.  This code will work
+ * anyway, so long as the OID is the index's first column.  The caller must
+ * pass in the actual heap attnum of the OID column, however.
  *
  * Caller must have a suitable lock on the relation.
  */
@@ -840,12 +569,9 @@ Oid
 GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 {
 	Oid			newOid;
-	SnapshotData SnapshotDirty;
-	SysScanDesc	scan;
+	SysScanDesc scan;
 	ScanKeyData key;
 	bool		collides;
-
-	InitDirtySnapshot(SnapshotDirty);
 
 	/* Generate new OIDs until we find one not in the table */
 	do
@@ -859,9 +585,9 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(newOid));
 
-		/* see notes above about using SnapshotDirty */
+		/* see notes above about using SnapshotAny */
 		scan = systable_beginscan(relation, indexId, true,
-								  &SnapshotDirty, 1, &key);
+								  SnapshotAny, 1, &key);
 
 		collides = HeapTupleIsValid(systable_getnext(scan));
 
@@ -871,171 +597,119 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 	return newOid;
 }
 
-/*
- * GetNewSequenceRelationOid
- *		Get a sequence relation Oid and verify it is valid against
- *		the pg_class relation by doing an index lookup. The caller
- *		should have a suitable lock on pg_class.
- */
-Oid
-GetNewSequenceRelationOid(Relation relation)
+static bool
+GpCheckRelFileCollision(RelFileNodeBackend rnode)
 {
-	Oid			newOid;
-	Oid			oidIndex;
-	Relation	indexrel;
-	SnapshotData SnapshotDirty;
-	IndexScanDesc scan;
-	ScanKeyData key;
-	bool		collides;
-	RelFileNode rnode;
 	char	   *rpath;
-	int			fd;
+	bool		collides;
 
-	/* This should match RelationInitPhysicalAddr */
-	rnode.spcNode = relation->rd_rel->reltablespace ? relation->rd_rel->reltablespace : MyDatabaseTableSpace;
-	rnode.dbNode = relation->rd_rel->relisshared ? InvalidOid : MyDatabaseId;
-
-	/* We should only be using pg_class */
-	Assert(RelationGetRelid(relation) == RelationRelationId);
-
-	/* The relcache will cache the identity of the OID index for us */
-	oidIndex = RelationGetOidIndex(relation);
-
-	/* Otherwise, use the index to find a nonconflicting OID */
-	indexrel = index_open(oidIndex, AccessShareLock);
-
-	InitDirtySnapshot(SnapshotDirty);
-
-	/* Generate new sequence relation OIDs until we find one not in the table */
-	do
+	/* Check for existing file of same name */
+	rpath = relpath(rnode, MAIN_FORKNUM);
+	if (access(rpath, F_OK) == 0)
+		collides = true;
+	else
 	{
-		CHECK_FOR_INTERRUPTS();
-
-		newOid = GetNewSequenceRelationObjectId();
-
-		ScanKeyInit(&key,
-					(AttrNumber) 1,
-					BTEqualStrategyNumber, F_OIDEQ,
-					ObjectIdGetDatum(newOid));
-
-		/* see notes above about using SnapshotDirty */
-		scan = index_beginscan(relation, indexrel,
-							   &SnapshotDirty, 1, &key);
-
-		collides = HeapTupleIsValid(index_getnext(scan, ForwardScanDirection));
-
-		index_endscan(scan);
-
-		if (!collides)
-		{
-			/* Check for existing file of same name */
-			/* GPDB_84_MERGE_FIXME: check my work; is MAIN_FORKNUM right? */
-			rpath = relpath(rnode, MAIN_FORKNUM);
-			fd = BasicOpenFile(rpath, O_RDONLY | PG_BINARY, 0);
-
-			if (fd >= 0)
-			{
-				/* definite collision */
-				gp_retry_close(fd);
-				collides = true;
-			}
-			else
-			{
-				/*
-				 * Here we have a little bit of a dilemma: if errno is something
-				 * other than ENOENT, should we declare a collision and loop? In
-				 * particular one might think this advisable for, say, EPERM.
-				 * However there really shouldn't be any unreadable files in a
-				 * tablespace directory, and if the EPERM is actually complaining
-				 * that we can't read the directory itself, we'd be in an infinite
-				 * loop.  In practice it seems best to go ahead regardless of the
-				 * errno.  If there is a colliding file we will get an smgr
-				 * failure when we attempt to create the new relation file.
-				 */
-				collides = false;
-			}
-		}
-
 		/*
-		 * Also check that the OID hasn't been pre-assigned for a different
-		 * relation.
-		 *
-		 * We're a bit sloppy between OIDs and relfilenodes here; it would be
-		 * OK to use a value that's been reserved for use as a type or
-		 * relation OID here, as long as the relfilenode is free. But there's
-		 * no harm in skipping over those too, so we don't bother to
-		 * distinguish them.
+		 * Here we have a little bit of a dilemma: if errno is something
+		 * other than ENOENT, should we declare a collision and loop? In
+		 * particular one might think this advisable for, say, EPERM.
+		 * However there really shouldn't be any unreadable files in a
+		 * tablespace directory, and if the EPERM is actually complaining
+		 * that we can't read the directory itself, we'd be in an infinite
+		 * loop.  In practice it seems best to go ahead regardless of the
+		 * errno.  If there is a colliding file we will get an smgr
+		 * failure when we attempt to create the new relation file.
 		 */
-		if (!collides && !IsOidAcceptable(newOid))
-			collides = true;
+		collides = false;
+	}
 
-	} while (collides);
+	pfree(rpath);
 
-	index_close(indexrel, AccessShareLock);
-
-	return newOid;
+	return collides;
 }
 
 /*
  * GetNewRelFileNode
- *		Generate a new relfilenode number that is unique within the given
- *		tablespace.
+ *		Generate a new relfilenode number that is unique within the
+ *		database of the given tablespace.
+ *
+ * If the relfilenode will also be used as the relation's OID, pass the
+ * opened pg_class catalog, and this routine will guarantee that the result
+ * is also an unused OID within pg_class.  If the result is to be used only
+ * as a relfilenode for an existing relation, pass NULL for pg_class.
+ * (in GPDB, 'pg_class' is unused, there is a different mechanism to avoid
+ * clashes, across the whole cluster.)
+ *
+ * As with GetNewOid, there is some theoretical risk of a race condition,
+ * but it doesn't seem worth worrying about.
  *
  * Note: we don't support using this in bootstrap mode.  All relations
  * created by bootstrap have preassigned OIDs, so there's no need.
  */
 Oid
-GetNewRelFileNode(Oid reltablespace, bool relisshared)
+GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
 {
-	RelFileNode rnode;
-	char	   *rpath;
-	int			fd;
+	RelFileNodeBackend rnode;
 	bool		collides = true;
+	BackendId	backend;
 
-	/* This should match RelationInitPhysicalAddr */
-	rnode.spcNode = reltablespace ? reltablespace : MyDatabaseTableSpace;
-	rnode.dbNode = relisshared ? InvalidOid : MyDatabaseId;
+	switch (relpersistence)
+	{
+		case RELPERSISTENCE_TEMP:
+			backend = TempRelBackendId;
+			break;
+		case RELPERSISTENCE_UNLOGGED:
+		case RELPERSISTENCE_PERMANENT:
+			backend = InvalidBackendId;
+			break;
+		default:
+			elog(ERROR, "invalid relpersistence: %c", relpersistence);
+			return InvalidOid;	/* placate compiler */
+	}
+
+	/* This logic should match RelationInitPhysicalAddr */
+	rnode.node.spcNode = reltablespace ? reltablespace : MyDatabaseTableSpace;
+	rnode.node.dbNode = (rnode.node.spcNode == GLOBALTABLESPACE_OID) ? InvalidOid : MyDatabaseId;
+
+	/*
+	 * The relpath will vary based on the backend ID, so we must initialize
+	 * that properly here to make sure that any collisions based on filename
+	 * are properly detected.
+	 */
+	rnode.backend = backend;
 
 	do
 	{
 		CHECK_FOR_INTERRUPTS();
 
 		/* Generate the Relfilenode */
-		rnode.relNode = GetNewSegRelfilenode();
+		rnode.node.relNode = GetNewSegRelfilenode();
 
-		if (!IsOidAcceptable(rnode.relNode))
+		if (!IsOidAcceptable(rnode.node.relNode))
 			continue;
 
-		/* Check for existing file of same name */
-		rpath = relpath(rnode, MAIN_FORKNUM);
-		fd = BasicOpenFile(rpath, O_RDONLY | PG_BINARY, 0);
+		collides = GpCheckRelFileCollision(rnode);
 
-		if (fd >= 0)
-		{
-			/* definite collision */
-			gp_retry_close(fd);
-			collides = true;
-		}
-		else
+		if (!collides && rnode.node.spcNode != GLOBALTABLESPACE_OID)
 		{
 			/*
-			 * Here we have a little bit of a dilemma: if errno is something
-			 * other than ENOENT, should we declare a collision and loop? In
-			 * particular one might think this advisable for, say, EPERM.
-			 * However there really shouldn't be any unreadable files in a
-			 * tablespace directory, and if the EPERM is actually complaining
-			 * that we can't read the directory itself, we'd be in an infinite
-			 * loop.  In practice it seems best to go ahead regardless of the
-			 * errno.  If there is a colliding file we will get an smgr
-			 * failure when we attempt to create the new relation file.
+			 * GPDB_91_MERGE_FIXME: check again for a collision with a temp
+			 * table (if this is a normal relation) or a normal table (if this
+			 * is a temp relation).
+			 *
+			 * The shared buffer manager currently assumes that relfilenodes of
+			 * relations stored in shared buffers can't conflict, which is
+			 * trivially true in upstream because temp tables don't use shared
+			 * buffers at all. We have to make this additional check to make
+			 * sure of that.
 			 */
-			collides = false;
+			rnode.backend = (backend == InvalidBackendId) ? TempRelBackendId
+														  : InvalidBackendId;
+			collides = GpCheckRelFileCollision(rnode);
 		}
-
-		pfree(rpath);
 	} while (collides);
 
-	elog(DEBUG1, "Calling GetNewRelFileNode returns new relfilenode = %d", rnode.relNode);
+	elog(DEBUG1, "Calling GetNewRelFileNode returns new relfilenode = %d", rnode.node.relNode);
 
-	return rnode.relNode;
+	return rnode.node.relNode;
 }

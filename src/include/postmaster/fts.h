@@ -9,56 +9,57 @@
  *
  *
  * IDENTIFICATION
- *	    src/include/postmaster/fts.h
+ *		src/include/postmaster/fts.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef FTS_H
 #define FTS_H
 
+#include "utils/guc.h"
 #include "cdb/cdbutil.h"
 
-#ifdef USE_SEGWALREP
 
 /* Queries for FTS messages */
-#define	FTS_MSG_TYPE_PROBE "PROBE"
+#define	FTS_MSG_PROBE "PROBE"
+#define FTS_MSG_SYNCREP_OFF "SYNCREP_OFF"
+#define FTS_MSG_PROMOTE "PROMOTE"
 
-#define Natts_fts_probe_response 2
-#define Anum_fts_probe_response_is_mirror_up 0
-#define Anum_fts_probe_response_is_in_sync 1
+/*
+ * This is used for constructing string to store the full fts message request
+ * string from QD to QE. Format for which is defined using FTS_MSG_FORMAT and
+ * first part of it string to define type of fts message like FTS_MSG_PROBE,
+ * FTS_MSG_SYNCREP_OFF or FTS_MSG_PROMOTE.
+ */
+#define FTS_MSG_MAX_LEN 100
 
-#define FTS_PROBE_RESPONSE_NTUPLES 1
+/*
+ * If altering the fts message format, consider if FTS_MSG_MAX_LEN is enough
+ * to store the modified format.
+ */
+#define FTS_MSG_FORMAT "%s dbid=%d contid=%d"
 
-typedef struct
-{
-	int16 dbid;
-	bool isPrimaryAlive;
-	bool isMirrorAlive;
-	bool isInSync;
-} probe_result;
+#define Natts_fts_message_response 5
+#define Anum_fts_message_response_is_mirror_up 0
+#define Anum_fts_message_response_is_in_sync 1
+#define Anum_fts_message_response_is_syncrep_enabled 2
+#define Anum_fts_message_response_is_role_mirror 3
+#define Anum_fts_message_response_request_retry 4
 
-typedef struct
-{
-	CdbComponentDatabaseInfo *segment_db_info;
-	probe_result result;
-	bool isScheduled;
-} probe_response_per_segment;
+#define FTS_MESSAGE_RESPONSE_NTUPLES 1
 
-typedef struct
-{
-	int count;
-	probe_response_per_segment *responses;
-} probe_context;
-
-typedef struct ProbeResponse
+typedef struct FtsResponse
 {
 	bool IsMirrorUp;
 	bool IsInSync;
-} ProbeResponse;
+	bool IsSyncRepEnabled;
+	bool IsRoleMirror;
+	bool RequestRetry;
+} FtsResponse;
 
-#endif
-
+extern bool am_ftsprobe;
 extern bool am_ftshandler;
+extern bool am_mirror;
 
 /*
  * ENUMS
@@ -69,7 +70,6 @@ enum probe_result_e
 	PROBE_DEAD            = 0x00,
 	PROBE_ALIVE           = 0x01,
 	PROBE_SEGMENT         = 0x02,
-	PROBE_RESYNC_COMPLETE = 0x04,
 	PROBE_FAULT_CRASH     = 0x08,
 	PROBE_FAULT_MIRROR    = 0x10,
 	PROBE_FAULT_NET       = 0x20,
@@ -79,8 +79,6 @@ enum probe_result_e
 
 #define PROBE_IS_ALIVE(dbInfo) \
 	PROBE_CHECK_FLAG(probe_results[(dbInfo)->dbid], PROBE_ALIVE)
-#define PROBE_IS_RESYNC_COMPLETE(dbInfo) \
-	PROBE_CHECK_FLAG(probe_results[(dbInfo)->dbid], PROBE_RESYNC_COMPLETE)
 #define PROBE_HAS_FAULT_CRASH(dbInfo) \
 	PROBE_CHECK_FLAG(probe_results[(dbInfo)->dbid], PROBE_FAULT_CRASH)
 #define PROBE_HAS_FAULT_MIRROR(dbInfo) \
@@ -136,60 +134,20 @@ typedef struct
 } FtsSegmentPairState;
 
 /*
- * FTS process interface
- */
-extern int ftsprobe_start(void);
-
-/*
- * Interface for probing segments
- */
-extern void FtsProbeSegments(CdbComponentDatabases *dbs, uint8 *scan_status);
-
-/*
- * Interface for segment state checking
- */
-extern bool FtsIsSegmentAlive(CdbComponentDatabaseInfo *segInfo);
-extern CdbComponentDatabaseInfo *FtsGetPeerSegment(CdbComponentDatabases *cdbs,
-												   int content, int dbid);
-extern void FtsDumpChanges(FtsSegmentStatusChange *changes, int changeEntries);
-
-/*
  * Interface for checking if FTS is active
  */
 extern bool FtsIsActive(void);
 
-#ifdef USE_SEGWALREP
 /*
  * Interface for WALREP specific checking
  */
-extern void HandleFtsWalRepProbe(void);
-extern void FtsWalRepProbeSegments(probe_context *context);
-#else
-extern bool probePublishUpdate(CdbComponentDatabases *dbs, uint8 *probe_results);
+extern void HandleFtsMessage(const char* query_string);
+extern void probeWalRepUpdateConfig(int16 dbid, int16 segindex, char role,
+									bool IsSegmentAlive, bool IsInSync);
 
-/*
- * Interface for FireRep-specific segment state machine and transitions
- */
-extern uint32 FtsGetPairStateFilerep(CdbComponentDatabaseInfo *primary, CdbComponentDatabaseInfo *mirror);
-extern uint32 FtsTransitionFilerep(uint32 stateOld, uint32 trans);
-extern void FtsResolveStateFilerep(FtsSegmentPairState *pairState);
+extern bool FtsProbeStartRule(Datum main_arg);
+extern void FtsProbeMain (Datum main_arg);
+extern void FtsProbeShmemInit(void);
+extern pid_t FtsProbePID(void);
 
-extern void FtsPreprocessProbeResultsFilerep(CdbComponentDatabases *dbs, uint8 *probe_results);
-extern void FtsFailoverFilerep(FtsSegmentStatusChange *changes, int changeCount);
-#endif
-
-/*
- * Interface for requesting master to shut down
- */
-extern void FtsRequestPostmasterShutdown(CdbComponentDatabaseInfo *primary, CdbComponentDatabaseInfo *mirror);
-extern bool FtsMasterShutdownRequested(void);
-extern void FtsRequestMasterShutdown(void);
-
-/*
- * If master has requested FTS to shutdown.
- */
-#ifdef FAULT_INJECTOR
-extern bool IsFtsShudownRequested(void);
-#endif
 #endif   /* FTS_H */
-

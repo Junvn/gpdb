@@ -15,7 +15,7 @@ set enable_bitmapscan=on;
 set enable_indexscan=on;
 
 create schema partition_pruning;
-set search_path to partition_pruning, public;
+set search_path to partition_pruning;
 
 -- Set up common test tables.
 CREATE TABLE pt_lt_tab
@@ -124,6 +124,10 @@ PREPARE prep_prune AS select * from pt_lt_tab WHERE col2 = stabletestfunc();
 -- The plan should only scan one partition, where col2 = 10.
 EXPLAIN EXECUTE prep_prune;
 
+-- Also test that Params are const-evaluated.
+PREPARE prep_prune_param AS select * from pt_lt_tab WHERE col2 = $1;
+EXPLAIN EXECUTE prep_prune_param(10);
+
 
 -- @description B-tree single index key = non-partitioning key
 CREATE INDEX idx1 on pt_lt_tab(col1);
@@ -144,12 +148,6 @@ SELECT * FROM pt_lt_tab WHERE col1 between 10 AND 25 ORDER BY col2,col3 LIMIT 5;
 EXPLAIN SELECT * FROM pt_lt_tab WHERE col1 between 10 AND 25 ORDER BY col2,col3 LIMIT 5;
 
 DROP INDEX idx1;
--- have to drop the indexes on the partitions explicitly.
-DROP INDEX idx1_1_prt_part1;
-DROP INDEX idx1_1_prt_part2;
-DROP INDEX idx1_1_prt_part3;
-DROP INDEX idx1_1_prt_part4;
-DROP INDEX idx1_1_prt_part5;
 
 -- @description B-tree single index key = partitioning key
 CREATE INDEX idx1 on pt_lt_tab(col2);
@@ -191,14 +189,6 @@ SELECT * FROM pt_lt_tab WHERE col2 between 10 AND 50 ORDER BY col2,col3 LIMIT 5;
 EXPLAIN SELECT * FROM pt_lt_tab WHERE col2 between 10 AND 50 ORDER BY col2,col3 LIMIT 5;
 
 DROP INDEX idx1;
--- have to drop the indexes on the partitions explicitly.
-DROP INDEX idx1_1_prt_part1;
-DROP INDEX idx1_1_prt_part2;
-DROP INDEX idx1_1_prt_part3;
-DROP INDEX idx1_1_prt_part4;
-DROP INDEX idx1_1_prt_part5;
-
-
 
 -- @description multi-column unique constraint (= b-tree index). Essentially the
 -- same as the previous case, but the columns are the other way 'round, and we
@@ -563,20 +553,6 @@ select * from ds_2 where month_id::int in (200808, 200801, 2008010) order by mon
 -- cleanup
 drop table ds_2;
 
-Create or replace function public.reverse(text) Returns text as $BODY$
-DECLARE
-   Original alias for $1;
-   Reverse_str text;
-   I int4;
-BEGIN
-   Reverse_str :='';
-   For I in reverse length(original)..1 LOOP
-   Reverse_str := reverse_str || substr(original,I,1);
-END LOOP;
-RETURN reverse_str;
-END;
-$BODY$ LANGUAGE plpgsql IMMUTABLE;
-
 drop table if exists dnsdata cascade;
 
 CREATE TABLE dnsdata(dnsname text) DISTRIBUTED RANDOMLY;
@@ -612,10 +588,9 @@ order by dnsname;
 
 -- cleanup
 drop table dnsdata cascade;
-drop function public.reverse(text) cascade;
 
 
-Create or replace function public.ZeroFunc(int) Returns int as $BODY$
+Create or replace function ZeroFunc(int) Returns int as $BODY$
 BEGIN
   RETURN 0;
 END;
@@ -627,7 +602,7 @@ create table mytable(i int, j int);
 insert into mytable select x, x+1 from generate_series(1, 100000) as x;
 analyze mytable;
 
-CREATE INDEX mytable_idx1 ON mytable USING bitmap(zerofunc(i));
+CREATE INDEX mytable_idx1 ON mytable USING bitmap(ZeroFunc(i));
 
 
 select * from mytable where ZeroFunc(i)=0 and i=100 order by i;

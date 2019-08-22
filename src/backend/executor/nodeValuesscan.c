@@ -6,12 +6,12 @@
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeValuesscan.c,v 1.8 2008/01/01 19:45:49 momjian Exp $
+ *	  src/backend/executor/nodeValuesscan.c
  *
  *-------------------------------------------------------------------------
  */
@@ -21,7 +21,7 @@
  *		ExecValuesNext			retrieve next tuple in sequential order.
  *		ExecInitValuesScan		creates and initializes a valuesscan node.
  *		ExecEndValuesScan		releases any storage allocated.
- *		ExecValuesReScan		rescans the values list
+ *		ExecReScanValuesScan	rescans the values list
  */
 #include "postgres.h"
 
@@ -30,7 +30,6 @@
 #include "executor/nodeValuesscan.h"
 #include "optimizer/var.h"              /* CDB: contain_var_reference() */
 #include "parser/parsetree.h"
-#include "utils/memutils.h"
 
 
 static TupleTableSlot *ValuesNext(ValuesScanState *node);
@@ -97,6 +96,7 @@ ValuesNext(ValuesScanState *node)
 	if (exprlist)
 	{
 		MemoryContext oldContext;
+		List	   *oldsubplans;
 		List	   *exprstatelist;
 		Datum	   *values;
 		bool	   *isnull;
@@ -119,12 +119,22 @@ ValuesNext(ValuesScanState *node)
 		oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 
 		/*
-		 * Pass NULL, not my plan node, because we don't want anything in this
-		 * transient state linking into permanent state.  The only possibility
-		 * is a SubPlan, and there shouldn't be any (any subselects in the
-		 * VALUES list should be InitPlans).
+		 * The expressions might contain SubPlans (this is currently only
+		 * possible if there's a sub-select containing a LATERAL reference,
+		 * otherwise sub-selects in a VALUES list should be InitPlans). Those
+		 * subplans will want to hook themselves into our subPlan list, which
+		 * would result in a corrupted list after we delete the eval state. We
+		 * can work around this by saving and restoring the subPlan list.
+		 * (There's no need for the functionality that would be enabled by
+		 * having the list entries, since the SubPlans aren't going to be
+		 * re-executed anyway.)
 		 */
-		exprstatelist = (List *) ExecInitExpr((Expr *) exprlist, NULL);
+		oldsubplans = node->ss.ps.subPlan;
+		node->ss.ps.subPlan = NIL;
+
+		exprstatelist = (List *) ExecInitExpr((Expr *) exprlist, &node->ss.ps);
+
+		node->ss.ps.subPlan = oldsubplans;
 
 		/* parser should have checked all sublists are the same length */
 		Assert(list_length(exprstatelist) == slot->tts_tupleDescriptor->natts);
@@ -169,23 +179,31 @@ ValuesNext(ValuesScanState *node)
 	return slot;
 }
 
+/*
+ * ValuesRecheck -- access method routine to recheck a tuple in EvalPlanQual
+ */
+static bool
+ValuesRecheck(ValuesScanState *node, TupleTableSlot *slot)
+{
+	/* nothing to check */
+	return true;
+}
 
 /* ----------------------------------------------------------------
  *		ExecValuesScan(node)
  *
  *		Scans the values lists sequentially and returns the next qualifying
  *		tuple.
- *		It calls the ExecScan() routine and passes it the access method
- *		which retrieves tuples sequentially.
+ *		We call the ExecScan() routine and pass it the appropriate
+ *		access method functions.
  * ----------------------------------------------------------------
  */
 TupleTableSlot *
 ExecValuesScan(ValuesScanState *node)
 {
-	/*
-	 * use ValuesNext as access method
-	 */
-	return ExecScan(&node->ss, (ExecScanAccessMtd) ValuesNext);
+	return ExecScan(&node->ss,
+					(ExecScanAccessMtd) ValuesNext,
+					(ExecScanRecheckMtd) ValuesRecheck);
 }
 
 /* ----------------------------------------------------------------
@@ -220,15 +238,13 @@ ExecInitValuesScan(ValuesScan *node, EState *estate, int eflags)
 	planstate = &scanstate->ss.ps;
 
 	/*
-	 * Create expression contexts.	We need two, one for per-sublist
+	 * Create expression contexts.  We need two, one for per-sublist
 	 * processing and one for execScan.c to use for quals and projections. We
 	 * cheat a little by using ExecAssignExprContext() to build both.
 	 */
 	ExecAssignExprContext(estate, planstate);
 	scanstate->rowcontext = planstate->ps_ExprContext;
 	ExecAssignExprContext(estate, planstate);
-
-#define VALUESSCAN_NSLOTS 2
 
 	/*
 	 * tuple table initialization
@@ -277,16 +293,8 @@ ExecInitValuesScan(ValuesScan *node, EState *estate, int eflags)
 	 */
 	ExecAssignResultTypeFromTL(&scanstate->ss.ps);
 	ExecAssignScanProjectionInfo(&scanstate->ss);
-	
-	return scanstate;
-}
 
-int
-ExecCountSlotsValuesScan(ValuesScan *node)
-{
-	return ExecCountSlotsNode(outerPlan(node)) +
-		ExecCountSlotsNode(innerPlan(node)) +
-		VALUESSCAN_NSLOTS;
+	return scanstate;
 }
 
 /* ----------------------------------------------------------------
@@ -339,16 +347,17 @@ ExecValuesRestrPos(ValuesScanState *node)
 }
 
 /* ----------------------------------------------------------------
- *		ExecValuesReScan
+ *		ExecReScanValuesScan
  *
  *		Rescans the relation.
  * ----------------------------------------------------------------
  */
 void
-ExecValuesReScan(ValuesScanState *node, ExprContext *exprCtxt)
+ExecReScanValuesScan(ValuesScanState *node)
 {
 	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	/*node->ss.ps.ps_TupFromTlist = false;*/
+
+	ExecScanReScan(&node->ss);
 
 	node->curr_idx = -1;
 }

@@ -3,11 +3,11 @@
  * tsvector_op.c
  *	  operations over tsvector
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/tsvector_op.c,v 1.19 2008/11/19 10:23:21 teodor Exp $
+ *	  src/backend/utils/adt/tsvector_op.c
  *
  *-------------------------------------------------------------------------
  */
@@ -15,15 +15,16 @@
 #include "postgres.h"
 
 #include "catalog/namespace.h"
+#include "catalog/pg_type.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 
 
 typedef struct
@@ -37,8 +38,8 @@ typedef struct
 
 typedef struct StatEntry
 {
-	uint32		ndoc; /* zero indicates that we already was here while
-						 walking throug the tree */
+	uint32		ndoc;			/* zero indicates that we already was here
+								 * while walking throug the tree */
 	uint32		nentry;
 	struct StatEntry *left;
 	struct StatEntry *right;
@@ -50,14 +51,14 @@ typedef struct StatEntry
 
 typedef struct
 {
-	int4		weight;
+	int32		weight;
 
 	uint32		maxdepth;
-	
-	StatEntry	**stack;
+
+	StatEntry **stack;
 	uint32		stackpos;
 
-	StatEntry*	root;
+	StatEntry  *root;
 } TSVectorStat;
 
 #define STATHDRSIZE (offsetof(TSVectorStat, data))
@@ -126,7 +127,7 @@ silly_cmp_tsvector(const TSVector a, const TSVector b)
 			{
 				return (aptr->haspos > bptr->haspos) ? -1 : 1;
 			}
-			else if ( (res=tsCompareString( STRPTR(a) + aptr->pos, aptr->len, STRPTR(b) + bptr->pos, bptr->len, false)) !=0 )
+			else if ((res = tsCompareString(STRPTR(a) + aptr->pos, aptr->len, STRPTR(b) + bptr->pos, bptr->len, false)) != 0)
 			{
 				return res;
 			}
@@ -171,7 +172,9 @@ tsvector_##type(PG_FUNCTION_ARGS)						\
 	PG_FREE_IF_COPY(a,0);								\
 	PG_FREE_IF_COPY(b,1);								\
 	PG_RETURN_##ret( res action 0 );					\
-}
+}	\
+/* keep compiler quiet - no extra ; */					\
+extern int no_such_variable
 
 TSVECTORCMPFUNC(lt, <, BOOL);
 TSVECTORCMPFUNC(le, <=, BOOL);
@@ -218,7 +221,7 @@ Datum
 tsvector_length(PG_FUNCTION_ARGS)
 {
 	TSVector	in = PG_GETARG_TSVECTOR(0);
-	int4		ret = in->size;
+	int32		ret = in->size;
 
 	PG_FREE_IF_COPY(in, 0);
 	PG_RETURN_INT32(ret);
@@ -290,10 +293,10 @@ tsvector_setweight(PG_FUNCTION_ARGS)
  * Add positions from src to dest after offsetting them by maxpos.
  * Return the number added (might be less than expected due to overflow)
  */
-static int4
+static int32
 add_pos(TSVector src, WordEntry *srcptr,
 		TSVector dest, WordEntry *destptr,
-		int4 maxpos)
+		int32 maxpos)
 {
 	uint16	   *clen = &_POSVECPTR(dest, destptr)->npos;
 	int			i;
@@ -370,9 +373,9 @@ tsvector_concat(PG_FUNCTION_ARGS)
 	i2 = in2->size;
 
 	/*
-	 * Conservative estimate of space needed.  We might need all the data
-	 * in both inputs, and conceivably add a pad byte before position data
-	 * for each item where there was none before.
+	 * Conservative estimate of space needed.  We might need all the data in
+	 * both inputs, and conceivably add a pad byte before position data for
+	 * each item where there was none before.
 	 */
 	output_bytes = VARSIZE(in1) + VARSIZE(in2) + i1 + i2;
 
@@ -545,40 +548,36 @@ tsvector_concat(PG_FUNCTION_ARGS)
 }
 
 /*
- * Compare two strings by tsvector rules. 
- * if isPrefix = true then it returns not-zero value if b has prefix a
+ * Compare two strings by tsvector rules.
+ *
+ * if isPrefix = true then it returns zero value iff b has prefix a
  */
-int4
+int32
 tsCompareString(char *a, int lena, char *b, int lenb, bool prefix)
 {
-	int cmp;
+	int			cmp;
 
-	if ( lena == 0 )
+	if (lena == 0)
 	{
-		if ( prefix )
-			cmp = 0; /* emtry string is equal to any if a prefix match */ 
+		if (prefix)
+			cmp = 0;			/* empty string is prefix of anything */
 		else
-			cmp = (lenb>0) ? -1 : 0;
+			cmp = (lenb > 0) ? -1 : 0;
 	}
-	else if ( lenb == 0 )
+	else if (lenb == 0)
 	{
-		cmp = (lena>0) ? 1 : 0;
+		cmp = (lena > 0) ? 1 : 0;
 	}
 	else
 	{
 		cmp = memcmp(a, b, Min(lena, lenb));
 
-		if ( prefix )
+		if (prefix)
 		{
-			if ( cmp == 0 && lena > lenb )
-			{
-				/*
-				 * b argument is not beginning with argument a
-				 */
-				cmp=1;
-			}
+			if (cmp == 0 && lena > lenb)
+				cmp = 1;		/* a is longer, so not a prefix of b */
 		}
-		else if ( (cmp == 0) && (lena != lenb) )
+		else if (cmp == 0 && lena != lenb)
 		{
 			cmp = (lena < lenb) ? -1 : 1;
 		}
@@ -622,16 +621,16 @@ checkcondition_str(void *checkval, QueryOperand *val)
 	WordEntry  *StopLow = chkval->arrb;
 	WordEntry  *StopHigh = chkval->arre;
 	WordEntry  *StopMiddle = StopHigh;
-	int			difference = -1; 
-	bool		res=false;
+	int			difference = -1;
+	bool		res = false;
 
 	/* Loop invariant: StopLow <= val < StopHigh */
 	while (StopLow < StopHigh)
 	{
 		StopMiddle = StopLow + (StopHigh - StopLow) / 2;
-		difference = tsCompareString( chkval->operand + val->distance, val->length,
-									  chkval->values + StopMiddle->pos, StopMiddle->len,
-									  false);
+		difference = tsCompareString(chkval->operand + val->distance, val->length,
+						   chkval->values + StopMiddle->pos, StopMiddle->len,
+									 false);
 
 		if (difference == 0)
 		{
@@ -645,19 +644,19 @@ checkcondition_str(void *checkval, QueryOperand *val)
 			StopHigh = StopMiddle;
 	}
 
-	if ( res == false && val->prefix == true )
+	if (!res && val->prefix)
 	{
 		/*
 		 * there was a failed exact search, so we should scan further to find
 		 * a prefix match.
 		 */
-		if ( StopLow >= StopHigh )
+		if (StopLow >= StopHigh)
 			StopMiddle = StopHigh;
 
-		while( res == false && StopMiddle < chkval->arre && 
-				tsCompareString( chkval->operand + val->distance, val->length,
-								 chkval->values + StopMiddle->pos, StopMiddle->len,
-								 true) == 0 )
+		while (res == false && StopMiddle < chkval->arre &&
+			   tsCompareString(chkval->operand + val->distance, val->length,
+						   chkval->values + StopMiddle->pos, StopMiddle->len,
+							   true) == 0)
 		{
 			res = (val->weight && StopMiddle->haspos) ?
 				checkclass_str(chkval, StopMiddle, val) : true;
@@ -666,17 +665,17 @@ checkcondition_str(void *checkval, QueryOperand *val)
 		}
 	}
 
-	return res; 
+	return res;
 }
 
 /*
- * check for boolean condition.
+ * Evaluate tsquery boolean expression.
  *
- * if calcnot is false, NOT expressions are always evaluated to be true. This is used in ranking.
+ * chkcond is a callback function used to evaluate each VAL node in the query.
  * checkval can be used to pass information to the callback. TS_execute doesn't
  * do anything with it.
- * chkcond is a callback function used to evaluate each VAL node in the query.
- *
+ * if calcnot is false, NOT expressions are always evaluated to be true. This
+ * is used in ranking.
  */
 bool
 TS_execute(QueryItem *curitem, void *checkval, bool calcnot,
@@ -688,27 +687,78 @@ TS_execute(QueryItem *curitem, void *checkval, bool calcnot,
 	if (curitem->type == QI_VAL)
 		return chkcond(checkval, (QueryOperand *) curitem);
 
-	switch (curitem->operator.oper)
+	switch (curitem->qoperator.oper)
 	{
 		case OP_NOT:
 			if (calcnot)
 				return !TS_execute(curitem + 1, checkval, calcnot, chkcond);
 			else
 				return true;
+
 		case OP_AND:
-			if (TS_execute(curitem + curitem->operator.left, checkval, calcnot, chkcond))
+			if (TS_execute(curitem + curitem->qoperator.left, checkval, calcnot, chkcond))
 				return TS_execute(curitem + 1, checkval, calcnot, chkcond);
 			else
 				return false;
 
 		case OP_OR:
-			if (TS_execute(curitem + curitem->operator.left, checkval, calcnot, chkcond))
+			if (TS_execute(curitem + curitem->qoperator.left, checkval, calcnot, chkcond))
 				return true;
 			else
 				return TS_execute(curitem + 1, checkval, calcnot, chkcond);
 
 		default:
-			elog(ERROR, "unrecognized operator: %d", curitem->operator.oper);
+			elog(ERROR, "unrecognized operator: %d", curitem->qoperator.oper);
+	}
+
+	/* not reachable, but keep compiler quiet */
+	return false;
+}
+
+/*
+ * Detect whether a tsquery boolean expression requires any positive matches
+ * to values shown in the tsquery.
+ *
+ * This is needed to know whether a GIN index search requires full index scan.
+ * For example, 'x & !y' requires a match of x, so it's sufficient to scan
+ * entries for x; but 'x | !y' could match rows containing neither x nor y.
+ */
+bool
+tsquery_requires_match(QueryItem *curitem)
+{
+	/* since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
+	if (curitem->type == QI_VAL)
+		return true;
+
+	switch (curitem->qoperator.oper)
+	{
+		case OP_NOT:
+
+			/*
+			 * Assume there are no required matches underneath a NOT.  For
+			 * some cases with nested NOTs, we could prove there's a required
+			 * match, but it seems unlikely to be worth the trouble.
+			 */
+			return false;
+
+		case OP_AND:
+			/* If either side requires a match, we're good */
+			if (tsquery_requires_match(curitem + curitem->qoperator.left))
+				return true;
+			else
+				return tsquery_requires_match(curitem + 1);
+
+		case OP_OR:
+			/* Both sides must require a match */
+			if (tsquery_requires_match(curitem + curitem->qoperator.left))
+				return tsquery_requires_match(curitem + 1);
+			else
+				return false;
+
+		default:
+			elog(ERROR, "unrecognized operator: %d", curitem->qoperator.oper);
 	}
 
 	/* not reachable, but keep compiler quiet */
@@ -734,7 +784,8 @@ ts_match_vq(PG_FUNCTION_ARGS)
 	CHKVAL		chkval;
 	bool		result;
 
-	if (!val->size || !query->size)
+	/* empty query matches nothing */
+	if (!query->size)
 	{
 		PG_FREE_IF_COPY(val, 0);
 		PG_FREE_IF_COPY(query, 1);
@@ -824,7 +875,7 @@ check_weight(TSVector txt, WordEntry *wptr, int8 weight)
 	return num;
 }
 
-#define compareStatWord(a,e,t) 							\
+#define compareStatWord(a,e,t)							\
 	tsCompareString((a)->lexeme, (a)->lenlexeme,		\
 					STRPTR(t) + (e)->pos, (e)->len,		\
 					false)
@@ -832,22 +883,22 @@ check_weight(TSVector txt, WordEntry *wptr, int8 weight)
 static void
 insertStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVector txt, uint32 off)
 {
-	WordEntry	*we = ARRPTR(txt) + off;
-	StatEntry	*node = stat->root, 
-				*pnode=NULL;
+	WordEntry  *we = ARRPTR(txt) + off;
+	StatEntry  *node = stat->root,
+			   *pnode = NULL;
 	int			n,
 				res = 0;
-	uint32		depth=1;
+	uint32		depth = 1;
 
-	if (stat->weight == 0) 
+	if (stat->weight == 0)
 		n = (we->haspos) ? POSDATALEN(txt, we) : 1;
 	else
 		n = (we->haspos) ? check_weight(txt, we, stat->weight) : 0;
 
-	if ( n == 0 )
-		return; /* nothing to insert */
+	if (n == 0)
+		return;					/* nothing to insert */
 
-	while( node ) 
+	while (node)
 	{
 		res = compareStatWord(node, we, txt);
 
@@ -858,7 +909,7 @@ insertStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVector tx
 		else
 		{
 			pnode = node;
-			node = ( res < 0 ) ? node->left : node->right;
+			node = (res < 0) ? node->left : node->right;
 		}
 		depth++;
 	}
@@ -868,14 +919,14 @@ insertStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVector tx
 
 	if (node == NULL)
 	{
-		node = MemoryContextAlloc(persistentContext, STATENTRYHDRSZ + we->len );
+		node = MemoryContextAlloc(persistentContext, STATENTRYHDRSZ + we->len);
 		node->left = node->right = NULL;
 		node->ndoc = 1;
 		node->nentry = n;
 		node->lenlexeme = we->len;
 		memcpy(node->lexeme, STRPTR(txt) + we->pos, node->lenlexeme);
 
-		if ( pnode==NULL )
+		if (pnode == NULL)
 		{
 			stat->root = node;
 		}
@@ -886,7 +937,7 @@ insertStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVector tx
 			else
 				pnode->right = node;
 		}
-			
+
 	}
 	else
 	{
@@ -896,18 +947,18 @@ insertStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVector tx
 }
 
 static void
-chooseNextStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVector txt, 
-			uint32 low, uint32 high, uint32 offset)
+chooseNextStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVector txt,
+					uint32 low, uint32 high, uint32 offset)
 {
-	uint32      pos;
-	uint32      middle = (low + high) >> 1;
+	uint32		pos;
+	uint32		middle = (low + high) >> 1;
 
 	pos = (low + middle) >> 1;
 	if (low != middle && pos >= offset && pos - offset < txt->size)
-		insertStatEntry( persistentContext, stat, txt, pos - offset );
+		insertStatEntry(persistentContext, stat, txt, pos - offset);
 	pos = (high + middle + 1) >> 1;
 	if (middle + 1 != high && pos >= offset && pos - offset < txt->size)
-		insertStatEntry( persistentContext, stat, txt, pos - offset );
+		insertStatEntry(persistentContext, stat, txt, pos - offset);
 
 	if (low != middle)
 		chooseNextStatEntry(persistentContext, stat, txt, low, middle, offset);
@@ -930,13 +981,13 @@ chooseNextStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVecto
 static TSVectorStat *
 ts_accum(MemoryContext persistentContext, TSVectorStat *stat, Datum data)
 {
-	TSVector		txt = DatumGetTSVector(data);
-	uint32			i,
-					nbit = 0,
-					offset;
+	TSVector	txt = DatumGetTSVector(data);
+	uint32		i,
+				nbit = 0,
+				offset;
 
 	if (stat == NULL)
-	{	/* Init in first */
+	{							/* Init in first */
 		stat = MemoryContextAllocZero(persistentContext, sizeof(TSVectorStat));
 		stat->maxdepth = 1;
 	}
@@ -956,7 +1007,7 @@ ts_accum(MemoryContext persistentContext, TSVectorStat *stat, Datum data)
 	nbit = 1 << nbit;
 	offset = (nbit - txt->size) / 2;
 
-	insertStatEntry( persistentContext, stat, txt, (nbit >> 1) - offset );
+	insertStatEntry(persistentContext, stat, txt, (nbit >> 1) - offset);
 	chooseNextStatEntry(persistentContext, stat, txt, 0, nbit, offset);
 
 	return stat;
@@ -966,30 +1017,34 @@ static void
 ts_setup_firstcall(FunctionCallInfo fcinfo, FuncCallContext *funcctx,
 				   TSVectorStat *stat)
 {
-	TupleDesc		tupdesc;
-	MemoryContext 	oldcontext;
-	StatEntry		*node;
+	TupleDesc	tupdesc;
+	MemoryContext oldcontext;
+	StatEntry  *node;
 
 	funcctx->user_fctx = (void *) stat;
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 	stat->stack = palloc0(sizeof(StatEntry *) * (stat->maxdepth + 1));
-	stat->stackpos = 0; 
+	stat->stackpos = 0;
 
 	node = stat->root;
 	/* find leftmost value */
-	for (;;)
-	{
-		stat->stack[ stat->stackpos ] = node;
-		if (node->left)
+	if (node == NULL)
+		stat->stack[stat->stackpos] = NULL;
+	else
+		for (;;)
 		{
-			stat->stackpos++;
-			node = node->left;
+			stat->stack[stat->stackpos] = node;
+			if (node->left)
+			{
+				stat->stackpos++;
+				node = node->left;
+			}
+			else
+				break;
 		}
-		else
-			break;
-	}
+	Assert(stat->stackpos <= stat->maxdepth);
 
 	tupdesc = CreateTemplateTupleDesc(3, false);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "word",
@@ -1005,14 +1060,14 @@ ts_setup_firstcall(FunctionCallInfo fcinfo, FuncCallContext *funcctx,
 }
 
 static StatEntry *
-walkStatEntryTree(TSVectorStat *stat) 
+walkStatEntryTree(TSVectorStat *stat)
 {
-	StatEntry	*node = stat->stack[ stat->stackpos ];
+	StatEntry  *node = stat->stack[stat->stackpos];
 
-	if ( node == NULL )
+	if (node == NULL)
 		return NULL;
 
-	if ( node->ndoc != 0 )
+	if (node->ndoc != 0)
 	{
 		/* return entry itself: we already was at left sublink */
 		return node;
@@ -1035,6 +1090,7 @@ walkStatEntryTree(TSVectorStat *stat)
 			else
 				break;
 		}
+		Assert(stat->stackpos <= stat->maxdepth);
 	}
 	else
 	{
@@ -1052,8 +1108,8 @@ walkStatEntryTree(TSVectorStat *stat)
 static Datum
 ts_process_call(FuncCallContext *funcctx)
 {
-	TSVectorStat 	*st;
-	StatEntry		*entry;
+	TSVectorStat *st;
+	StatEntry  *entry;
 
 	st = (TSVectorStat *) funcctx->user_fctx;
 
@@ -1093,7 +1149,7 @@ static TSVectorStat *
 ts_stat_sql(MemoryContext persistentContext, text *txt, text *ws)
 {
 	char	   *query = text_to_cstring(txt);
-	int			i;
+	int64			i;
 	TSVectorStat *stat;
 	bool		isnull;
 	Portal		portal;
@@ -1185,7 +1241,7 @@ ts_stat1(PG_FUNCTION_ARGS)
 
 	if (SRF_IS_FIRSTCALL())
 	{
-		TSVectorStat	   *stat;
+		TSVectorStat *stat;
 		text	   *txt = PG_GETARG_TEXT_P(0);
 
 		funcctx = SRF_FIRSTCALL_INIT();
@@ -1210,7 +1266,7 @@ ts_stat2(PG_FUNCTION_ARGS)
 
 	if (SRF_IS_FIRSTCALL())
 	{
-		TSVectorStat	   *stat;
+		TSVectorStat *stat;
 		text	   *txt = PG_GETARG_TEXT_P(0);
 		text	   *ws = PG_GETARG_TEXT_P(1);
 
@@ -1272,9 +1328,9 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 		elog(ERROR, "tsvector_update_trigger: not fired by trigger manager");
 
 	trigdata = (TriggerData *) fcinfo->context;
-	if (TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
-		elog(ERROR, "tsvector_update_trigger: can't process STATEMENT events");
-	if (TRIGGER_FIRED_AFTER(trigdata->tg_event))
+	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+		elog(ERROR, "tsvector_update_trigger: must be fired for row");
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
 		elog(ERROR, "tsvector_update_trigger: must be fired BEFORE event");
 
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
@@ -1341,7 +1397,7 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("text search configuration name \"%s\" must be schema-qualified",
 							trigger->tgargs[1])));
-		cfgId = TSConfigGetCfgid(names, false);
+		cfgId = get_ts_config_oid(names, false);
 	}
 
 	/* initialize parse state */

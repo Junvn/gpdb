@@ -5,10 +5,10 @@
  *	  standard operators and index access methods.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/utils/selfuncs.h,v 1.47 2008/09/28 19:51:40 tgl Exp $
+ * src/include/utils/selfuncs.h
  *
  *-------------------------------------------------------------------------
  */
@@ -23,7 +23,7 @@
 /*
  * Note: the default selectivity estimates are not chosen entirely at random.
  * We want them to be small enough to ensure that indexscans will be used if
- * available, for typical table densities of ~100 tuples/page.	Thus, for
+ * available, for typical table densities of ~100 tuples/page.  Thus, for
  * example, 0.01 is not quite small enough, since that makes it appear that
  * nearly all pages will be hit anyway.  Also, since we sometimes estimate
  * eqsel as 1/num_distinct, we probably want DEFAULT_NUM_DISTINCT to equal
@@ -75,7 +75,8 @@ typedef struct VariableStatData
 	Oid			vartype;		/* exposed type of expression */
 	Oid			atttype;		/* type to pass to get_attstatsslot */
 	int32		atttypmod;		/* typmod to pass to get_attstatsslot */
-	bool		isunique;		/* true if matched to a unique index */
+	bool		isunique;		/* matches unique index or DISTINCT clause */
+	bool		acl_ok;			/* result of ACL check on table or column */
 } VariableStatData;
 
 /* get the pg_statistic tuple, or NULL if none */
@@ -86,6 +87,7 @@ typedef struct VariableStatData
 		if (HeapTupleIsValid((vardata).statsTuple)) \
 			(* (vardata).freefunc) ((vardata).statsTuple); \
 	} while(0)
+
 
 typedef enum
 {
@@ -98,23 +100,23 @@ typedef enum
 	Pattern_Prefix_None, Pattern_Prefix_Partial, Pattern_Prefix_Exact
 } Pattern_Prefix_Status;
 
-
-/* selfuncs.c */
-
 /* Hooks for plugins to get control when we ask for stats */
 typedef bool (*get_relation_stats_hook_type) (PlannerInfo *root,
-											  RangeTblEntry *rte,
-											  AttrNumber attnum,
-											  VariableStatData *vardata);
+														  RangeTblEntry *rte,
+														  AttrNumber attnum,
+												  VariableStatData *vardata);
 extern PGDLLIMPORT get_relation_stats_hook_type get_relation_stats_hook;
 typedef bool (*get_index_stats_hook_type) (PlannerInfo *root,
-										   Oid indexOid,
-										   AttrNumber indexattnum,
-										   VariableStatData *vardata);
+													   Oid indexOid,
+													   AttrNumber indexattnum,
+												  VariableStatData *vardata);
 extern PGDLLIMPORT get_index_stats_hook_type get_index_stats_hook;
+
+/* Functions in selfuncs.c */
 
 extern void examine_variable(PlannerInfo *root, Node *node, int varRelid,
 				 VariableStatData *vardata);
+extern bool statistic_proc_security_check(VariableStatData *vardata, Oid func_oid);
 extern bool get_restriction_variable(PlannerInfo *root, List *args,
 						 int varRelid,
 						 VariableStatData *vardata, Node **other,
@@ -124,7 +126,8 @@ extern void get_join_variables(PlannerInfo *root, List *args,
 				   VariableStatData *vardata1,
 				   VariableStatData *vardata2,
 				   bool *join_is_reversed);
-extern double get_variable_numdistinct(VariableStatData *vardata);
+extern double get_variable_numdistinct(VariableStatData *vardata,
+						 bool *isdefault);
 extern double mcv_selectivity(VariableStatData *vardata, FmgrInfo *opproc,
 				Datum constval, bool varonleft,
 				double *sumcommonp);
@@ -132,13 +135,15 @@ extern double histogram_selectivity(VariableStatData *vardata, FmgrInfo *opproc,
 					  Datum constval, bool varonleft,
 					  int min_hist_size, int n_skip,
 					  int *hist_size);
-extern double convert_timevalue_to_scalar(Datum value, Oid typid);
+extern double convert_timevalue_to_scalar(Datum value, Oid typid, bool *failure);
 
 extern Pattern_Prefix_Status pattern_fixed_prefix(Const *patt,
 					 Pattern_Type ptype,
+					 Oid collation,
 					 Const **prefix,
 					 Selectivity *rest_selec);
-extern Const *make_greater_string(const Const *str_const, FmgrInfo *ltproc);
+extern Const *make_greater_string(const Const *str_const, FmgrInfo *ltproc,
+					Oid collation);
 
 extern Datum eqsel(PG_FUNCTION_ARGS);
 extern Datum neqsel(PG_FUNCTION_ARGS);
@@ -195,7 +200,17 @@ extern Selectivity estimate_hash_bucketsize(PlannerInfo *root, Node *hashkey,
 extern Datum btcostestimate(PG_FUNCTION_ARGS);
 extern Datum hashcostestimate(PG_FUNCTION_ARGS);
 extern Datum gistcostestimate(PG_FUNCTION_ARGS);
+extern Datum spgcostestimate(PG_FUNCTION_ARGS);
 extern Datum gincostestimate(PG_FUNCTION_ARGS);
 extern Datum bmcostestimate(PG_FUNCTION_ARGS);
+
+/* Functions in array_selfuncs.c */
+
+extern Selectivity scalararraysel_containment(PlannerInfo *root,
+						   Node *leftop, Node *rightop,
+						   Oid elemtype, bool isEquality, bool useOr,
+						   int varRelid);
+extern Datum arraycontsel(PG_FUNCTION_ARGS);
+extern Datum arraycontjoinsel(PG_FUNCTION_ARGS);
 
 #endif   /* SELFUNCS_H */

@@ -79,14 +79,14 @@ explain select c1 from t1 where c1 not in
                                             QUERY PLAN                                             
 ---------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..862.00 rows=4 width=4)
-   ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=2 width=4)
+   ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=431.00..431.00 rows=5 width=4)
                ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=5 width=4)
-                     ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                     ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (9 rows)
 
 select c1 from t1 where c1 not in 
@@ -109,20 +109,20 @@ explain select c1 from t1 where c1 not in
                                                      QUERY PLAN                                                      
 ---------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..1293.00 rows=4 width=4)
-   ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..1293.00 rows=2 width=4)
+   ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..1293.00 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=862.00..862.00 rows=1 width=4)
                ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..862.00 rows=1 width=4)
-                     ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=1 width=4)
+                     ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=1 width=4)
                            Hash Cond: t2.c2 = t3.c3
-                           ->  Table Scan on t2  (cost=0.00..431.00 rows=1 width=4)
+                           ->  Seq Scan on t2  (cost=0.00..431.00 rows=1 width=4)
                                  Filter: c2 > 2
                            ->  Hash  (cost=431.00..431.00 rows=3 width=4)
                                  ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-                                       ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+                                       ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (15 rows)
 
 select c1 from t1 where c1 not in 
@@ -151,24 +151,24 @@ explain select c1 from t1 where c1 not in
                                                               QUERY PLAN                                                               
 ---------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice4; segments: 3)  (cost=0.00..1724.00 rows=4 width=4)
-   ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..1724.00 rows=2 width=4)
+   ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..1724.00 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=1293.00..1293.00 rows=2 width=4)
                ->  Broadcast Motion 3:3  (slice3; segments: 3)  (cost=0.00..1293.00 rows=2 width=4)
-                     ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..1293.00 rows=1 width=4)
+                     ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..1293.00 rows=1 width=4)
                            Hash Cond: t2.c2 = t3.c3
-                           ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                           ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
                            ->  Hash  (cost=862.00..862.00 rows=2 width=4)
                                  ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..862.00 rows=2 width=4)
-                                       ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=1 width=4)
+                                       ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=1 width=4)
                                              Hash Cond: t3.c3 = t4.c4
-                                             ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+                                             ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
                                              ->  Hash  (cost=431.00..431.00 rows=2 width=4)
                                                    ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
-                                                         ->  Table Scan on t4  (cost=0.00..431.00 rows=1 width=4)
+                                                         ->  Seq Scan on t4  (cost=0.00..431.00 rows=1 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (19 rows)
 
 select c1 from t1 where c1 not in 
@@ -197,16 +197,16 @@ explain select c1 from t1,
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..1293.00 rows=2 width=4)
    ->  Hash Join  (cost=0.00..1293.00 rows=1 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=862.00..862.00 rows=1 width=4)
-               ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=1 width=4)
+               ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=1 width=4)
                      Hash Cond: t2.c2 = t3.c3
-                     ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                     ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
                      ->  Hash  (cost=431.00..431.00 rows=3 width=4)
                            ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-                                 ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+                                 ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (13 rows)
 
 select c1 from t1, 
@@ -228,21 +228,21 @@ explain select c1 from t1,
 	where c1 = foo.c2;
                                         QUERY PLAN                                        
 ------------------------------------------------------------------------------------------
- Hash Left Anti Semi Join (Not-In)  (cost=0.00..1293.00 rows=1 width=4)
-   Hash Cond: t2.c2 = t3.c3
+ Hash Left Anti Semi (Not-In) Join  (cost=0.00..1293.00 rows=1 width=4)
+   Hash Cond: (t2.c2 = t3.c3)
    ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..862.00 rows=1 width=8)
          ->  Hash Join  (cost=0.00..862.00 rows=1 width=8)
-               Hash Cond: t1.c1 = t2.c2
-               ->  Table Scan on t1  (cost=0.00..431.00 rows=2 width=4)
-                     Filter: c1 > 4
-               ->  Hash  (cost=431.00..431.00 rows=1 width=4)
-                     ->  Table Scan on t2  (cost=0.00..431.00 rows=1 width=4)
-                           Filter: c2 > 4
+               Hash Cond: (t2.c2 = t1.c1)
+               ->  Seq Scan on t2  (cost=0.00..431.00 rows=1 width=4)
+                     Filter: (c2 > 4)
+               ->  Hash  (cost=431.00..431.00 rows=2 width=4)
+                     ->  Seq Scan on t1  (cost=0.00..431.00 rows=2 width=4)
+                           Filter: (c1 > 4)
    ->  Hash  (cost=431.00..431.00 rows=1 width=4)
          ->  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-               ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+               ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (15 rows)
 
 select c1 from t1, 
@@ -262,15 +262,15 @@ explain select c1 from t1 where c1 not in
                                             QUERY PLAN                                             
 ---------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..862.00 rows=4 width=4)
-   ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=2 width=4)
+   ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=3 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=3 width=4)
                Filter: c1 > 1
          ->  Hash  (cost=431.00..431.00 rows=5 width=4)
                ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=5 width=4)
-                     ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                     ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (10 rows)
 
 select c1 from t1 where c1 not in 
@@ -292,15 +292,15 @@ explain select c1 from t1 where c1 > 6 and c1 not in
                                             QUERY PLAN                                             
 ---------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..862.00 rows=2 width=4)
-   ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=1 width=4)
+   ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=1 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=2 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=2 width=4)
                Filter: c1 > 6 AND c1 < 10
          ->  Hash  (cost=431.00..431.00 rows=5 width=4)
                ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=5 width=4)
-                     ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                     ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (10 rows)
 
 select c1 from t1 where c1 > 6 and c1 not in 
@@ -322,16 +322,16 @@ explain select c1 from t1,t2 where c1 not in
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..1293.00 rows=2 width=4)
    ->  Hash Join  (cost=0.00..1293.00 rows=1 width=4)
          Hash Cond: t2.c2 = t1.c1
-         ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+         ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
          ->  Hash  (cost=862.00..862.00 rows=2 width=4)
-               ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=2 width=4)
+               ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=2 width=4)
                      Hash Cond: t1.c1 = t3.c3
-                     ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+                     ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
                      ->  Hash  (cost=431.00..431.00 rows=3 width=4)
                            ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-                                 ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+                                 ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (13 rows)
 
 select c1 from t1,t2 where c1 not in 
@@ -403,27 +403,26 @@ explain select x,y from l1 where (x,y) not in
 	(select distinct y, sum(x) from l1 group by y having y < 4 order by y) order by 1,2;
                                                          QUERY PLAN                                                          
 -----------------------------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice3; segments: 3)  (cost=8.96..8.98 rows=10 width=8)
-   Merge Key: notin.l1.x, notin.l1.y
-   ->  Sort  (cost=8.96..8.98 rows=4 width=8)
-         Sort Key: notin.l1.x, notin.l1.y
-         ->  Nested Loop Left Anti Semi Join (Not-In)  (cost=3.44..8.79 rows=4 width=8)
-               Join Filter: notin.l1.x = "NotIn_SUBQUERY".y AND notin.l1.y = "NotIn_SUBQUERY".sum
+ Gather Motion 3:1  (slice3; segments: 3)  (cost=10000000008.02..10000000008.03 rows=4 width=8)
+   Merge Key: l1.x, l1.y
+   ->  Sort  (cost=10000000008.02..10000000008.03 rows=2 width=8)
+         Sort Key: l1.x, l1.y
+         ->  Nested Loop Left Anti Semi (Not-In) Join  (cost=10000000003.25..10000000007.99 rows=2 width=8)
+               Join Filter: l1.x = "NotIn_SUBQUERY".y AND l1.y = "NotIn_SUBQUERY".sum
                ->  Seq Scan on l1  (cost=0.00..3.10 rows=4 width=8)
-               ->  Materialize  (cost=3.44..3.53 rows=3 width=12)
+               ->  Materialize  (cost=3.25..3.47 rows=3 width=12)
                      ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=3.25..3.43 rows=3 width=12)
-                           ->  Subquery Scan "NotIn_SUBQUERY"  (cost=3.25..3.31 rows=1 width=12)
+                           ->  Subquery Scan on "NotIn_SUBQUERY"  (cost=3.25..3.31 rows=1 width=12)
                                  ->  HashAggregate  (cost=3.25..3.28 rows=1 width=16)
-                                       Group By: notin.l1.y
+                                       Group Key: l1_1.y
                                        ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=3.14..3.20 rows=1 width=12)
-                                             Hash Key: notin.l1.y
+                                             Hash Key: l1_1.y
                                              ->  HashAggregate  (cost=3.14..3.14 rows=1 width=12)
-                                                   Group By: notin.l1.y
-                                                   ->  Seq Scan on l1  (cost=0.00..3.12 rows=2 width=8)
+                                                   Group Key: l1_1.y
+                                                   ->  Seq Scan on l1 l1_1  (cost=0.00..3.12 rows=2 width=8)
                                                          Filter: y < 4
- Settings:  optimizer=on
- Optimizer status: legacy query optimizer
-(20 rows)
+ Optimizer: Postgres query optimizer
+(19 rows)
 
 select x,y from l1 where (x,y) not in
 	(select distinct y, sum(x) from l1 group by y having y < 4 order by y) order by 1,2;
@@ -446,13 +445,13 @@ explain select * from g1 where (a,b,c) not in
                                             QUERY PLAN                                             
 ---------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice2; segments: 3)  (cost=3.53..14.71 rows=11 width=12)
-   ->  Nested Loop Left Anti Semi Join (Not-In)  (cost=3.53..14.71 rows=4 width=12)
+   ->  Nested Loop Left Anti Semi (Not-In) Join  (cost=3.53..14.71 rows=4 width=12)
          Join Filter: g1.a = l1.x AND g1.b = l1.y AND g1.c = l1.z
          ->  Seq Scan on g1  (cost=0.00..2.11 rows=4 width=12)
          ->  Materialize  (cost=3.53..3.83 rows=10 width=12)
                ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..3.50 rows=10 width=12)
                      ->  Seq Scan on l1  (cost=0.00..3.10 rows=4 width=12)
- Optimizer status: legacy query optimizer
+ Optimizer status: Postgres query optimizer
 (10 rows)
 
 select * from g1 where (a,b,c) not in 
@@ -477,7 +476,7 @@ explain select c1 from t1, t2 where c1 not in
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..1324465.54 rows=6 width=4)
    ->  Hash Join  (cost=0.00..1324465.54 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..1324034.54 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..1324034.54 rows=4 width=4)
                Filter: (subplan)
                SubPlan 1
                  ->  Result  (cost=0.00..431.00 rows=1 width=1)
@@ -490,11 +489,11 @@ explain select c1 from t1, t2 where c1 not in
                                                      Filter: t3.c3 = $0
                                                      ->  Materialize  (cost=0.00..431.00 rows=3 width=4)
                                                            ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-                                                                 ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+                                                                 ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
          ->  Hash  (cost=431.00..431.00 rows=2 width=4)
-               ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+               ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (21 rows)
 
 select c1 from t1, t2 where c1 not in 
@@ -551,9 +550,9 @@ explain select c1 from t1 where c1 not in
                                             QUERY PLAN                                             
 ---------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..862.00 rows=1 width=4)
-   ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=1 width=4)
+   ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=1 width=4)
          Hash Cond: t1.c1::bigint = (sum(t2.c2))
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=431.00..431.00 rows=2 width=8)
                ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=2 width=8)
                      ->  Result  (cost=0.00..431.00 rows=1 width=8)
@@ -561,10 +560,10 @@ explain select c1 from t1 where c1 not in
                                  Group By: t2.c2
                                  ->  Sort  (cost=0.00..431.00 rows=1 width=4)
                                        Sort Key: t2.c2
-                                       ->  Table Scan on t2  (cost=0.00..431.00 rows=1 width=4)
+                                       ->  Seq Scan on t2  (cost=0.00..431.00 rows=1 width=4)
                                              Filter: c2 > 2 AND c2 > 3
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (15 rows)
 
 select c1 from t1 where c1 not in 
@@ -664,32 +663,31 @@ explain select (case when c1%2 = 0
                Join Filter: true
                ->  Nested Loop Left Join  (cost=0.00..1765378.17 rows=7 width=12)
                      Join Filter: true
-                     ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+                     ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
                      ->  Materialize  (cost=0.00..862.00 rows=1 width=8)
                            ->  Broadcast Motion 1:3  (slice6)  (cost=0.00..862.00 rows=3 width=8)
                                  ->  Aggregate  (cost=0.00..862.00 rows=1 width=8)
                                        ->  Gather Motion 3:1  (slice5; segments: 3)  (cost=0.00..862.00 rows=1 width=8)
                                              ->  Aggregate  (cost=0.00..862.00 rows=1 width=8)
-                                                   ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=1 width=4)
-                                                         Hash Cond: t2.c2 = notin.t3.c3
-                                                         ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                                                   ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=1 width=4)
+                                                         Hash Cond: t2.c2 = t3_1.c3
+                                                         ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
                                                          ->  Hash  (cost=431.00..431.00 rows=3 width=4)
                                                                ->  Broadcast Motion 3:3  (slice4; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-                                                                     ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+                                                                     ->  Seq Scan on t3 t3_1  (cost=0.00..431.00 rows=1 width=4)
                ->  Materialize  (cost=0.00..862.00 rows=1 width=8)
                      ->  Broadcast Motion 1:3  (slice3)  (cost=0.00..862.00 rows=3 width=8)
                            ->  Aggregate  (cost=0.00..862.00 rows=1 width=8)
                                  ->  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..862.00 rows=1 width=8)
                                        ->  Aggregate  (cost=0.00..862.00 rows=1 width=8)
-                                             ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=1 width=4)
-                                                   Hash Cond: notin.t3.c3 = t4.c4
-                                                   ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+                                             ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=1 width=4)
+                                                   Hash Cond: t3.c3 = t4.c4
+                                                   ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
                                                    ->  Hash  (cost=431.00..431.00 rows=2 width=4)
                                                          ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
-                                                               ->  Table Scan on t4  (cost=0.00..431.00 rows=1 width=4)
- Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
-(31 rows)
+                                                               ->  Seq Scan on t4  (cost=0.00..431.00 rows=1 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
+(30 rows)
 
 select (case when c1%2 = 0 
  then (select sum(c2) from t2 where c2 not in (select c3 from t3)) 
@@ -717,7 +715,7 @@ explain select c1 from t1 where not c1 >= some (select c2 from t2);
  Result  (cost=0.00..1324032.88 rows=2 width=4)
    Filter: (subplan)
    ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.00 rows=10 width=4)
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
    SubPlan 1
      ->  Result  (cost=0.00..431.00 rows=1 width=1)
            ->  Result  (cost=0.00..431.00 rows=1 width=1)
@@ -727,9 +725,9 @@ explain select c1 from t1 where not c1 >= some (select c2 from t2);
                              ->  Result  (cost=0.00..431.00 rows=2 width=8)
                                    ->  Materialize  (cost=0.00..431.00 rows=2 width=4)
                                          ->  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..431.00 rows=5 width=4)
-                                               ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                                               ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (16 rows)
 
 select c1 from t1 where not c1 >= some (select c2 from t2);
@@ -744,15 +742,14 @@ explain select c2 from t2 where not c2 < all (select c2 from t2);
                                              QUERY PLAN                                              
 -----------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..1324033.39 rows=5 width=4)
-   ->  Table Scan on t2  (cost=0.00..1324033.39 rows=2 width=4)
-         Filter: (subplan)
-         SubPlan 1
+   ->  Seq Scan on t2  (cost=0.00..1324033.39 rows=2 width=4)
+         Filter: (SubPlan 1)
+         SubPlan 1  (slice2; segments: 3)
            ->  Materialize  (cost=0.00..431.00 rows=5 width=4)
                  ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=5 width=4)
-                       ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
- Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
-(9 rows)
+                       ->  Seq Scan on t2 t2_1  (cost=0.00..431.00 rows=2 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
+(8 rows)
 
 select c2 from t2 where not c2 < all (select c2 from t2);
  c2 
@@ -773,7 +770,7 @@ explain select c3 from t3 where not c3 <> any (select c4 from t4);
  Result  (cost=0.00..1324032.31 rows=1 width=4)
    Filter: (subplan)
    ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-         ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+         ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
    SubPlan 1
      ->  Result  (cost=0.00..431.00 rows=1 width=1)
            ->  Result  (cost=0.00..431.00 rows=1 width=1)
@@ -783,9 +780,9 @@ explain select c3 from t3 where not c3 <> any (select c4 from t4);
                              ->  Result  (cost=0.00..431.00 rows=1 width=8)
                                    ->  Materialize  (cost=0.00..431.00 rows=1 width=4)
                                          ->  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
-                                               ->  Table Scan on t4  (cost=0.00..431.00 rows=1 width=4)
+                                               ->  Seq Scan on t4  (cost=0.00..431.00 rows=1 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (16 rows)
 
 select c3 from t3 where not c3 <> any (select c4 from t4);
@@ -803,9 +800,9 @@ explain select c1 from t1 where c1 not in (select c2 from t2 order by c2 limit 3
    Merge Key: t1.c1
    ->  Sort  (cost=0.00..862.00 rows=2 width=4)
          Sort Key: t1.c1
-         ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=2 width=4)
+         ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=2 width=4)
                Hash Cond: t1.c1 = t2.c2
-               ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+               ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
                ->  Hash  (cost=431.00..431.00 rows=3 width=4)
                      ->  Broadcast Motion 1:3  (slice2)  (cost=0.00..431.00 rows=9 width=4)
                            ->  Limit  (cost=0.00..431.00 rows=1 width=4)
@@ -814,9 +811,9 @@ explain select c1 from t1 where c1 not in (select c2 from t2 order by c2 limit 3
                                        ->  Limit  (cost=0.00..431.00 rows=1 width=4)
                                              ->  Sort  (cost=0.00..431.00 rows=2 width=4)
                                                    Sort Key: t2.c2
-                                                   ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                                                   ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (18 rows)
 
 select c1 from t1 where c1 not in (select c2 from t2 order by c2 limit 3) order by c1;
@@ -839,7 +836,7 @@ explain select c1 from t1 where c1 =all (select c2 from t2 where c2 > -1 and c2 
                                                                                                                                                                 QUERY PLAN                                                                                                                                                                
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..1324032.79 rows=4 width=4)
-   ->  Table Scan on t1  (cost=0.00..1324032.79 rows=2 width=4)
+   ->  Seq Scan on t1  (cost=0.00..1324032.79 rows=2 width=4)
          Filter: (subplan)
          SubPlan 1
            ->  Result  (cost=0.00..431.00 rows=1 width=1)
@@ -850,10 +847,10 @@ explain select c1 from t1 where c1 =all (select c2 from t2 where c2 > -1 and c2 
                                    ->  Result  (cost=0.00..431.00 rows=1 width=8)
                                          ->  Materialize  (cost=0.00..431.00 rows=1 width=4)
                                                ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
-                                                     ->  Table Scan on t2  (cost=0.00..431.00 rows=1 width=4)
+                                                     ->  Seq Scan on t2  (cost=0.00..431.00 rows=1 width=4)
                                                            Filter: c2 > (-1) AND c2 <= 1
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (16 rows)
 
 select c1 from t1 where c1 =all (select c2 from t2 where c2 > -1 and c2 <= 1);
@@ -869,14 +866,14 @@ explain select c1 from t1 where c1 <>all (select c2 from t2);
                                             QUERY PLAN                                             
 ---------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..862.00 rows=4 width=4)
-   ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=2 width=4)
+   ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=431.00..431.00 rows=5 width=4)
                ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=5 width=4)
-                     ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                     ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (9 rows)
 
 select c1 from t1 where c1 <>all (select c2 from t2);
@@ -896,7 +893,7 @@ explain select c1 from t1 where c1 <=all (select c2 from t2 where c2 not in (sel
                                                                                                                                                                QUERY PLAN                                                                                                                                                               
 ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..1765379.01 rows=4 width=4)
-   ->  Table Scan on t1  (cost=0.00..1765379.01 rows=2 width=4)
+   ->  Seq Scan on t1  (cost=0.00..1765379.01 rows=2 width=4)
          Filter: (subplan)
          SubPlan 1
            ->  Result  (cost=0.00..862.00 rows=1 width=1)
@@ -907,14 +904,14 @@ explain select c1 from t1 where c1 <=all (select c2 from t2 where c2 not in (sel
                                    ->  Result  (cost=0.00..862.00 rows=2 width=8)
                                          ->  Materialize  (cost=0.00..862.00 rows=2 width=4)
                                                ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..862.00 rows=2 width=4)
-                                                     ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=1 width=4)
+                                                     ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=1 width=4)
                                                            Hash Cond: t2.c2 = t1n.c1n
-                                                           ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                                                           ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
                                                            ->  Hash  (cost=431.00..431.00 rows=7 width=4)
                                                                  ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=7 width=4)
-                                                                       ->  Table Scan on t1n  (cost=0.00..431.00 rows=3 width=4)
+                                                                       ->  Seq Scan on t1n  (cost=0.00..431.00 rows=3 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (20 rows)
 
 select c1 from t1 where c1 <=all (select c2 from t2 where c2 not in (select c1n from t1n));
@@ -939,19 +936,19 @@ explain select c1 from t1 where not c1 =all (select c2 from t2 where not c2 >all
                                                        QUERY PLAN                                                        
 -------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..1356692471.20 rows=10 width=4)
-   ->  Table Scan on t1  (cost=0.00..1356692471.20 rows=4 width=4)
+   ->  Seq Scan on t1  (cost=0.00..1356692471.20 rows=4 width=4)
          Filter: (subplan)
          SubPlan 2
            ->  Materialize  (cost=0.00..1324032.99 rows=5 width=4)
                  ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1324032.99 rows=5 width=4)
-                       ->  Table Scan on t2  (cost=0.00..1324032.99 rows=2 width=4)
+                       ->  Seq Scan on t2  (cost=0.00..1324032.99 rows=2 width=4)
                              Filter: (subplan)
                              SubPlan 1
                                ->  Materialize  (cost=0.00..431.00 rows=3 width=4)
                                      ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-                                           ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+                                           ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (14 rows)
 
 select c1 from t1 where not c1 =all (select c2 from t2 where not c2 >all (select c3 from t3));
@@ -978,9 +975,9 @@ explain select c1 from t1 where not c1 <>all (select c1n from t1n where c1n <all
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..1324464.88 rows=8 width=4)
    ->  Hash Semi Join  (cost=0.00..1324464.88 rows=3 width=4)
          Hash Cond: t1.c1 = t1n.c1n
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=1324033.87..1324033.87 rows=3 width=4)
-               ->  Table Scan on t1n  (cost=0.00..1324033.87 rows=3 width=4)
+               ->  Seq Scan on t1n  (cost=0.00..1324033.87 rows=3 width=4)
                      Filter: (subplan)
                      SubPlan 1
                        ->  Result  (cost=0.00..431.00 rows=1 width=1)
@@ -993,9 +990,9 @@ explain select c1 from t1 where not c1 <>all (select c1n from t1n where c1n <all
                                                            Filter: t3.c3 = $0
                                                            ->  Materialize  (cost=0.00..431.00 rows=3 width=4)
                                                                  ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-                                                                       ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+                                                                       ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (21 rows)
 
 select c1 from t1 where not c1 <>all (select c1n from t1n where c1n <all (select c3 from t3 where c3 = c1n));
@@ -1016,11 +1013,11 @@ explain select c1 from t1 where not c1 >=all (select c2 from t2 where c2 = c1);
    ->  Hash Semi Join  (cost=0.00..862.00 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
          Join Filter: t1.c1 < t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=431.00..431.00 rows=2 width=4)
-               ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+               ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (9 rows)
 
 select c1 from t1 where not c1 >=all (select c2 from t2 where c2 = c1);
@@ -1030,7 +1027,6 @@ select c1 from t1 where not c1 >=all (select c2 from t2 where c2 = c1);
 
 --
 --q38
--- GPDB_90_MERGE_FIXME: We should generate c2 IS NOT NULL derived filter.
 --
 explain select c1 from t1 where not exists (select c2 from t2 where c2 = c1);
                                   QUERY PLAN                                  
@@ -1038,11 +1034,11 @@ explain select c1 from t1 where not exists (select c2 from t2 where c2 = c1);
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..862.00 rows=4 width=4)
    ->  Hash Anti Join  (cost=0.00..862.00 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=431.00..431.00 rows=2 width=4)
-               ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+               ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (8 rows)
 
 select c1 from t1 where not exists (select c2 from t2 where c2 = c1);
@@ -1064,16 +1060,16 @@ explain select c1 from t1 where not exists (select c2 from t2 where c2 not in (s
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..1293.00 rows=4 width=4)
    ->  Hash Anti Join  (cost=0.00..1293.00 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=862.00..862.00 rows=1 width=4)
-               ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=1 width=4)
+               ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=1 width=4)
                      Hash Cond: t2.c2 = t3.c3
-                     ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                     ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
                      ->  Hash  (cost=431.00..431.00 rows=3 width=4)
                            ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-                                 ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
+                                 ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=4)
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (13 rows)
 
 select c1 from t1 where not exists (select c2 from t2 where c2 not in (select c3 from t3) and c2 = c1);
@@ -1094,28 +1090,28 @@ select c1 from t1 where not exists (select c2 from t2 where c2 not in (select c3
 -- GPDB_90_MERGE_FIXME: We should be able to push down join filter on param $0 to a result node on top of LASJ (Not in)
 --
 explain select c1 from t1 where not exists (select c2 from t2 where exists (select c3 from t3) and c2 <>all (select c3 from t3) and c2 = c1);
-                                                     QUERY PLAN                                                      
----------------------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..1324894.16 rows=4 width=4)
+                                                          QUERY PLAN                                                          
+------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice4; segments: 3)  (cost=0.00..1324894.16 rows=4 width=4)
    ->  Hash Anti Join  (cost=0.00..1324894.16 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
          ->  Hash  (cost=1324463.16..1324463.16 rows=1 width=4)
-               ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..1324463.16 rows=1 width=4)
-                     Hash Cond: t2.c2 = notin.t3.c3
+               ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..1324463.16 rows=1 width=4)
+                     Hash Cond: t2.c2 = t3_1.c3
                      ->  Nested Loop Semi Join  (cost=0.00..1324032.16 rows=2 width=4)
                            Join Filter: true
-                           ->  Table Scan on t2  (cost=0.00..431.00 rows=2 width=4)
+                           ->  Seq Scan on t2  (cost=0.00..431.00 rows=2 width=4)
                            ->  Materialize  (cost=0.00..431.00 rows=1 width=1)
                                  ->  Broadcast Motion 1:3  (slice2)  (cost=0.00..431.00 rows=3 width=1)
                                        ->  Limit  (cost=0.00..431.00 rows=1 width=1)
                                              ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=1)
                                                    ->  Limit  (cost=0.00..431.00 rows=1 width=1)
-                                                         ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=1)
+                                                         ->  Seq Scan on t3  (cost=0.00..431.00 rows=1 width=1)
                      ->  Hash  (cost=431.00..431.00 rows=3 width=4)
                            ->  Broadcast Motion 3:3  (slice3; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
-                                 ->  Table Scan on t3  (cost=0.00..431.00 rows=1 width=4)
- Optimizer status: PQO version 2.35.1
+                                 ->  Seq Scan on t3 t3_1  (cost=0.00..431.00 rows=1 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (20 rows)
 
 select c1 from t1 where not exists (select c2 from t2 where exists (select c3 from t3) and c2 <>all (select c3 from t3) and c2 = c1);
@@ -1164,16 +1160,16 @@ explain select c1 from t1 where c1 not in (select c2 from t2 where c2 > 4) and c
                                             QUERY PLAN                                             
 ---------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..862.00 rows=4 width=4)
-   ->  Hash Left Anti Semi Join (Not-In)  (cost=0.00..862.00 rows=2 width=4)
+   ->  Hash Left Anti Semi (Not-In) Join  (cost=0.00..862.00 rows=2 width=4)
          Hash Cond: t1.c1 = t2.c2
-         ->  Table Scan on t1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=4)
                Filter: NOT c1 IS NULL
          ->  Hash  (cost=431.00..431.00 rows=1 width=4)
                ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
-                     ->  Table Scan on t2  (cost=0.00..431.00 rows=1 width=4)
+                     ->  Seq Scan on t2  (cost=0.00..431.00 rows=1 width=4)
                            Filter: c2 > 4
  Settings:  optimizer=on
- Optimizer status: PQO version 2.34.0
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.34.0
 (11 rows)
 
 select c1 from t1 where c1 not in (select c2 from t2 where c2 > 4) and c1 is not null;
@@ -1205,9 +1201,50 @@ select c1 from t1 where c1 not in (select c2 from t2 where c2 > 4) and c1 > 2;
   7
 (7 rows)
 
+-- Test if the equality operator is implemented by a SQL function
+--
+--q45
+--
+create domain absint as int4;
+create function iszero(absint) returns bool as $$ begin return $1::int4 = 0; end; $$ language plpgsql immutable strict;
+create or replace function abseq (absint, absint) returns bool as $$ select iszero(abs($1) - abs($2)); $$ language sql immutable strict;
+create operator = (PROCEDURE = abseq, leftarg=absint, rightarg=absint);
+explain select c1 from t1 where c1::absint not in
+	(select c1n::absint from t1n);
+                                                                                                                                              QUERY PLAN                                                                                                                                               
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..1324035.89 rows=10 width=4)
+   ->  Result  (cost=0.00..1324035.89 rows=4 width=4)
+         Filter: (NOT CASE WHEN ((count((count("inner".ColRef_0017)))) > 0::bigint) THEN CASE WHEN ((pg_catalog.sum((sum((CASE WHEN (((t1.c1)::absint = ((t1n.c1n)::absint)) IS NULL) THEN 1 ELSE 0 END))))) = (count((count("inner".ColRef_0017))))) THEN NULL::boolean ELSE true END ELSE false END)
+         ->  GroupAggregate  (cost=0.00..1324035.89 rows=4 width=20)
+               Group Key: t1.c1, t1.ctid, t1.gp_segment_id
+               ->  Sort  (cost=0.00..1324035.89 rows=4 width=30)
+                     Sort Key: t1.ctid, t1.gp_segment_id
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..1324035.89 rows=4 width=30)
+                           Hash Key: t1.ctid, t1.gp_segment_id
+                           ->  Result  (cost=0.00..1324035.89 rows=4 width=30)
+                                 ->  HashAggregate  (cost=0.00..1324035.89 rows=4 width=30)
+                                       Group Key: t1.c1, t1.ctid, t1.gp_segment_id
+                                       ->  Result  (cost=0.00..1324035.88 rows=11 width=19)
+                                             ->  Nested Loop Left Join  (cost=0.00..1324035.88 rows=11 width=19)
+                                                   Join Filter: (((t1.c1)::absint = ((t1n.c1n)::absint)) IS NOT FALSE)
+                                                   ->  Seq Scan on t1  (cost=0.00..431.00 rows=4 width=14)
+                                                   ->  Result  (cost=0.00..431.00 rows=7 width=5)
+                                                         ->  Materialize  (cost=0.00..431.00 rows=7 width=4)
+                                                               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=7 width=4)
+                                                                     ->  Seq Scan on t1n  (cost=0.00..431.00 rows=3 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.27.0
+(21 rows)
+
+select c1 from t1 where c1::absint not in
+	(select c1n::absint from t1n);
+ c1 
+----
+(0 rows)
+
 reset search_path;
 drop schema notin cascade;
-NOTICE:  drop cascades to 7 other objects
+NOTICE:  drop cascades to 11 other objects
 DETAIL:  drop cascades to table notin.t1
 drop cascades to table notin.t2
 drop cascades to table notin.t3
@@ -1215,3 +1252,7 @@ drop cascades to table notin.t4
 drop cascades to table notin.t1n
 drop cascades to table notin.g1
 drop cascades to table notin.l1
+drop cascades to type notin.absint
+drop cascades to function notin.iszero(notin.absint)
+drop cascades to function notin.abseq(notin.absint,notin.absint)
+drop cascades to operator notin.=(notin.absint,notin.absint)

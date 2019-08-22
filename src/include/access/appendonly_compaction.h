@@ -13,7 +13,6 @@
 #ifndef APPENDONLY_COMPACTION_H
 #define APPENDONLY_COMPACTION_H
 
-#include "postgres.h"
 #include "nodes/pg_list.h"
 #include "access/appendonly_visimap.h"
 #include "utils/rel.h"
@@ -32,8 +31,9 @@ extern bool AppendOnlyCompaction_ShouldCompact(
 								   Relation aoRelation,
 								   int segno,
 								   int64 segmentTotalTupcount,
-								   bool isFull);
-extern void AppendOnlyThrowAwayTuple(Relation rel, MemTuple tuple,
+								   bool isFull,
+								   Snapshot appendOnlyMetaDataSnapshot);
+extern void AppendOnlyThrowAwayTuple(Relation rel,
 						 TupleTableSlot *slot, MemTupleBinding *mt_bind);
 extern void AppendOnlyTruncateToEOF(Relation aorel);
 extern bool HasLockForSegmentFileDrop(Relation aorel);

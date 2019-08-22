@@ -1,7 +1,10 @@
-# $PostgreSQL: pgsql/contrib/auto_explain/Makefile,v 1.1 2008/11/19 02:59:28 tgl Exp $
+# contrib/auto_explain/Makefile
 
 MODULE_big = auto_explain
 OBJS = auto_explain.o
+
+REGRESS = auto_explain
+REGRESS_OPTS = --init-file=init_file
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

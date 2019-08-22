@@ -3,10 +3,10 @@
  * security.c
  *	  Microsoft Windows Win32 Security Support Functions
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/port/win32/security.c,v 1.14 2009/01/01 17:23:46 momjian Exp $
+ *	  src/backend/port/win32/security.c
  *
  *-------------------------------------------------------------------------
  */
@@ -40,15 +40,15 @@ pgwin32_is_admin(void)
 
 	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_READ, &AccessToken))
 	{
-		write_stderr("could not open process token: error code %d\n",
-					 (int) GetLastError());
+		write_stderr("could not open process token: error code %lu\n",
+					 GetLastError());
 		exit(1);
 	}
 
 	if (!pgwin32_get_dynamic_tokeninfo(AccessToken, TokenGroups,
 									   &InfoBuffer, errbuf, sizeof(errbuf)))
 	{
-		write_stderr(errbuf);
+		write_stderr("%s", errbuf);
 		exit(1);
 	}
 
@@ -60,8 +60,8 @@ pgwin32_is_admin(void)
 		 SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0,
 								  0, &AdministratorsSid))
 	{
-		write_stderr("could not get SID for Administrators group: error code %d\n",
-					 (int) GetLastError());
+		write_stderr("could not get SID for Administrators group: error code %lu\n",
+					 GetLastError());
 		exit(1);
 	}
 
@@ -69,8 +69,8 @@ pgwin32_is_admin(void)
 	SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_POWER_USERS, 0, 0, 0, 0, 0,
 								  0, &PowerUsersSid))
 	{
-		write_stderr("could not get SID for PowerUsers group: error code %d\n",
-					 (int) GetLastError());
+		write_stderr("could not get SID for PowerUsers group: error code %lu\n",
+					 GetLastError());
 		exit(1);
 	}
 
@@ -129,8 +129,8 @@ pgwin32_is_service(void)
 
 	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_READ, &AccessToken))
 	{
-		fprintf(stderr, "could not open process token: error code %d\n",
-				(int) GetLastError());
+		fprintf(stderr, "could not open process token: error code %lu\n",
+				GetLastError());
 		return -1;
 	}
 
@@ -138,7 +138,7 @@ pgwin32_is_service(void)
 	if (!pgwin32_get_dynamic_tokeninfo(AccessToken, TokenUser, &InfoBuffer,
 									   errbuf, sizeof(errbuf)))
 	{
-		fprintf(stderr, errbuf);
+		fprintf(stderr, "%s", errbuf);
 		return -1;
 	}
 
@@ -169,7 +169,7 @@ pgwin32_is_service(void)
 	if (!pgwin32_get_dynamic_tokeninfo(AccessToken, TokenGroups, &InfoBuffer,
 									   errbuf, sizeof(errbuf)))
 	{
-		fprintf(stderr, errbuf);
+		fprintf(stderr, "%s", errbuf);
 		return -1;
 	}
 
@@ -188,7 +188,8 @@ pgwin32_is_service(void)
 	_is_service = 0;
 	for (x = 0; x < Groups->GroupCount; x++)
 	{
-		if (EqualSid(ServiceSid, Groups->Groups[x].Sid))
+		if (EqualSid(ServiceSid, Groups->Groups[x].Sid) &&
+			(Groups->Groups[x].Attributes & SE_GROUP_ENABLED))
 		{
 			_is_service = 1;
 			break;
@@ -223,8 +224,8 @@ pgwin32_get_dynamic_tokeninfo(HANDLE token, TOKEN_INFORMATION_CLASS class,
 
 	if (GetLastError() != ERROR_INSUFFICIENT_BUFFER)
 	{
-		snprintf(errbuf, errsize, "could not get token information: error code %d\n",
-				 (int) GetLastError());
+		snprintf(errbuf, errsize, "could not get token information: error code %lu\n",
+				 GetLastError());
 		return FALSE;
 	}
 
@@ -239,8 +240,8 @@ pgwin32_get_dynamic_tokeninfo(HANDLE token, TOKEN_INFORMATION_CLASS class,
 	if (!GetTokenInformation(token, class, *InfoBuffer,
 							 InfoBufferSize, &InfoBufferSize))
 	{
-		snprintf(errbuf, errsize, "could not get token information: error code %d\n",
-				 (int) GetLastError());
+		snprintf(errbuf, errsize, "could not get token information: error code %lu\n",
+				 GetLastError());
 		return FALSE;
 	}
 

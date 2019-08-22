@@ -14,8 +14,9 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres.h"
+
 #include "cdb/cdbbufferedread.h"
-#include <unistd.h>				/* for read() */
 #include "utils/guc.h"
 #include "miscadmin.h"
 
@@ -59,8 +60,6 @@ BufferedReadInit(
 				 int32 maxLargeReadLen,
 				 char *relationName)
 {
-	int			relationNameLen;
-
 	Assert(bufferedRead != NULL);
 	Assert(memory != NULL);
 	Assert(maxBufferLen > 0);
@@ -72,9 +71,7 @@ BufferedReadInit(
 	/*
 	 * Init level.
 	 */
-	relationNameLen = strlen(relationName);
-	bufferedRead->relationName = (char *) palloc(relationNameLen + 1);
-	memcpy(bufferedRead->relationName, relationName, relationNameLen + 1);
+	bufferedRead->relationName = pstrdup(relationName);
 
 	/*
 	 * Large-read memory level members.
@@ -582,26 +579,6 @@ BufferedReadGetNextBuffer(
 
 	*nextBufferLen = bufferedRead->bufferLen;
 	return &bufferedRead->largeReadMemory[bufferedRead->bufferOffset];
-}
-
-/*
- * Get the next, maximum buffer space for reading.
- *
- * Returns NULL when the current file has been completely read.
- */
-uint8 *
-BufferedReadGetMaxBuffer(
-						 BufferedRead *bufferedRead,
-						 int32 *nextBufferLen)
-{
-	Assert(bufferedRead != NULL);
-	Assert(bufferedRead->file >= 0);
-	Assert(nextBufferLen != NULL);
-
-	return BufferedReadGetNextBuffer(
-									 bufferedRead,
-									 bufferedRead->maxBufferLen,
-									 nextBufferLen);
 }
 
 /*

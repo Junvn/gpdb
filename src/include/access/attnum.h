@@ -4,10 +4,10 @@
  *	  POSTGRES attribute number definitions.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/access/attnum.h,v 1.25 2008/04/05 01:58:20 tgl Exp $
+ * src/include/access/attnum.h
  *
  *-------------------------------------------------------------------------
  */
@@ -16,7 +16,7 @@
 
 
 /*
- * user defined attribute numbers start at 1.	-ay 2/95
+ * user defined attribute numbers start at 1.   -ay 2/95
  */
 typedef int16 AttrNumber;
 

@@ -61,7 +61,6 @@ WHERE sale.pn=product.pn
 GROUP BY ROLLUP((sale.vn),(sale.vn),(sale.qty)),sale.pn,sale.cn;
 
 -- ###### Queries involving COVAR_POP() function ###### --
-
 SELECT DISTINCT sale.qty,sale.pn,GROUPING(sale.pn,sale.pn), TO_CHAR(COALESCE(COVAR_POP(floor(sale.prc-sale.prc),floor(sale.vn-sale.prc)),0),'99999999.9999999'),TO_CHAR(COALESCE(VAR_POP(floor(sale.qty+sale.vn)),0),'99999999.9999999'),TO_CHAR(COALESCE(STDDEV_SAMP(floor(sale.pn)),0),'99999999.9999999'),TO_CHAR(COALESCE(AVG(DISTINCT floor(sale.pn)),0),'99999999.9999999') 
 FROM sale,product
 WHERE sale.pn=product.pn

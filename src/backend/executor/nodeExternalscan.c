@@ -19,7 +19,6 @@
  *		ExecExternalNext				retrieve next tuple in sequential order.
  *		ExecInitExternalScan			creates and initializes a externalscan node.
  *		ExecEndExternalScan				releases any storage allocated.
- *		ExecStopExternalScan			closes external resources before EOD.
  *		ExecExternalReScan				rescans the relation
  */
 #include "postgres.h"
@@ -31,11 +30,13 @@
 #include "executor/nodeExternalscan.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/guc.h"
 #include "parser/parsetree.h"
 #include "optimizer/var.h"
 #include "optimizer/clauses.h"
 
 static TupleTableSlot *ExternalNext(ExternalScanState *node);
+static void ExecEagerFreeExternalScan(ExternalScanState *node);
 
 static bool
 ExternalConstraintCheck(TupleTableSlot *slot, ExternalScanState *node)
@@ -93,7 +94,7 @@ ExternalConstraintCheck(TupleTableSlot *slot, ExternalScanState *node)
 		if (!ExecQual(qual, econtext, true))
 			return false;
 	}
-	
+
 	return true;
 }
 /* ----------------------------------------------------------------
@@ -115,6 +116,7 @@ ExternalNext(ExternalScanState *node)
 	ScanDirection direction;
 	TupleTableSlot *slot;
 	bool		scanNext = true;
+	ExternalSelectDesc externalSelectDesc;
 
 	/*
 	 * get information from the estate and scan state
@@ -124,12 +126,16 @@ ExternalNext(ExternalScanState *node)
 	direction = estate->es_direction;
 	slot = node->ss.ss_ScanTupleSlot;
 
+	externalSelectDesc = external_getnext_init(&(node->ss.ps));
+
+	if (gp_external_enable_filter_pushdown)
+		externalSelectDesc->filter_quals = node->ss.ps.plan->qual;
 	/*
 	 * get the next tuple from the file access methods
 	 */
 	while(scanNext)
 	{
-		tuple = external_getnext(scandesc, direction);
+		tuple = external_getnext(scandesc, direction, externalSelectDesc);
 
 		/*
 		 * save the tuple and the buffer returned to us by the access methods in
@@ -160,16 +166,23 @@ ExternalNext(ExternalScanState *node)
 		{
 			ExecClearTuple(slot);
 
-			if (!node->ss.ps.delayEagerFree)
-			{
-				ExecEagerFreeExternalScan(node);
-			}
+			ExecEagerFreeExternalScan(node);
 		}
 		scanNext = false;
 	}
-	
+	pfree(externalSelectDesc);
 
 	return slot;
+}
+
+/*
+ * ExternalRecheck -- access method routine to recheck a tuple in EvalPlanQual
+ */
+static bool
+ExternalRecheck(ExternalScanState *node, TupleTableSlot *slot)
+{
+	/* There are no access-method-specific conditions to recheck. */
+	return true;
 }
 
 /* ----------------------------------------------------------------
@@ -188,7 +201,9 @@ ExecExternalScan(ExternalScanState *node)
 	/*
 	 * use SeqNext as access method
 	 */
-	return ExecScan(&node->ss, (ExecScanAccessMtd) ExternalNext);
+	return ExecScan(&node->ss,
+					(ExecScanAccessMtd) ExternalNext,
+					(ExecScanRecheckMtd) ExternalRecheck);
 }
 
 
@@ -234,8 +249,6 @@ ExecInitExternalScan(ExternalScan *node, EState *estate, int eflags)
 	externalstate->cdb_want_ctid = contain_ctid_var_reference(&node->scan);
 	ItemPointerSetInvalid(&externalstate->cdb_fake_ctid);
 
-#define EXTSCAN_NSLOTS 2
-
 	/*
 	 * tuple table initialization
 	 */
@@ -250,15 +263,14 @@ ExecInitExternalScan(ExternalScan *node, EState *estate, int eflags)
 
 
 	currentScanDesc = external_beginscan(currentRelation,
-									 node->scan.scanrelid,
 									 node->scancounter,
 									 node->uriList,
-									 node->fmtOpts,
+									 node->fmtOptString,
 									 node->fmtType,
 									 node->isMasterOnly,
 									 node->rejLimit,
 									 node->rejLimitInRows,
-									 node->fmterrtbl,
+									 node->logErrors,
 									 node->encoding);
 
 	externalstate->ss.ss_currentRelation = currentRelation;
@@ -272,23 +284,7 @@ ExecInitExternalScan(ExternalScan *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&externalstate->ss.ps);
 	ExecAssignScanProjectionInfo(&externalstate->ss);
 
-	/*
-	 * If eflag contains EXEC_FLAG_REWIND or EXEC_FLAG_BACKWARD or EXEC_FLAG_MARK,
-	 * then this node is not eager free safe.
-	 */
-	externalstate->ss.ps.delayEagerFree =
-		((eflags & (EXEC_FLAG_REWIND | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)) != 0);
-
 	return externalstate;
-}
-
-
-int
-ExecCountSlotsExternalScan(ExternalScan *node)
-{
-	return ExecCountSlotsNode(outerPlan(node)) +
-	ExecCountSlotsNode(innerPlan(node)) +
-	EXTSCAN_NSLOTS;
 }
 
 /* ----------------------------------------------------------------
@@ -330,8 +326,37 @@ ExecEndExternalScan(ExternalScanState *node)
 	EndPlanStateGpmonPkt(&node->ss.ps);
 }
 
+
 /* ----------------------------------------------------------------
-*		ExecStopExternalScan
+*						Join Support
+* ----------------------------------------------------------------
+*/
+
+/* ----------------------------------------------------------------
+*		ExecReScanExternal
+*
+*		Rescans the relation.
+* ----------------------------------------------------------------
+*/
+void
+ExecReScanExternal(ExternalScanState *node)
+{
+	FileScanDesc fileScan = node->ess_ScanDesc;
+
+	ItemPointerSet(&node->cdb_fake_ctid, 0, 0);
+
+	external_rescan(fileScan);
+}
+
+static void
+ExecEagerFreeExternalScan(ExternalScanState *node)
+{
+	Assert(node->ess_ScanDesc != NULL);
+	external_endscan(node->ess_ScanDesc);
+}
+
+/* ----------------------------------------------------------------
+*		ExecSquelchExternalScan
 *
 *		Performs identically to ExecEndExternalScan except that
 *		closure errors are ignored.  This function is called for
@@ -340,7 +365,7 @@ ExecEndExternalScan(ExternalScanState *node)
 * ----------------------------------------------------------------
 */
 void
-ExecStopExternalScan(ExternalScanState *node)
+ExecSquelchExternalScan(ExternalScanState *node)
 {
 	FileScanDesc fileScanDesc;
 
@@ -353,47 +378,6 @@ ExecStopExternalScan(ExternalScanState *node)
 	 * stop the file scan
 	 */
 	external_stopscan(fileScanDesc);
-}
 
-
-/* ----------------------------------------------------------------
-*						Join Support
-* ----------------------------------------------------------------
-*/
-
-/* ----------------------------------------------------------------
-*		ExecExternalReScan
-*
-*		Rescans the relation.
-* ----------------------------------------------------------------
-*/
-void
-ExecExternalReScan(ExternalScanState *node, ExprContext *exprCtxt)
-{
-	EState	   *estate;
-	Index		scanrelid;
-	FileScanDesc fileScan;
-
-	estate = node->ss.ps.state;
-	scanrelid = ((SeqScan *) node->ss.ps.plan)->scanrelid;
-
-	/* If this is re-scanning of PlanQual ... */
-	if (estate->es_evTuple != NULL &&
-		estate->es_evTuple[scanrelid - 1] != NULL)
-	{
-		estate->es_evTupleNull[scanrelid - 1] = false;
-		return;
-	}
-	fileScan = node->ess_ScanDesc;
-
-	ItemPointerSet(&node->cdb_fake_ctid, 0, 0);
-
-	external_rescan(fileScan);
-}
-
-void
-ExecEagerFreeExternalScan(ExternalScanState *node)
-{
-	Assert(node->ess_ScanDesc != NULL);
-	external_endscan(node->ess_ScanDesc);
+	ExecEagerFreeExternalScan(node);
 }

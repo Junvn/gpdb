@@ -1,20 +1,9 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/declare.sgml,v 1.45 2008/11/16 17:34:28 tgl Exp $
+doc/src/sgml/ref/declare.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-DECLARE">
- <refmeta>
-  <refentrytitle id="SQL-DECLARE-TITLE">DECLARE</refentrytitle>
-  <manvolnum>7</manvolnum>
-  <refmiscinfo>SQL - Language Statements</refmiscinfo>
- </refmeta>
-
- <refnamediv>
-  <refname>DECLARE</refname>
-  <refpurpose>define a cursor</refpurpose>
- </refnamediv>
-
  <indexterm zone="sql-declare">
   <primary>DECLARE</primary>
  </indexterm>
@@ -23,6 +12,17 @@ PostgreSQL documentation
   <primary>cursor</primary>
   <secondary>DECLARE</secondary>
  </indexterm>
+
+ <refmeta>
+  <refentrytitle>DECLARE</refentrytitle>
+  <manvolnum>7</manvolnum>
+  <refmiscinfo>SQL - Language Statements</refmiscinfo>
+ </refmeta>
+
+ <refnamediv>
+  <refname>DECLARE</refname>
+  <refpurpose>define a cursor</refpurpose>
+ </refnamediv>
 
  <refsynopsisdiv>
 <synopsis>
@@ -39,8 +39,17 @@ DECLARE <replaceable class="parameter">name</replaceable> [ BINARY ] [ INSENSITI
    can be used to retrieve
    a small number of rows at a time out of a larger query.
    After the cursor is created, rows are fetched from it using
-   <xref linkend="sql-fetch" endterm="sql-fetch-title">.
+   <xref linkend="sql-fetch">.
   </para>
+
+  <note>
+   <para>
+    This page describes usage of cursors at the SQL command level.
+    If you are trying to use cursors inside a <application>PL/pgSQL</>
+    function, the rules are different &mdash;
+    see <xref linkend="plpgsql-cursors">.
+   </para>
+  </note>
  </refsect1>
 
  <refsect1>
@@ -82,8 +91,7 @@ DECLARE <replaceable class="parameter">name</replaceable> [ BINARY ] [ INSENSITI
     <term><literal>SCROLL</literal></term>
     <term><literal>NO SCROLL</literal></term>
     <listitem>
-     <para>
-      <literal>SCROLL</literal> specifies that the cursor can be used
+     <para><literal>SCROLL</literal> specifies that the cursor can be used
       to retrieve rows in a nonsequential fashion (e.g.,
       backward). Depending upon the complexity of the query's
       execution plan, specifying <literal>SCROLL</literal> might impose
@@ -101,8 +109,7 @@ DECLARE <replaceable class="parameter">name</replaceable> [ BINARY ] [ INSENSITI
     <term><literal>WITH HOLD</literal></term>
     <term><literal>WITHOUT HOLD</literal></term>
     <listitem>
-     <para>
-      <literal>WITH HOLD</literal> specifies that the cursor can
+     <para><literal>WITH HOLD</literal> specifies that the cursor can
       continue to be used after the transaction that created it
       successfully commits.  <literal>WITHOUT HOLD</literal> specifies
       that the cursor cannot be used outside of the transaction that
@@ -117,8 +124,8 @@ DECLARE <replaceable class="parameter">name</replaceable> [ BINARY ] [ INSENSITI
     <term><replaceable class="parameter">query</replaceable></term>
     <listitem>
      <para>
-      A <xref linkend="sql-select" endterm="sql-select-title"> or
-      <xref linkend="sql-values" endterm="sql-values-title"> command
+      A <xref linkend="sql-select"> or
+      <xref linkend="sql-values"> command
       which will provide the rows to be returned by the cursor.
      </para>
     </listitem>
@@ -176,9 +183,9 @@ DECLARE <replaceable class="parameter">name</replaceable> [ BINARY ] [ INSENSITI
     <productname>PostgreSQL</productname> reports an error if such a
     command is used outside a transaction block.
     Use
-    <xref linkend="sql-begin" endterm="sql-begin-title"> and
-    <xref linkend="sql-commit" endterm="sql-commit-title">
-    (or <xref linkend="sql-rollback" endterm="sql-rollback-title">)
+    <xref linkend="sql-begin"> and
+    <xref linkend="sql-commit">
+    (or <xref linkend="sql-rollback">)
     to define a transaction block.
    </para>
 
@@ -219,11 +226,25 @@ DECLARE <replaceable class="parameter">name</replaceable> [ BINARY ] [ INSENSITI
     <literal>SCROLL</literal> may not be specified in this case.
    </para>
 
+   <caution>
+    <para>
+     Scrollable and <literal>WITH HOLD</literal> cursors may give unexpected
+     results if they invoke any volatile functions (see <xref
+     linkend="xfunc-volatility">).  When a previously fetched row is
+     re-fetched, the functions might be re-executed, perhaps leading to
+     results different from the first time.  One workaround for such cases
+     is to declare the cursor <literal>WITH HOLD</literal> and commit the
+     transaction before reading any rows from it.  This will force the
+     entire output of the cursor to be materialized in temporary storage,
+     so that volatile functions are executed exactly once for each row.
+    </para>
+   </caution>
+
    <para>
     If the cursor's query includes <literal>FOR UPDATE</> or <literal>FOR
     SHARE</>, then returned rows are locked at the time they are first
     fetched, in the same way as for a regular
-    <xref linkend="sql-select" endterm="sql-select-title"> command with
+    <xref linkend="sql-select"> command with
     these options.
     In addition, the returned rows will be the most up-to-date versions;
     therefore these options provide the equivalent of what the SQL standard
@@ -250,7 +271,8 @@ DECLARE <replaceable class="parameter">name</replaceable> [ BINARY ] [ INSENSITI
      and not use grouping or <literal>ORDER BY</>).  Cursors
      that are not simply updatable might work, or might not, depending on plan
      choice details; so in the worst case, an application might work in testing
-     and then fail in production.
+     and then fail in production.  If <literal>FOR UPDATE</literal> is
+     specified, the cursor is guaranteed to be updatable.
     </para>
 
     <para>
@@ -288,7 +310,7 @@ DECLARE <replaceable class="parameter">name</replaceable> [ BINARY ] [ INSENSITI
 <programlisting>
 DECLARE liahona CURSOR FOR SELECT * FROM films;
 </programlisting>
-   See <xref linkend="sql-fetch" endterm="sql-fetch-title"> for more
+   See <xref linkend="sql-fetch"> for more
    examples of cursor usage.
   </para>
  </refsect1>
@@ -320,9 +342,9 @@ DECLARE liahona CURSOR FOR SELECT * FROM films;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-close" endterm="sql-close-title"></member>
-   <member><xref linkend="sql-fetch" endterm="sql-fetch-title"></member>
-   <member><xref linkend="sql-move" endterm="sql-move-title"></member>
+   <member><xref linkend="sql-close"></member>
+   <member><xref linkend="sql-fetch"></member>
+   <member><xref linkend="sql-move"></member>
   </simplelist>
  </refsect1>
 </refentry>

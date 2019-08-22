@@ -76,7 +76,6 @@
 		<topicref href="ref_guide/sql_commands/ALTER_DATABASE.xml"/>
 		<topicref href="ref_guide/sql_commands/ALTER_DOMAIN.xml"/>
 		<topicref href="ref_guide/sql_commands/ALTER_EXTERNAL_TABLE.xml"/>
-		<topicref href="ref_guide/sql_commands/ALTER_FILESPACE.xml"/>
 		<topicref href="ref_guide/sql_commands/ALTER_FUNCTION.xml"/>
 		<topicref href="ref_guide/sql_commands/ALTER_GROUP.xml"/>
 		<topicref href="ref_guide/sql_commands/ALTER_INDEX.xml"/>
@@ -91,7 +90,11 @@
 		<topicref href="ref_guide/sql_commands/ALTER_SCHEMA.xml"/>
 		<topicref href="ref_guide/sql_commands/ALTER_SEQUENCE.xml"/>
 		<topicref href="ref_guide/sql_commands/ALTER_TABLE.xml"/>
-		<topicref href="ref_guide/sql_commands/ALTER_TABLESPACE.xml"/>
+    <topicref href="ref_guide/sql_commands/ALTER_TABLESPACE.xml"/>
+		<topicref href="ref_guide/sql_commands/ALTER_TEXT_SEARCH_CONFIGURATION.xml"/>
+    <topicref href="ref_guide/sql_commands/ALTER_TEXT_SEARCH_DICTIONARY.xml"/>
+    <topicref href="ref_guide/sql_commands/ALTER_TEXT_SEARCH_PARSER.xml"/>
+    <topicref href="ref_guide/sql_commands/ALTER_TEXT_SEARCH_TEMPLATE.xml"/>
 		<topicref href="ref_guide/sql_commands/ALTER_TRIGGER.xml" otherprops="op-hidden"/>
 		<topicref href="ref_guide/sql_commands/ALTER_TYPE.xml"/>
 		<topicref href="ref_guide/sql_commands/ALTER_USER.xml"/>
@@ -127,6 +130,10 @@
 		<topicref href="ref_guide/sql_commands/CREATE_TABLE.xml"/>
 		<topicref href="ref_guide/sql_commands/CREATE_TABLE_AS.xml"/>
 		<topicref href="ref_guide/sql_commands/CREATE_TABLESPACE.xml"/>
+    <topicref href="ref_guide/sql_commands/CREATE_TEXT_SEARCH_CONFIGURATION.xml"/>
+    <topicref href="ref_guide/sql_commands/CREATE_TEXT_SEARCH_DICTIONARY.xml"/>
+    <topicref href="ref_guide/sql_commands/CREATE_TEXT_SEARCH_PARSER.xml"/>
+    <topicref href="ref_guide/sql_commands/CRETE_TEXT_SEARCH_TEMPLATE.xml"/>
 		<topicref href="ref_guide/sql_commands/CREATE_TRIGGER.xml" otherprops="op-hidden"/>
 		<topicref href="ref_guide/sql_commands/CREATE_TYPE.xml"/>
 		<topicref href="ref_guide/sql_commands/CREATE_USER.xml"/>
@@ -142,7 +149,6 @@
 		<topicref href="ref_guide/sql_commands/DROP_DATABASE.xml"/>
 		<topicref href="ref_guide/sql_commands/DROP_DOMAIN.xml"/>
 		<topicref href="ref_guide/sql_commands/DROP_EXTERNAL_TABLE.xml"/>
-		<topicref href="ref_guide/sql_commands/DROP_FILESPACE.xml"/>
 		<topicref href="ref_guide/sql_commands/DROP_FUNCTION.xml"/>
 		<topicref href="ref_guide/sql_commands/DROP_GROUP.xml"/>
 		<topicref href="ref_guide/sql_commands/DROP_INDEX.xml"/>
@@ -160,6 +166,10 @@
 		<topicref href="ref_guide/sql_commands/DROP_SEQUENCE.xml"/>
 		<topicref href="ref_guide/sql_commands/DROP_TABLE.xml"/>
 		<topicref href="ref_guide/sql_commands/DROP_TABLESPACE.xml"/>
+    <topicref href="ref_guide/sql_commands/DROP_TEXT_SEARCH_CONFIGURATION.xml"/>
+    <topicref href="ref_guide/sql_commands/DROP_TEXT_SEARCH_DICTIONARY.xml"/>
+    <topicref href="ref_guide/sql_commands/DROP_TEXT_SEARCH_PARSER.xml"/>
+    <topicref href="ref_guide/sql_commands/DROP_TEXT_SEARCH_TEMPLATE.xml"/>
 		<topicref href="ref_guide/sql_commands/DROP_TRIGGER.xml" otherprops="op-hidden"/>
 		<topicref href="ref_guide/sql_commands/DROP_TYPE.xml"/>
 		<topicref href="ref_guide/sql_commands/DROP_USER.xml"/>
@@ -198,6 +208,8 @@
 	<chapter href="ref_guide/SQL2008_support.xml"/>
 	<chapter href="ref_guide/env_var_ref.xml" navtitle="Greenplum Environment Variables"
 		id="env_var_ref"/>
+	<chapter href="ref_guide/sql-keywords.xml" navtitle="Reserved Identifiers and SQL Key Words"
+		id="keyword_ref"/>
 	<chapter href="ref_guide/system_catalogs/catalog_ref.xml">
 		<topicref href="ref_guide/system_catalogs/catalog_ref-tables.xml"/>
 		<topicref href="ref_guide/system_catalogs/catalog_ref-views.xml"/>
@@ -211,15 +223,8 @@
 			<topicref href="ref_guide/system_catalogs/gp_expansion_status.xml"/>
 			<topicref href="ref_guide/system_catalogs/gp_expansion_tables.xml"/>
 			<topicref href="ref_guide/system_catalogs/gp_fastsequence.xml"/>
-			<topicref href="ref_guide/system_catalogs/gp_fault_strategy.xml"/>
-			<topicref href="ref_guide/system_catalogs/gp_global_sequence.xml"/>
 			<topicref href="ref_guide/system_catalogs/gp_id.xml"/>
-			<topicref href="ref_guide/system_catalogs/gp_persistent_database_node.xml"/>
-			<topicref href="ref_guide/system_catalogs/gp_persistent_filespace_node.xml"/>
-			<topicref href="ref_guide/system_catalogs/gp_persistent_relation_node.xml"/>
-			<topicref href="ref_guide/system_catalogs/gp_persistent_tablespace_node.xml"/>
 			<topicref href="ref_guide/system_catalogs/gp_pgdatabase.xml"/>
-			<topicref href="ref_guide/system_catalogs/gp_relation_node.xml"/>
 			<topicref href="ref_guide/system_catalogs/gp_resqueue_status.xml"/>
 			<topicref href="ref_guide/system_catalogs/gp_segment_configuration.xml"/>
 			<topicref href="ref_guide/system_catalogs/gp_transaction_log.xml"/>
@@ -244,8 +249,6 @@
 			<topicref href="ref_guide/system_catalogs/pg_description.xml"/>
 			<topicref href="ref_guide/system_catalogs/pg_enum.xml"/>
 			<topicref href="ref_guide/system_catalogs/pg_exttable.xml"/>
-			<topicref href="ref_guide/system_catalogs/pg_filespace.xml"/>
-			<topicref href="ref_guide/system_catalogs/pg_filespace_entry.xml"/>
 			<topicref href="ref_guide/system_catalogs/pg_index.xml"/>
 			<topicref href="ref_guide/system_catalogs/pg_inherits.xml"/>
 			<topicref href="ref_guide/system_catalogs/pg_language.xml"/>
@@ -284,7 +287,6 @@
 			<topicref href="ref_guide/system_catalogs/pg_type.xml"/>
 			<topicref href="ref_guide/system_catalogs/pg_type_encoding.xml"/>
 			<topicref href="ref_guide/system_catalogs/pg_user_mapping.xml"/>
-			<topicref href="ref_guide/system_catalogs/pg_window.xml"/>
 		</topicref>
 	</chapter>
 	<chapter href="ref_guide/gp_toolkit.xml" navtitle="The gp_toolkit Administrative Schema"

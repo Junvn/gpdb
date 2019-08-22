@@ -10,13 +10,11 @@
  * IDENTIFICATION
  *	    src/backend/cdb/cdbllize.c
  *
- * NOTES
- *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
-#include "miscadmin.h"
+
 #include "optimizer/clauses.h"
 #include "optimizer/pathnode.h"
 #include "nodes/primnodes.h"
@@ -25,16 +23,11 @@
 #include "nodes/pg_list.h"
 #include "nodes/print.h"
 
+#include "optimizer/paths.h"
 #include "optimizer/planmain.h" /* for is_projection_capable_plan() */
-#include "optimizer/var.h"		/* for contain_vars_of_level_or_above() */
 #include "parser/parsetree.h"	/* for rt_fetch() */
-#include "utils/lsyscache.h"	/* for getatttypetypmod() */
-#include "parser/parse_oper.h"	/* for compatible_oper_opid() */
-#include "nodes/makefuncs.h"	/* for makeVar() */
-#include "nodes/value.h"		/* for makeString() */
-#include "utils/relcache.h"		/* RelationGetPartitioningKey() */
-
-#include "utils/debugbreak.h"
+#include "nodes/makefuncs.h"	/* for makeTargetEntry() */
+#include "utils/guc.h"			/* for Debug_pretty_print */
 
 #include "cdb/cdbvars.h"
 #include "cdb/cdbplan.h"
@@ -42,13 +35,6 @@
 #include "cdb/cdbllize.h"
 #include "cdb/cdbmutate.h"
 #include "optimizer/tlist.h"
-
-#define ARRAYCOPY(to, from, sz) \
-	do { \
-		Size	_size = (sz) * sizeof((to)[0]); \
-		(to) = palloc(_size); \
-		memcpy((to), (from), _size); \
-	} while (0)
 
 /*
  * A PlanProfile holds state for recursive prescan_walker().
@@ -66,7 +52,11 @@ typedef struct PlanProfile
 	 */
 	bool		resultSegments;
 
+	/* main plan is parallelled */
 	bool		dispatchParallel;
+
+	/* init plan is parallelled */
+	bool		initPlanParallel;
 
 	Flow	   *currentPlanFlow;	/* what is the flow of the current plan
 									 * node */
@@ -83,7 +73,9 @@ static bool adjustPlanFlow(Plan *plan,
 			   bool stable,
 			   bool rescannable,
 			   Movement req_move,
-			   List *hashExpr);
+			   List *hashExprs,
+			   List *hashOpfamilies,
+			   int numsegments);
 
 static void motion_sanity_check(PlannerInfo *root, Plan *plan);
 static bool loci_compatible(List *hashExpr1, List *hashExpr2);
@@ -136,29 +128,20 @@ static Plan *materialize_subplan(PlannerInfo *root, Plan *subplan);
  * ------------------------------------------------------------------------- *
  */
 Plan *
-cdbparallelize(PlannerInfo *root,
-			   Plan *plan,
-			   Query *query,
-			   int cursorOptions __attribute__((unused)),
-			   ParamListInfo boundParams __attribute__((unused))
-)
+cdbparallelize(PlannerInfo *root, Plan *plan, Query *query)
 {
 	PlanProfile profile;
 	PlanProfile *context = &profile;
 
 	/* Make sure we're called correctly (and need to be called).  */
-	switch (Gp_role)
-	{
-		case GP_ROLE_DISPATCH:
-			break;
-		case GP_ROLE_UTILITY:
-			return plan;
-		case GP_ROLE_EXECUTE:
-		case GP_ROLE_UNDEFINED:
-			Insist(0);
-	}
+	if (Gp_role == GP_ROLE_UTILITY)
+		return plan;
+	if (Gp_role != GP_ROLE_DISPATCH)
+		elog(ERROR, "Plan parallelization invoked for incorrect role: %s",
+			 role_to_string(Gp_role));
+
 	Assert(is_plan_node((Node *) plan));
-	Assert(query !=NULL && IsA(query, Query));
+	Assert(query != NULL && IsA(query, Query));
 
 	/* Print plan if debugging. */
 	if (Debug_print_prelim_plan)
@@ -186,72 +169,26 @@ cdbparallelize(PlannerInfo *root,
 	switch (query->commandType)
 	{
 		case CMD_SELECT:
-			if (query->intoClause)
-			{
-				/* SELECT INTO always created partitioned tables. */
+			/* SELECT INTO / CREATE TABLE AS always created partitioned tables. */
+			if (query->parentStmtType != PARENTSTMTTYPE_NONE)
 				context->resultSegments = true;
-			}
 			break;
 
 		case CMD_INSERT:
 		case CMD_UPDATE:
 		case CMD_DELETE:
-			{
-				/*
-				 * Since this is a data modification command, we need to
-				 * include information about the result relation in the
-				 * summary of relations touched.
-				 */
-				Oid			reloid;
-				Relation	relation;
-				GpPolicy   *policy = NULL;
-
-				/* Get Oid of target relation. */
-				Insist(query->resultRelation > 0 &&
-					   query->resultRelation <= list_length(root->glob->finalrtable));
-				reloid = getrelid(query->resultRelation, root->glob->finalrtable);
-
-				/* Get a copy of the rel's GpPolicy from the relcache. */
-				relation = relation_open(reloid, NoLock);
-				policy = RelationGetPartitioningKey(relation);
-				relation_close(relation, NoLock);
-
-				/* Tell caller if target rel is distributed. */
-				if (policy &&
-					policy->ptype == POLICYTYPE_PARTITIONED)
-					context->resultSegments = true;
-
-				if (policy)
-					pfree(policy);
-
-				/* RETURNING is not yet implemented for partitioned tables. */
-				if (query->returningList &&
-					context->resultSegments)
-				{
-					const char *cmd = (query->commandType == CMD_INSERT) ? "INSERT"
-					: (query->commandType == CMD_UPDATE) ? "UPDATE"
-					: "DELETE";
-
-					ereport(ERROR, (errcode(ERRCODE_CDB_FEATURE_NOT_SUPPORTED),
-									errmsg("The RETURNING clause of the %s "
-										   "statement is not yet supported in "
-										   "this version of " PACKAGE_NAME ".",
-										   cmd)
-									));
-				}
-			}
 			break;
 
 		default:
-			Insist(0);
+			elog(ERROR, "incorrect commandtype for Plan parallelization");
 	}
-
 
 	/*
 	 * We need to keep track of whether any part of the plan needs to be
 	 * dispatched in parallel.
 	 */
 	context->dispatchParallel = context->resultSegments;
+	context->initPlanParallel = false;
 	context->currentPlanFlow = NULL;
 
 	/*
@@ -261,7 +198,7 @@ cdbparallelize(PlannerInfo *root,
 	 */
 	prescan(plan, context);
 
-	if (context->dispatchParallel)
+	if (context->dispatchParallel || context->initPlanParallel)
 	{
 		/*
 		 * Implement the parallelizing directions in the Flow nodes attached
@@ -271,10 +208,12 @@ cdbparallelize(PlannerInfo *root,
 		plan = apply_motion(root, plan, query);
 
 		/*
-		 * From this point on, since part of plan is parallel, we have to
-		 * regard the whole plan as parallel.
+		 * Mark the root plan to DISPATCH_PARALLEL if prescan() says
+		 * it is parallel. Init plan has it's own flag to indicate
+		 * whether it's a parallel plan.
 		 */
-		plan->dispatch = DISPATCH_PARALLEL;
+		if (context->dispatchParallel)
+			plan->dispatch = DISPATCH_PARALLEL;
 	}
 
 	if (gp_enable_motion_deadlock_sanity)
@@ -314,10 +253,11 @@ typedef struct ParallelizeCorrelatedPlanWalkerContext
 								 * gather or broadcast */
 	List	   *rtable;			/* rtable from the global context */
 	bool		subPlanDistributed; /* is original subplan distributed */
+	Flow	   *currentPlanFlow;
 } ParallelizeCorrelatedPlanWalkerContext;
 
 /**
- * Context information to map vars occuring in the Result node's targetlist
+ * Context information to map vars occurring in the Result node's targetlist
  * and quals to what is produced by the underlying SeqScan node.
  */
 typedef struct MapVarsMutatorContext
@@ -332,7 +272,7 @@ typedef struct MapVarsMutatorContext
  */
 static bool ContainsParamWalker(Node *expr, void *ctx);
 static void ParallelizeSubplan(SubPlan *spExpr, PlanProfile *context);
-static Plan *ParallelizeCorrelatedSubPlan(PlannerInfo *root, SubPlan *spExpr, Plan *plan, Movement m, bool subPlanDistributed);
+static Plan *ParallelizeCorrelatedSubPlan(PlannerInfo *root, SubPlan *spExpr, Plan *plan, Movement m, bool subPlanDistributed, Flow *currentPlanFlow);
 static Node *MapVarsMutator(Node *expr, MapVarsMutatorContext *ctx);
 static Node *ParallelizeCorrelatedSubPlanMutator(Node *node, ParallelizeCorrelatedPlanWalkerContext *ctx);
 static Node *ParallelizeCorrelatedSubPlanUpdateFlowMutator(Node *node);
@@ -358,7 +298,7 @@ ContainsParamWalker(Node *expr, void *ctx)
 }
 
 /**
- * Replaces all vars in an expression with OUTER vars referring to the
+ * Replaces all vars in an expression with OUTER_VAR vars referring to the
  * targetlist contained in the context (ctx->outerTL).
  */
 static Node *
@@ -379,7 +319,7 @@ MapVarsMutator(Node *expr, MapVarsMutatorContext *ctx)
 		Var		   *vOrig = (Var *) expr;
 		Var		   *vOuter = (Var *) copyObject(vOrig);
 
-		vOuter->varno = OUTER;
+		vOuter->varno = OUTER_VAR;
 		vOuter->varattno = tle->resno;
 		vOuter->varnoold = vOrig->varno;
 		return (Node *) vOuter;
@@ -440,6 +380,18 @@ ParallelizeCorrelatedSubPlanUpdateFlowMutator(Node *node)
 				((Plan *) node)->flow = pull_up_Flow((Plan *) node, first_append);
 				break;
 			}
+		case T_MergeAppend:
+			{
+				List	   *merge_list = (List *) ((MergeAppend *) node)->mergeplans;
+
+				if (merge_list == NULL)
+					break;
+				Plan	   *first_merge = (Plan *) (lfirst(list_head(merge_list)));
+
+				Assert(first_merge && first_merge->flow);
+				((Plan *) node)->flow = pull_up_Flow((Plan *) node, first_merge);
+				break;
+			}
 		default:
 			break;
 	}
@@ -476,26 +428,28 @@ ParallelizeCorrelatedSubPlanMutator(Node *node, ParallelizeCorrelatedPlanWalkerC
 
 	if (IsA(node, FunctionScan))
 	{
-		RangeTblEntry *rte = rt_fetch(((Scan *) node)->scanrelid,
-									  ctx->rtable);
+		RangeTblEntry *rte;
+		ListCell   *lc;
 
+		rte = rt_fetch(((Scan *) node)->scanrelid, ctx->rtable);
 		Assert(rte->rtekind == RTE_FUNCTION);
 
-		if (rte->funcexpr &&
-			ContainsParamWalker(rte->funcexpr, NULL /* ctx */ ) && ctx->subPlanDistributed)
+		foreach(lc, rte->functions)
 		{
-			ereport(ERROR, (errcode(ERRCODE_CDB_FEATURE_NOT_YET),
-							errmsg("Cannot parallelize that query yet."),
-							errdetail("In a subquery FROM clause, a "
-									  "function invocation cannot contain "
-									  "a correlated reference.")
-							));
+			RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
+
+			if (rtfunc->funcexpr &&
+				ContainsParamWalker(rtfunc->funcexpr, NULL /* ctx */ ) && ctx->subPlanDistributed)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_GP_FEATURE_NOT_YET),
+						 errmsg("cannot parallelize that query yet"),
+						 errdetail("In a subquery FROM clause, a function invocation cannot contain a correlated reference.")));
+			}
 		}
 	}
 
 	if (IsA(node, SeqScan)
-		||IsA(node, AppendOnlyScan)
-		||IsA(node, AOCSScan)
 		||IsA(node, ShareInputScan)
 		||IsA(node, ExternalScan))
 	{
@@ -557,11 +511,16 @@ ParallelizeCorrelatedSubPlanMutator(Node *node, ParallelizeCorrelatedPlanWalkerC
 		 * Step 3: Find all the vars that are needed from the scan node
 		 * for upstream processing.
 		 */
-		/* GPDB_84_MERGE_FIXME: Should we pass includePlaceHolderVars as true */
-		/* in pull_var_clause ? */
-		List	   *scanVars = pull_var_clause((Node *) scanPlan->targetlist, false);
+		/* GPDB_84_MERGE_FIXME: What are the correct PVC_* modes here? */
+		List	   *scanVars;
 
-		scanVars = list_concat(scanVars, pull_var_clause((Node *) resQual, false));
+		scanVars = list_concat(
+			pull_var_clause((Node *) scanPlan->targetlist,
+							PVC_RECURSE_AGGREGATES,
+							PVC_REJECT_PLACEHOLDERS),
+			pull_var_clause((Node *) resQual,
+							PVC_RECURSE_AGGREGATES,
+							PVC_REJECT_PLACEHOLDERS));
 
 		/*
 		 * Step 4: Construct the new targetlist for the scan node
@@ -607,7 +566,9 @@ ParallelizeCorrelatedSubPlanMutator(Node *node, ParallelizeCorrelatedPlanWalkerC
 		 */
 		if (ctx->movement == MOVEMENT_BROADCAST)
 		{
-			broadcastPlan(scanPlan, false /* stable */ , false /* rescannable */ );
+			Assert (NULL != ctx->currentPlanFlow);
+			broadcastPlan(scanPlan, false /* stable */ , false /* rescannable */,
+						  ctx->currentPlanFlow->numsegments /* numsegments */);
 		}
 		else
 		{
@@ -698,7 +659,7 @@ ParallelizeCorrelatedSubPlanMutator(Node *node, ParallelizeCorrelatedPlanWalkerC
  * Parallelizes a correlated subplan. See ParallelizeCorrelatedSubPlanMutator for details.
  */
 Plan *
-ParallelizeCorrelatedSubPlan(PlannerInfo *root, SubPlan *spExpr, Plan *plan, Movement m, bool subPlanDistributed)
+ParallelizeCorrelatedSubPlan(PlannerInfo *root, SubPlan *spExpr, Plan *plan, Movement m, bool subPlanDistributed, Flow *currentPlanFlow)
 {
 	ParallelizeCorrelatedPlanWalkerContext ctx;
 
@@ -707,6 +668,7 @@ ParallelizeCorrelatedSubPlan(PlannerInfo *root, SubPlan *spExpr, Plan *plan, Mov
 	ctx.subPlanDistributed = subPlanDistributed;
 	ctx.sp = spExpr;
 	ctx.rtable = root->glob->finalrtable;
+	ctx.currentPlanFlow = currentPlanFlow;
 	return (Plan *) ParallelizeCorrelatedSubPlanMutator((Node *) plan, &ctx);
 
 }
@@ -738,7 +700,9 @@ ParallelizeSubplan(SubPlan *spExpr, PlanProfile *context)
 
 	Plan	   *origPlan = planner_subplan_get_plan(context->root, spExpr);
 
-	bool		containingPlanDistributed = (context->currentPlanFlow && context->currentPlanFlow->flotype == FLOW_PARTITIONED);
+	bool		containingPlanDistributed = (context->currentPlanFlow &&
+											 (context->currentPlanFlow->flotype == FLOW_PARTITIONED ||
+											  context->currentPlanFlow->flotype == FLOW_REPLICATED));
 	bool		subPlanDistributed = (origPlan->flow && origPlan->flow->flotype == FLOW_PARTITIONED);
 	bool		hasParParam = (list_length(spExpr->parParam) > 0);
 
@@ -770,14 +734,28 @@ ParallelizeSubplan(SubPlan *spExpr, PlanProfile *context)
 
 		if (containingPlanDistributed)
 		{
-			broadcastPlan(newPlan, false /* stable */ , false /* rescannable */ );
+			Assert(NULL != context->currentPlanFlow);
+			broadcastPlan(newPlan, false /* stable */ , false /* rescannable */,
+						  context->currentPlanFlow->numsegments /* numsegments */);
 		}
 		else
 		{
 			focusPlan(newPlan, false /* stable */ , false /* rescannable */ );
 		}
 
-		newPlan = materialize_subplan(context->root, newPlan);
+		if (containingPlanDistributed &&
+			newPlan->flow->flotype == FLOW_SINGLETON &&
+			newPlan->flow->locustype == CdbLocusType_SegmentGeneral)
+		{
+			/*
+			 * Nothing to do, the data is already replicated on segments,
+			 * no need to add a motion or materialize.
+			 */
+		}
+		else
+		{
+			newPlan = materialize_subplan(context->root, newPlan);
+		}
 	}
 
 	/*
@@ -792,7 +770,7 @@ ParallelizeSubplan(SubPlan *spExpr, PlanProfile *context)
 		 * Subplan corresponds to a correlated subquery and its parallelization
 		 * requires certain transformations.
 		 */
-		newPlan = ParallelizeCorrelatedSubPlan(context->root, spExpr, newPlan, reqMove, subPlanDistributed);
+		newPlan = ParallelizeCorrelatedSubPlan(context->root, spExpr, newPlan, reqMove, subPlanDistributed, context->currentPlanFlow);
 	}
 
 	Assert(newPlan);
@@ -827,6 +805,8 @@ ParallelizeSubplan(SubPlan *spExpr, PlanProfile *context)
 static bool
 prescan_walker(Node *node, PlanProfile *context)
 {
+	bool savedMainPlanParallel = false;
+
 	if (node == NULL)
 		return false;
 
@@ -866,8 +846,7 @@ prescan_walker(Node *node, PlanProfile *context)
 
 			{
 				/*
-				 * SubPlans establish a local state for the contained plan,
-				 * notably the range table.
+				 * SubPlans establish a local state for the contained plan, * notably the range table.
 				 */
 				SubPlan    *subplan = (SubPlan *) node;
 
@@ -875,6 +854,21 @@ prescan_walker(Node *node, PlanProfile *context)
 				{
 					ParallelizeSubplan(subplan, context);
 				}
+
+				/*
+				 * Init plan and main plan are dispatched separately,
+				 * so we need to set DISPATCH_PARALLEL flag separately
+				 * for them.
+				 *
+				 * save the parallel state of main plan. init plan
+				 * should not effect main plan.
+				 */
+				if (subplan->is_initplan)
+				{
+					savedMainPlanParallel = context->dispatchParallel;
+					context->dispatchParallel = false;
+				}
+
 				break;
 			}
 
@@ -891,6 +885,23 @@ prescan_walker(Node *node, PlanProfile *context)
 
 	bool		result = plan_tree_walker(node, prescan_walker, context);
 
+	if (IsA(node, SubPlan))
+	{
+		SubPlan    *subplan = (SubPlan *) node;
+
+		/* mark init plan parallel state and restore it for main plan */
+		if (subplan->is_initplan)
+		{
+			if (context->dispatchParallel)
+			{
+				context->initPlanParallel = true;
+				subplan->initPlanParallel= true;
+			}
+
+			context->dispatchParallel = savedMainPlanParallel;
+		}
+	}
+
 	/**
 	 * Replace saved flow
 	 */
@@ -904,13 +915,20 @@ prescan_walker(Node *node, PlanProfile *context)
  * Construct a new Flow in the current memory context.
  */
 Flow *
-makeFlow(FlowType flotype)
+makeFlow(FlowType flotype, int numsegments)
 {
 	Flow	   *flow = makeNode(Flow);
+
+	Assert(numsegments > 0);
+	if (numsegments == GP_POLICY_INVALID_NUMSEGMENTS())
+	{
+		Assert(!"what's the proper value of numsegments?");
+	}
 
 	flow->flotype = flotype;
 	flow->req_move = MOVEMENT_NONE;
 	flow->locustype = CdbLocusType_Null;
+	flow->numsegments = numsegments;
 
 	return flow;
 }
@@ -947,22 +965,27 @@ pull_up_Flow(Plan *plan, Plan *subplan)
 		Assert(subplan == plan->lefttree || subplan == plan->righttree);
 	else if (IsA(plan, Append))
 		Assert(list_member(((Append *) plan)->appendplans, subplan));
+	else if (IsA(plan, ModifyTable))
+		Assert(list_member(((ModifyTable *) plan)->plans, subplan));
 	else
 		Assert(subplan == plan->lefttree);
 
-	new_flow = makeFlow(model_flow->flotype);
+	new_flow = makeFlow(model_flow->flotype, model_flow->numsegments);
 
 	if (model_flow->flotype == FLOW_SINGLETON)
 		new_flow->segindex = model_flow->segindex;
 
 	/* Pull up hash key exprs, if they're all present in the plan's result. */
 	else if (model_flow->flotype == FLOW_PARTITIONED &&
-			 model_flow->hashExpr)
+			 model_flow->hashExprs)
 	{
 		if (!is_projection_capable_plan(plan) ||
-			cdbpullup_isExprCoveredByTargetlist((Expr *) model_flow->hashExpr,
+			cdbpullup_isExprCoveredByTargetlist((Expr *) model_flow->hashExprs,
 												plan->targetlist))
-			new_flow->hashExpr = copyObject(model_flow->hashExpr);
+		{
+			new_flow->hashExprs = copyObject(model_flow->hashExprs);
+			new_flow->hashOpfamilies = copyObject(model_flow->hashOpfamilies);
+		}
 	}
 
 	new_flow->locustype = model_flow->locustype;
@@ -1013,26 +1036,37 @@ focusPlan(Plan *plan, bool stable, bool rescannable)
 {
 	Assert(plan->flow && plan->flow->flotype != FLOW_UNDEFINED);
 
-	/* Already focused?  Do nothing. */
-	if (plan->flow->flotype == FLOW_SINGLETON)
+	/*
+	 * Already focused and flow is CdbLocusType_SingleQE, CdbLocusType_Entry,
+	 * do nothing.
+	 */
+	if (plan->flow->flotype == FLOW_SINGLETON &&
+		plan->flow->locustype != CdbLocusType_SegmentGeneral)
 		return true;
 
-	/* TODO How specify deep-six? */
-	if (plan->flow->flotype == FLOW_REPLICATED)
-		return false;
-
-	return adjustPlanFlow(plan, stable, rescannable, MOVEMENT_FOCUS, NIL);
+	return adjustPlanFlow(plan, stable, rescannable, MOVEMENT_FOCUS, NIL, NIL,
+						  plan->flow->numsegments);
 }
 
 /*
  * Function: broadcastPlan
  */
 bool
-broadcastPlan(Plan *plan, bool stable, bool rescannable)
+broadcastPlan(Plan *plan, bool stable, bool rescannable, int numsegments)
 {
 	Assert(plan->flow && plan->flow->flotype != FLOW_UNDEFINED);
 
-	return adjustPlanFlow(plan, stable, rescannable, MOVEMENT_BROADCAST, NIL);
+	/*
+	 * Already focused and flow is CdbLocusType_SegmentGeneral and data
+	 * is replicated on every segment of target, do nothing.
+	 */
+	if (plan->flow->flotype == FLOW_SINGLETON &&
+		plan->flow->locustype == CdbLocusType_SegmentGeneral &&
+		plan->flow->numsegments >= numsegments)
+		return true;
+
+	return adjustPlanFlow(plan, stable, rescannable, MOVEMENT_BROADCAST, NIL, NIL,
+						  numsegments);
 }
 
 
@@ -1071,32 +1105,27 @@ loci_compatible(List *hashExpr1, List *hashExpr2)
  * Function: repartitionPlan
  */
 bool
-repartitionPlan(Plan *plan, bool stable, bool rescannable, List *hashExpr)
+repartitionPlan(Plan *plan, bool stable, bool rescannable,
+				List *hashExprs, List *hashOpfamilies, int numsegments)
 {
 	Assert(plan->flow);
 	Assert(plan->flow->flotype == FLOW_PARTITIONED ||
 		   plan->flow->flotype == FLOW_SINGLETON);
 
 	/* Already partitioned on the given hashExpr?  Do nothing. */
-	if (hashExpr)
+	if (hashExprs && plan->flow->numsegments == numsegments &&
+		plan->flow->locustype == CdbLocusType_Hashed)
 	{
-		if (equal(hashExpr, plan->flow->hashExpr))
+		if (equal(hashOpfamilies, plan->flow->hashOpfamilies) &&
+			loci_compatible(hashExprs, plan->flow->hashExprs))
+		{
 			return true;
-
-		/*
-		 * MPP-4922: The earlier check is very conservative and may result in
-		 * unnecessary motion nodes. Adding another check to avoid motion
-		 * nodes, if possible.
-		 */
-		if (loci_compatible(hashExpr, plan->flow->hashExpr))
-			return true;
+		}
 	}
 
-	return adjustPlanFlow(plan, stable, rescannable, MOVEMENT_REPARTITION, hashExpr);
+	return adjustPlanFlow(plan, stable, rescannable, MOVEMENT_REPARTITION,
+						  hashExprs, hashOpfamilies, numsegments);
 }
-
-
-
 
 /*
  * Helper Function: adjustPlanFlow
@@ -1113,7 +1142,9 @@ adjustPlanFlow(Plan *plan,
 			   bool stable,
 			   bool rescannable,
 			   Movement req_move,
-			   List *hashExpr)
+			   List *hashExprs,
+			   List *hashOpfamilies,
+			   int numsegments)
 {
 	Flow	   *flow = plan->flow;
 	bool		disorder = false;
@@ -1123,6 +1154,12 @@ adjustPlanFlow(Plan *plan,
 	Assert(flow && flow->flotype != FLOW_UNDEFINED);
 	Assert(flow->req_move == MOVEMENT_NONE);
 	Assert(flow->flow_before_req_move == NULL);
+
+	Assert(numsegments > 0);
+	if (numsegments == GP_POLICY_INVALID_NUMSEGMENTS())
+	{
+		Assert(!"what's the proper value of numsegments?");
+	}
 
 	switch (req_move)
 	{
@@ -1190,6 +1227,7 @@ adjustPlanFlow(Plan *plan,
 			break;
 
 		case T_Append:			/* Maybe handle specially some day. */
+		case T_MergeAppend:
 		default:
 			break;
 	}
@@ -1209,7 +1247,9 @@ adjustPlanFlow(Plan *plan,
 							stable && !reorder,
 							rescannable,
 							req_move,
-							hashExpr))
+							hashExprs,
+							hashOpfamilies,
+							numsegments))
 			return false;
 
 		/* After updating subplan, bubble new distribution back up the tree. */
@@ -1217,7 +1257,9 @@ adjustPlanFlow(Plan *plan,
 
 		flow->flotype = kidflow->flotype;
 		flow->segindex = kidflow->segindex;
-		flow->hashExpr = copyObject(kidflow->hashExpr);
+		flow->hashExprs = copyObject(kidflow->hashExprs);
+		flow->hashOpfamilies = copyObject(kidflow->hashOpfamilies);
+		flow->numsegments = kidflow->numsegments;
 		plan->dispatch = plan->lefttree->dispatch;
 
 		return true;			/* success */
@@ -1268,19 +1310,25 @@ adjustPlanFlow(Plan *plan,
 		case MOVEMENT_FOCUS:
 			/* Converge to a single QE (or QD; that choice is made later). */
 			flow->flotype = FLOW_SINGLETON;
-			flow->hashExpr = NIL;
+			flow->hashExprs= NIL;
+			flow->hashOpfamilies = NIL;
+			flow->numsegments = numsegments;
 			flow->segindex = 0;
 			break;
 
 		case MOVEMENT_BROADCAST:
 			flow->flotype = FLOW_REPLICATED;
-			flow->hashExpr = NIL;
+			flow->hashExprs = NIL;
+			flow->hashOpfamilies = NIL;
+			flow->numsegments = numsegments;
 			flow->segindex = 0;
 			break;
 
 		case MOVEMENT_REPARTITION:
 			flow->flotype = FLOW_PARTITIONED;
-			flow->hashExpr = copyObject(hashExpr);
+			flow->hashExprs = copyObject(hashExprs);
+			flow->hashOpfamilies = copyObject(hashOpfamilies);
+			flow->numsegments = numsegments;
 			flow->segindex = 0;
 			break;
 
@@ -1389,15 +1437,12 @@ motion_sanity_walker(Node *node, sanity_result_t *result)
 		case T_TableFunctionScan:
 		case T_ShareInputScan:
 		case T_Append:
+		case T_MergeAppend:
 		case T_SeqScan:
 		case T_ExternalScan:
-		case T_AppendOnlyScan:
-		case T_AOCSScan:
 		case T_IndexScan:
 		case T_BitmapIndexScan:
 		case T_BitmapHeapScan:
-		case T_BitmapAppendOnlyScan:
-		case T_BitmapTableScan:
 		case T_TidScan:
 		case T_SubqueryScan:
 		case T_FunctionScan:
@@ -1409,6 +1454,7 @@ motion_sanity_walker(Node *node, sanity_result_t *result)
 		case T_Limit:
 		case T_Sort:
 		case T_Material:
+		case T_ForeignScan:
 			if (plan_tree_walker(node, motion_sanity_walker, result))
 				return true;
 			break;

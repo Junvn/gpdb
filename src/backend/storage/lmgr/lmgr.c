@@ -5,12 +5,12 @@
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/storage/lmgr/lmgr.c,v 1.98 2008/11/07 18:25:06 tgl Exp $
+ *	  src/backend/storage/lmgr/lmgr.c
  *
  *-------------------------------------------------------------------------
  */
@@ -21,16 +21,32 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
-#include "catalog/namespace.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "utils/inval.h"
-#include "utils/lsyscache.h"        /* CDB: get_rel_name() */
 
-#include "catalog/gp_policy.h"     /* CDB: POLICYTYPE_PARTiITIONED */
+#include "access/heapam.h"
+#include "catalog/namespace.h"
 #include "cdb/cdbvars.h"
+#include "utils/lsyscache.h"        /* CDB: get_rel_namespace() */
+#include "utils/guc.h"
 
+
+/*
+ * Struct to hold context info for transaction lock waits.
+ *
+ * 'oper' is the operation that needs to wait for the other transaction; 'rel'
+ * and 'ctid' specify the address of the tuple being waited for.
+ */
+typedef struct XactLockTableWaitInfo
+{
+	XLTW_Oper	oper;
+	Relation	rel;
+	ItemPointer ctid;
+} XactLockTableWaitInfo;
+
+static void XactLockTableWaitErrorCb(void *arg);
 
 /*
  * RelationInitLockInfo
@@ -72,30 +88,41 @@ SetLocktagRelationOid(LOCKTAG *tag, Oid relid)
 /*
  *		LockRelationOid
  *
- * Lock a relation given only its OID.	This should generally be used
+ * Lock a relation given only its OID.  This should generally be used
  * before attempting to open the relation's relcache entry.
  */
 void
 LockRelationOid(Oid relid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SetLocktagRelationOid(&tag, relid);
 
-	res = LockAcquire(&tag, lockmode, false, false);
+	res = LockAcquireExtended(&tag, lockmode, false, false, true, &locallock);
 
 	/*
 	 * Now that we have the lock, check for invalidation messages, so that we
 	 * will update or flush any stale relcache entry before we try to use it.
-	 * We can skip this in the not-uncommon case that we already had the same
-	 * type of lock being requested, since then no one else could have
-	 * modified the relcache entry in an undesirable way.  (In the case where
-	 * our own xact modifies the rel, the relcache update happens via
+	 * RangeVarGetRelid() specifically relies on us for this.  We can skip
+	 * this in the not-uncommon case that we already had the same type of lock
+	 * being requested, since then no one else could have modified the
+	 * relcache entry in an undesirable way.  (In the case where our own xact
+	 * modifies the rel, the relcache update happens via
 	 * CommandCounterIncrement, not here.)
+	 *
+	 * However, in corner cases where code acts on tables (usually catalogs)
+	 * recursively, we might get here while still processing invalidation
+	 * messages in some outer execution of this function or a sibling.  The
+	 * "cleared" status of the lock tells us whether we really are done
+	 * absorbing relevant inval messages.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 }
 
 /*
@@ -111,11 +138,12 @@ bool
 ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SetLocktagRelationOid(&tag, relid);
 
-	res = LockAcquire(&tag, lockmode, false, true);
+	res = LockAcquireExtended(&tag, lockmode, false, true, true, &locallock);
 
 	if (res == LOCKACQUIRE_NOT_AVAIL)
 		return false;
@@ -124,8 +152,11 @@ ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
 	 * Now that we have the lock, check for invalidation messages; see notes
 	 * in LockRelationOid.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 
 	return true;
 }
@@ -172,20 +203,24 @@ void
 LockRelation(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SET_LOCKTAG_RELATION(tag,
 						 relation->rd_lockInfo.lockRelId.dbId,
 						 relation->rd_lockInfo.lockRelId.relId);
 
-	res = LockAcquire(&tag, lockmode, false, false);
+	res = LockAcquireExtended(&tag, lockmode, false, false, true, &locallock);
 
 	/*
 	 * Now that we have the lock, check for invalidation messages; see notes
 	 * in LockRelationOid.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 }
 
 /*
@@ -228,13 +263,14 @@ bool
 ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SET_LOCKTAG_RELATION(tag,
 						 relation->rd_lockInfo.lockRelId.dbId,
 						 relation->rd_lockInfo.lockRelId.relId);
 
-	res = LockAcquire(&tag, lockmode, false, true);
+	res = LockAcquireExtended(&tag, lockmode, false, true, true, &locallock);
 
 	if (res == LOCKACQUIRE_NOT_AVAIL)
 		return false;
@@ -243,8 +279,11 @@ ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
 	 * Now that we have the lock, check for invalidation messages; see notes
 	 * in LockRelationOid.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 
 	return true;
 }
@@ -268,9 +307,27 @@ UnlockRelation(Relation relation, LOCKMODE lockmode)
 }
 
 /*
+ *		LockHasWaitersRelation
+ *
+ * This is a functiion to check if someone else is waiting on a
+ * lock, we are currently holding.
+ */
+bool
+LockHasWaitersRelation(Relation relation, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION(tag,
+						 relation->rd_lockInfo.lockRelId.dbId,
+						 relation->rd_lockInfo.lockRelId.relId);
+
+	return LockHasWaiters(&tag, lockmode, false);
+}
+
+/*
  *		LockRelationIdForSession
  *
- * This routine grabs a session-level lock on the target relation.	The
+ * This routine grabs a session-level lock on the target relation.  The
  * session lock persists across transaction boundaries.  It will be removed
  * when UnlockRelationIdForSession() is called, or if an ereport(ERROR) occurs,
  * or if the backend exits.
@@ -335,60 +392,6 @@ UnlockRelationForExtension(Relation relation, LOCKMODE lockmode)
 	SET_LOCKTAG_RELATION_EXTEND(tag,
 								relation->rd_lockInfo.lockRelId.dbId,
 								relation->rd_lockInfo.lockRelId.relId);
-
-	LockRelease(&tag, lockmode, false);
-}
-
-/*
- * Separate routine for LockRelationForExtension() because resync workers do not have relation.  
- */
-void
-LockRelationForResyncExtension(RelFileNode *relFileNode, LOCKMODE lockmode)
-{
-	LOCKTAG		tag;
-	
-	SET_LOCKTAG_RELATION_EXTEND(tag,
-								relFileNode->dbNode,
-								relFileNode->relNode);
-	
-	(void) LockAcquire(&tag, lockmode, false, false);
-}
-
-/*
- * Separate routine for UnlockRelationForExtension() because resync workers do not have relation.
- */
-void
-UnlockRelationForResyncExtension(RelFileNode *relFileNode, LOCKMODE lockmode)
-{
-	LOCKTAG		tag;
-	
-	SET_LOCKTAG_RELATION_EXTEND(tag,
-								relFileNode->dbNode,
-								relFileNode->relNode);
-	
-	LockRelease(&tag, lockmode, false);
-}
-
-void
-LockRelationForResynchronize(RelFileNode *relFileNode, LOCKMODE lockmode)
-{
-	LOCKTAG		tag;
-
-	SET_LOCKTAG_RELATION_RESYNCHRONIZE(tag,
-						 relFileNode->dbNode,
-						 relFileNode->relNode);
-
-	(void) LockAcquire(&tag, lockmode, false, false);
-}
-
-void
-UnlockRelationForResynchronize(RelFileNode *relFileNode, LOCKMODE lockmode)
-{
-	LOCKTAG		tag;
-
-	SET_LOCKTAG_RELATION_RESYNCHRONIZE(tag,
-						 relFileNode->dbNode,
-						 relFileNode->relNode);
 
 	LockRelease(&tag, lockmode, false);
 }
@@ -546,13 +549,6 @@ XactLockTableInsert(TransactionId xid)
 
 	SET_LOCKTAG_TRANSACTION(tag, xid);
 
-	if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
-	{
-		elog(LOG,"XactLockTableInsert lock for xid = %u is not available!", xid);
-		
-		return;
-	}
-
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
 }
 
@@ -561,7 +557,7 @@ XactLockTableInsert(TransactionId xid)
  *
  * Delete the lock showing that the given transaction ID is running.
  * (This is never used for main transaction IDs; those locks are only
- * released implicitly at transaction end.	But we do use it for subtrans IDs.)
+ * released implicitly at transaction end.  But we do use it for subtrans IDs.)
  */
 void
 XactLockTableDelete(TransactionId xid)
@@ -576,19 +572,44 @@ XactLockTableDelete(TransactionId xid)
 /*
  *		XactLockTableWait
  *
- * Wait for the specified transaction to commit or abort.
+ * Wait for the specified transaction to commit or abort.  If an operation
+ * is specified, an error context callback is set up.  If 'oper' is passed as
+ * None, no error context callback is set up.
  *
  * Note that this does the right thing for subtransactions: if we wait on a
  * subtransaction, we will exit as soon as it aborts or its top parent commits.
  * It takes some extra work to ensure this, because to save on shared memory
  * the XID lock of a subtransaction is released when it ends, whether
- * successfully or unsuccessfully.	So we have to check if it's "still running"
+ * successfully or unsuccessfully.  So we have to check if it's "still running"
  * and if so wait for its parent.
  */
 void
-XactLockTableWait(TransactionId xid)
+XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
+				  XLTW_Oper oper)
 {
 	LOCKTAG		tag;
+	XactLockTableWaitInfo info;
+	ErrorContextCallback callback;
+	bool		first = true;
+
+	/*
+	 * If an operation is specified, set up our verbose error context
+	 * callback.
+	 */
+	if (oper != XLTW_None)
+	{
+		Assert(RelationIsValid(rel));
+		Assert(ItemPointerIsValid(ctid));
+
+		info.rel = rel;
+		info.ctid = ctid;
+		info.oper = oper;
+
+		callback.callback = XactLockTableWaitErrorCb;
+		callback.arg = &info;
+		callback.previous = error_context_stack;
+		error_context_stack = &callback;
+	}
 
 	for (;;)
 	{
@@ -603,8 +624,30 @@ XactLockTableWait(TransactionId xid)
 
 		if (!TransactionIdIsInProgress(xid))
 			break;
-		xid = SubTransGetParent(xid);
+
+		/*
+		 * If the Xid belonged to a subtransaction, then the lock would have
+		 * gone away as soon as it was finished; for correct tuple visibility,
+		 * the right action is to wait on its parent transaction to go away.
+		 * But instead of going levels up one by one, we can just wait for the
+		 * topmost transaction to finish with the same end result, which also
+		 * incurs less locktable traffic.
+		 *
+		 * Some uses of this function don't involve tuple visibility -- such
+		 * as when building snapshots for logical decoding.  It is possible to
+		 * see a transaction in ProcArray before it registers itself in the
+		 * locktable.  The topmost transaction in that case is the same xid,
+		 * so we try again after a short sleep.  (Don't sleep the first time
+		 * through, to avoid slowing down the normal case.)
+		 */
+		if (!first)
+			pg_usleep(1000L);
+		first = false;
+		xid = SubTransGetTopmostTransaction(xid);
 	}
+
+	if (oper != XLTW_None)
+		error_context_stack = callback.previous;
 }
 
 /*
@@ -617,6 +660,7 @@ bool
 ConditionalXactLockTableWait(TransactionId xid)
 {
 	LOCKTAG		tag;
+	bool		first = true;
 
 	for (;;)
 	{
@@ -632,73 +676,137 @@ ConditionalXactLockTableWait(TransactionId xid)
 
 		if (!TransactionIdIsInProgress(xid))
 			break;
-		xid = SubTransGetParent(xid);
+
+		/* See XactLockTableWait about this case */
+		if (!first)
+			pg_usleep(1000L);
+		first = false;
+		xid = SubTransGetTopmostTransaction(xid);
 	}
 
 	return true;
 }
 
-
 /*
- *		VirtualXactLockTableInsert
- *
- * Insert a lock showing that the given virtual transaction ID is running ---
- * this is done at main transaction start when its VXID is assigned.
- * The lock can then be used to wait for the transaction to finish.
+ * XactLockTableWaitErrorContextCb
+ *		Error context callback for transaction lock waits.
  */
-void
-VirtualXactLockTableInsert(VirtualTransactionId vxid)
+static void
+XactLockTableWaitErrorCb(void *arg)
 {
-	LOCKTAG		tag;
+	XactLockTableWaitInfo *info = (XactLockTableWaitInfo *) arg;
 
-	Assert(VirtualTransactionIdIsValid(vxid));
+	/*
+	 * We would like to print schema name too, but that would require a
+	 * syscache lookup.
+	 */
+	if (info->oper != XLTW_None &&
+		ItemPointerIsValid(info->ctid) && RelationIsValid(info->rel))
+	{
+		const char *cxt;
 
-	SET_LOCKTAG_VIRTUALTRANSACTION(tag, vxid);
+		switch (info->oper)
+		{
+			case XLTW_Update:
+				cxt = gettext_noop("while updating tuple (%u,%u) in relation \"%s\"");
+				break;
+			case XLTW_Delete:
+				cxt = gettext_noop("while deleting tuple (%u,%u) in relation \"%s\"");
+				break;
+			case XLTW_Lock:
+				cxt = gettext_noop("while locking tuple (%u,%u) in relation \"%s\"");
+				break;
+			case XLTW_LockUpdated:
+				cxt = gettext_noop("while locking updated version (%u,%u) of tuple in relation \"%s\"");
+				break;
+			case XLTW_InsertIndex:
+				cxt = gettext_noop("while inserting index tuple (%u,%u) in relation \"%s\"");
+				break;
+			case XLTW_InsertIndexUnique:
+				cxt = gettext_noop("while checking uniqueness of tuple (%u,%u) in relation \"%s\"");
+				break;
+			case XLTW_FetchUpdated:
+				cxt = gettext_noop("while rechecking updated tuple (%u,%u) in relation \"%s\"");
+				break;
+			case XLTW_RecheckExclusionConstr:
+				cxt = gettext_noop("while checking exclusion constraint on tuple (%u,%u) in relation \"%s\"");
+				break;
 
-	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+			default:
+				return;
+		}
+
+		errcontext(cxt,
+				   ItemPointerGetBlockNumber(info->ctid),
+				   ItemPointerGetOffsetNumber(info->ctid),
+				   RelationGetRelationName(info->rel));
+	}
 }
 
 /*
- *		VirtualXactLockTableWait
+ * WaitForLockersMultiple
+ *		Wait until no transaction holds locks that conflict with the given
+ *		locktags at the given lockmode.
  *
- * Waits until the lock on the given VXID is released, which shows that
- * the top-level transaction owning the VXID has ended.
+ * To do this, obtain the current list of lockers, and wait on their VXIDs
+ * until they are finished.
+ *
+ * Note we don't try to acquire the locks on the given locktags, only the VXIDs
+ * of its lock holders; if somebody grabs a conflicting lock on the objects
+ * after we obtained our initial list of lockers, we will not wait for them.
  */
 void
-VirtualXactLockTableWait(VirtualTransactionId vxid)
+WaitForLockersMultiple(List *locktags, LOCKMODE lockmode)
 {
-	LOCKTAG		tag;
+	List	   *holders = NIL;
+	ListCell   *lc;
 
-	Assert(VirtualTransactionIdIsValid(vxid));
+	/* Done if no locks to wait for */
+	if (list_length(locktags) == 0)
+		return;
 
-	SET_LOCKTAG_VIRTUALTRANSACTION(tag, vxid);
+	/* Collect the transactions we need to wait on */
+	foreach(lc, locktags)
+	{
+		LOCKTAG    *locktag = lfirst(lc);
 
-	(void) LockAcquire(&tag, ShareLock, false, false);
+		holders = lappend(holders, GetLockConflicts(locktag, lockmode));
+	}
 
-	LockRelease(&tag, ShareLock, false);
+	/*
+	 * Note: GetLockConflicts() never reports our own xid, hence we need not
+	 * check for that.  Also, prepared xacts are not reported, which is fine
+	 * since they certainly aren't going to do anything anymore.
+	 */
+
+	/* Finally wait for each such transaction to complete */
+	foreach(lc, holders)
+	{
+		VirtualTransactionId *lockholders = lfirst(lc);
+
+		while (VirtualTransactionIdIsValid(*lockholders))
+		{
+			VirtualXactLock(*lockholders, true);
+			lockholders++;
+		}
+	}
+
+	list_free_deep(holders);
 }
 
 /*
- *		ConditionalVirtualXactLockTableWait
+ * WaitForLockers
  *
- * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE if the lock was acquired.
+ * Same as WaitForLockersMultiple, for a single lock tag.
  */
-bool
-ConditionalVirtualXactLockTableWait(VirtualTransactionId vxid)
+void
+WaitForLockers(LOCKTAG heaplocktag, LOCKMODE lockmode)
 {
-	LOCKTAG		tag;
+	List	   *l;
 
-	Assert(VirtualTransactionIdIsValid(vxid));
-
-	SET_LOCKTAG_VIRTUALTRANSACTION(tag, vxid);
-
-	if (LockAcquire(&tag, ShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
-		return false;
-
-	LockRelease(&tag, ShareLock, false);
-
-	return true;
+	l = list_make1(&heaplocktag);
+	WaitForLockersMultiple(l, lockmode);
+	list_free(l);
 }
 
 
@@ -723,6 +831,9 @@ LockDatabaseObject(Oid classid, Oid objid, uint16 objsubid,
 					   objsubid);
 
 	(void) LockAcquire(&tag, lockmode, false, false);
+
+	/* Make sure syscaches are up-to-date with any changes we waited for */
+	AcceptInvalidationMessages();
 }
 
 /*
@@ -863,12 +974,6 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 							 tag->locktag_field2,
 							 tag->locktag_field1);
 			break;
-		case LOCKTAG_RELATION_RESYNCHRONIZE:
-			appendStringInfo(buf,
-							 _("resynchronize relation %u of database %u"),
-							 tag->locktag_field1,
-							 tag->locktag_field2);
-			break;
 		case LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE:
 			appendStringInfo(buf,
 							 _("segment file %u of appendonly relation %u of database %u"),
@@ -941,7 +1046,6 @@ LockTagIsTemp(const LOCKTAG *tag)
 		case LOCKTAG_RELATION_EXTEND:
 		case LOCKTAG_PAGE:
 		case LOCKTAG_TUPLE:
-		case LOCKTAG_RELATION_RESYNCHRONIZE:
 		case LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE:
 			/* check for lock on a temp relation */
 			/* field1 is dboid, field2 is reloid for all of these */
@@ -962,4 +1066,37 @@ LockTagIsTemp(const LOCKTAG *tag)
 			break;
 	}
 	return false;				/* default case */
+}
+
+/*
+ * If gp_enable_global_deadlock_detector is set off, we always
+ * have to upgrade lock level to avoid global deadlock, and then
+ * because of the current disign of AO table's visibility map,
+ * we have to keep upgrading locks for AO table.
+ */
+bool
+CondUpgradeRelLock(Oid relid, bool noWait)
+{
+	Relation rel;
+	bool upgrade = false;
+
+	if (!gp_enable_global_deadlock_detector)
+		return true;
+
+	/*
+	 * try_relation_open will throw error if
+	 * the relation is invaliad
+	 */
+	rel = try_relation_open(relid, NoLock, noWait);
+
+	if (!rel)
+		return false;
+	else if (RelationIsAppendOptimized(rel))
+		upgrade = true;
+	else
+		upgrade = false;
+
+	relation_close(rel, NoLock);
+
+	return upgrade;
 }

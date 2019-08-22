@@ -3,6 +3,9 @@
 #include <setjmp.h>
 #include "cmockery.h"
 
+#include "postgres.h"
+#include "utils/memutils.h"
+
 #include "../aocsam.c"
 
 /*
@@ -12,7 +15,7 @@
  * compression, no checksum) for scanning an existing column in ALTER
  * TABLE ADD COLUMN case.
  */
-void
+static void
 test__aocs_begin_headerscan(void **state)
 {
 	AOCSHeaderScanDesc desc;
@@ -55,7 +58,7 @@ test__aocs_begin_headerscan(void **state)
 }
 
 
-void
+static void
 test__aocs_addcol_init(void **state)
 {
 	AOCSAddColumnDesc desc;
@@ -70,11 +73,11 @@ test__aocs_addcol_init(void **state)
 
 	/* 2 newly added columns */
 	opts[3] = (StdRdOptions *) malloc(sizeof(StdRdOptions));
-	opts[3]->compresstype = "rle_type";
+	strcpy(opts[3]->compresstype, "rle_type");
 	opts[3]->compresslevel = 2;
 	opts[3]->blocksize = 8192;
 	opts[4] = (StdRdOptions *) malloc(sizeof(StdRdOptions));
-	opts[4]->compresstype = "none";
+	strcpy(opts[4]->compresstype, "none");
 	opts[4]->compresslevel = 0;
 	opts[4]->blocksize = 8192 * 2;
 
@@ -87,21 +90,21 @@ test__aocs_addcol_init(void **state)
 	expect_string(create_datumstreamwrite, compName, "none");
 	expect_value(create_datumstreamwrite, compLevel, 2);
 	expect_value(create_datumstreamwrite, compLevel, 0);
-	expect_value(create_datumstreamwrite, checksum, true);
-	expect_value(create_datumstreamwrite, checksum, true);
-	expect_value(create_datumstreamwrite, safeFSWriteSize, 0);
-	expect_value(create_datumstreamwrite, safeFSWriteSize, 0);
+	expect_value_count(create_datumstreamwrite, checksum, true, 2);
+	expect_value_count(create_datumstreamwrite, safeFSWriteSize, 0, 2);
 	expect_value(create_datumstreamwrite, maxsz, 8192);
 	expect_value(create_datumstreamwrite, maxsz, 8192 * 2);
-	expect_any(create_datumstreamwrite, attr);
-	expect_any(create_datumstreamwrite, attr);
-	expect_any(create_datumstreamwrite, relname);
-	expect_any(create_datumstreamwrite, relname);
-	expect_any(create_datumstreamwrite, title);
-	expect_any(create_datumstreamwrite, title);
+	expect_value(create_datumstreamwrite, needsWAL, true);
+	expect_value(create_datumstreamwrite, needsWAL, true);
+	expect_any_count(create_datumstreamwrite, attr, 2);
+	expect_any_count(create_datumstreamwrite, relname, 2);
+	expect_any_count(create_datumstreamwrite, title, 2);
 	will_return_count(create_datumstreamwrite, NULL, 2);
 
 	pgappendonly.checksum = true;
+	FormData_pg_class rel;
+	rel.relpersistence = RELPERSISTENCE_PERMANENT;
+	reldata.rd_rel = &rel;
 	reldata.rd_appendonly = &pgappendonly;
 	reldata.rd_att = (TupleDesc) malloc(sizeof(struct tupleDesc));
 	reldata.rd_att->attrs =

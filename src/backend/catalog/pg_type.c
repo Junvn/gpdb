@@ -3,22 +3,26 @@
  * pg_type.c
  *	  routines to support manipulation of the pg_type relation
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/catalog/pg_type.c,v 1.122 2008/11/02 01:45:27 tgl Exp $
+ *	  src/backend/catalog/pg_type.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/xact.h"
+#include "catalog/binary_upgrade.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/objectaccess.h"
 #include "catalog/oid_dispatch.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -119,36 +123,37 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	 * give it typtype = TYPTYPE_PSEUDO as extra insurance that it won't be
 	 * mistaken for a usable type.
 	 */
-	i = 0;
 	namestrcpy(&name, typeName);
-	values[i++] = NameGetDatum(&name);	/* typname */
-	values[i++] = ObjectIdGetDatum(typeNamespace);		/* typnamespace */
-	values[i++] = ObjectIdGetDatum(ownerId);	/* typowner */
-	values[i++] = Int16GetDatum(sizeof(int4));	/* typlen */
-	values[i++] = BoolGetDatum(true);	/* typbyval */
-	values[i++] = CharGetDatum(TYPTYPE_PSEUDO); /* typtype */
-	values[i++] = CharGetDatum(TYPCATEGORY_PSEUDOTYPE); /* typcategory */
-	values[i++] = BoolGetDatum(false);	/* typispreferred */
-	values[i++] = BoolGetDatum(false);	/* typisdefined */
-	values[i++] = CharGetDatum(DEFAULT_TYPDELIM);		/* typdelim */
-	values[i++] = ObjectIdGetDatum(InvalidOid); /* typrelid */
-	values[i++] = ObjectIdGetDatum(InvalidOid); /* typelem */
-	values[i++] = ObjectIdGetDatum(InvalidOid); /* typarray */
-	values[i++] = ObjectIdGetDatum(F_SHELL_IN); /* typinput */
-	values[i++] = ObjectIdGetDatum(F_SHELL_OUT);		/* typoutput */
-	values[i++] = ObjectIdGetDatum(InvalidOid); /* typreceive */
-	values[i++] = ObjectIdGetDatum(InvalidOid); /* typsend */
-	values[i++] = ObjectIdGetDatum(InvalidOid); /* typmodin */
-	values[i++] = ObjectIdGetDatum(InvalidOid); /* typmodout */
-	values[i++] = ObjectIdGetDatum(InvalidOid); /* typanalyze */
-	values[i++] = CharGetDatum('i');	/* typalign */
-	values[i++] = CharGetDatum('p');	/* typstorage */
-	values[i++] = BoolGetDatum(false);	/* typnotnull */
-	values[i++] = ObjectIdGetDatum(InvalidOid); /* typbasetype */
-	values[i++] = Int32GetDatum(-1);	/* typtypmod */
-	values[i++] = Int32GetDatum(0);		/* typndims */
-	nulls[i++] = true;			/* typdefaultbin */
-	nulls[i++] = true;			/* typdefault */
+	values[Anum_pg_type_typname - 1] = NameGetDatum(&name);
+	values[Anum_pg_type_typnamespace - 1] = ObjectIdGetDatum(typeNamespace);
+	values[Anum_pg_type_typowner - 1] = ObjectIdGetDatum(ownerId);
+	values[Anum_pg_type_typlen - 1] = Int16GetDatum(sizeof(int32));
+	values[Anum_pg_type_typbyval - 1] = BoolGetDatum(true);
+	values[Anum_pg_type_typtype - 1] = CharGetDatum(TYPTYPE_PSEUDO);
+	values[Anum_pg_type_typcategory - 1] = CharGetDatum(TYPCATEGORY_PSEUDOTYPE);
+	values[Anum_pg_type_typispreferred - 1] = BoolGetDatum(false);
+	values[Anum_pg_type_typisdefined - 1] = BoolGetDatum(false);
+	values[Anum_pg_type_typdelim - 1] = CharGetDatum(DEFAULT_TYPDELIM);
+	values[Anum_pg_type_typrelid - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_type_typelem - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_type_typarray - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_type_typinput - 1] = ObjectIdGetDatum(F_SHELL_IN);
+	values[Anum_pg_type_typoutput - 1] = ObjectIdGetDatum(F_SHELL_OUT);
+	values[Anum_pg_type_typreceive - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_type_typsend - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_type_typmodin - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_type_typmodout - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_type_typanalyze - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_type_typalign - 1] = CharGetDatum('i');
+	values[Anum_pg_type_typstorage - 1] = CharGetDatum('p');
+	values[Anum_pg_type_typnotnull - 1] = BoolGetDatum(false);
+	values[Anum_pg_type_typbasetype - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_type_typtypmod - 1] = Int32GetDatum(-1);
+	values[Anum_pg_type_typndims - 1] = Int32GetDatum(0);
+	values[Anum_pg_type_typcollation - 1] = ObjectIdGetDatum(InvalidOid);
+	nulls[Anum_pg_type_typdefaultbin - 1] = true;
+	nulls[Anum_pg_type_typdefault - 1] = true;
+	nulls[Anum_pg_type_typacl - 1] = true;
 
 	/*
 	 * create a new type tuple
@@ -181,8 +186,12 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 								 InvalidOid,
 								 false,
 								 InvalidOid,
+								 InvalidOid,
 								 NULL,
 								 false);
+
+	/* Post creation hook for new shell type */
+	InvokeObjectPostCreateHook(TypeRelationId, typoid, 0);
 
 	/*
 	 * clean up and return the type-oid
@@ -234,6 +243,7 @@ TypeCreateWithOptions(Oid newTypeOid,
 		   int32 typeMod,
 		   int32 typNDims,		/* Array dimensions for baseType */
 		   bool typeNotNull,
+		   Oid typeCollation,
 		   Datum typoptions)
 {
 	Relation	pg_type_desc;
@@ -245,6 +255,7 @@ TypeCreateWithOptions(Oid newTypeOid,
 	Datum		values[Natts_pg_type];
 	NameData	name;
 	int			i;
+	Acl		   *typacl = NULL;
 
 	/*
 	 * We assume that the caller validated the arguments individually, but did
@@ -315,14 +326,14 @@ TypeCreateWithOptions(Oid newTypeOid,
 		if (internalSize == -1 && !(alignment == 'i' || alignment == 'd'))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("alignment \"%c\" is invalid for variable-length type",
-							alignment)));
+			   errmsg("alignment \"%c\" is invalid for variable-length type",
+					  alignment)));
 		/* cstring must have char alignment */
 		if (internalSize == -2 && !(alignment == 'c'))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("alignment \"%c\" is invalid for variable-length type",
-							alignment)));
+			   errmsg("alignment \"%c\" is invalid for variable-length type",
+					  alignment)));
 	}
 
 	/* Only varlena types can be toasted */
@@ -342,55 +353,60 @@ TypeCreateWithOptions(Oid newTypeOid,
 	}
 
 	/*
-	 * initialize the *values information
+	 * insert data values
 	 */
-	i = 0;
 	namestrcpy(&name, typeName);
-	values[i++] = NameGetDatum(&name);	/* typname */
-	values[i++] = ObjectIdGetDatum(typeNamespace);		/* typnamespace */
-	values[i++] = ObjectIdGetDatum(ownerId);	/* typowner */
-	values[i++] = Int16GetDatum(internalSize);	/* typlen */
-	values[i++] = BoolGetDatum(passedByValue);	/* typbyval */
-	values[i++] = CharGetDatum(typeType);		/* typtype */
-	values[i++] = CharGetDatum(typeCategory);	/* typcategory */
-	values[i++] = BoolGetDatum(typePreferred);	/* typispreferred */
-	values[i++] = BoolGetDatum(true);	/* typisdefined */
-	values[i++] = CharGetDatum(typDelim);		/* typdelim */
-	values[i++] = ObjectIdGetDatum(relationOid);		/* typrelid */
-	values[i++] = ObjectIdGetDatum(elementType);		/* typelem */
-	values[i++] = ObjectIdGetDatum(arrayType);			/* typarray */
-	values[i++] = ObjectIdGetDatum(inputProcedure);		/* typinput */
-	values[i++] = ObjectIdGetDatum(outputProcedure);	/* typoutput */
-	values[i++] = ObjectIdGetDatum(receiveProcedure);	/* typreceive */
-	values[i++] = ObjectIdGetDatum(sendProcedure);		/* typsend */
-	values[i++] = ObjectIdGetDatum(typmodinProcedure);	/* typmodin */
-	values[i++] = ObjectIdGetDatum(typmodoutProcedure); /* typmodout */
-	values[i++] = ObjectIdGetDatum(analyzeProcedure);	/* typanalyze */
-	values[i++] = CharGetDatum(alignment);		/* typalign */
-	values[i++] = CharGetDatum(storage);		/* typstorage */
-	values[i++] = BoolGetDatum(typeNotNull);	/* typnotnull */
-	values[i++] = ObjectIdGetDatum(baseType);	/* typbasetype */
-	values[i++] = Int32GetDatum(typeMod);		/* typtypmod */
-	values[i++] = Int32GetDatum(typNDims);		/* typndims */
+	values[Anum_pg_type_typname - 1] = NameGetDatum(&name);
+	values[Anum_pg_type_typnamespace - 1] = ObjectIdGetDatum(typeNamespace);
+	values[Anum_pg_type_typowner - 1] = ObjectIdGetDatum(ownerId);
+	values[Anum_pg_type_typlen - 1] = Int16GetDatum(internalSize);
+	values[Anum_pg_type_typbyval - 1] = BoolGetDatum(passedByValue);
+	values[Anum_pg_type_typtype - 1] = CharGetDatum(typeType);
+	values[Anum_pg_type_typcategory - 1] = CharGetDatum(typeCategory);
+	values[Anum_pg_type_typispreferred - 1] = BoolGetDatum(typePreferred);
+	values[Anum_pg_type_typisdefined - 1] = BoolGetDatum(true);
+	values[Anum_pg_type_typdelim - 1] = CharGetDatum(typDelim);
+	values[Anum_pg_type_typrelid - 1] = ObjectIdGetDatum(relationOid);
+	values[Anum_pg_type_typelem - 1] = ObjectIdGetDatum(elementType);
+	values[Anum_pg_type_typarray - 1] = ObjectIdGetDatum(arrayType);
+	values[Anum_pg_type_typinput - 1] = ObjectIdGetDatum(inputProcedure);
+	values[Anum_pg_type_typoutput - 1] = ObjectIdGetDatum(outputProcedure);
+	values[Anum_pg_type_typreceive - 1] = ObjectIdGetDatum(receiveProcedure);
+	values[Anum_pg_type_typsend - 1] = ObjectIdGetDatum(sendProcedure);
+	values[Anum_pg_type_typmodin - 1] = ObjectIdGetDatum(typmodinProcedure);
+	values[Anum_pg_type_typmodout - 1] = ObjectIdGetDatum(typmodoutProcedure);
+	values[Anum_pg_type_typanalyze - 1] = ObjectIdGetDatum(analyzeProcedure);
+	values[Anum_pg_type_typalign - 1] = CharGetDatum(alignment);
+	values[Anum_pg_type_typstorage - 1] = CharGetDatum(storage);
+	values[Anum_pg_type_typnotnull - 1] = BoolGetDatum(typeNotNull);
+	values[Anum_pg_type_typbasetype - 1] = ObjectIdGetDatum(baseType);
+	values[Anum_pg_type_typtypmod - 1] = Int32GetDatum(typeMod);
+	values[Anum_pg_type_typndims - 1] = Int32GetDatum(typNDims);
+	values[Anum_pg_type_typcollation - 1] = ObjectIdGetDatum(typeCollation);
 
 	/*
 	 * initialize the default binary value for this type.  Check for nulls of
 	 * course.
 	 */
 	if (defaultTypeBin)
-		values[i] = CStringGetTextDatum(defaultTypeBin);
+		values[Anum_pg_type_typdefaultbin - 1] = CStringGetTextDatum(defaultTypeBin);
 	else
-		nulls[i] = true;
-	i++;						/* typdefaultbin */
+		nulls[Anum_pg_type_typdefaultbin - 1] = true;
 
 	/*
 	 * initialize the default value for this type.
 	 */
 	if (defaultTypeValue)
-		values[i] = CStringGetTextDatum(defaultTypeValue);
+		values[Anum_pg_type_typdefault - 1] = CStringGetTextDatum(defaultTypeValue);
 	else
-		nulls[i] = true;
-	i++;						/* typdefault */
+		nulls[Anum_pg_type_typdefault - 1] = true;
+
+	typacl = get_user_default_acl(ACL_OBJECT_TYPE, ownerId,
+								  typeNamespace);
+	if (typacl != NULL)
+		values[Anum_pg_type_typacl - 1] = PointerGetDatum(typacl);
+	else
+		nulls[Anum_pg_type_typacl - 1] = true;
 
 	/*
 	 * open pg_type and prepare to insert or update a row.
@@ -400,14 +416,13 @@ TypeCreateWithOptions(Oid newTypeOid,
 	 */
 	pg_type_desc = heap_open(TypeRelationId, RowExclusiveLock);
 
-	tup = SearchSysCacheCopy(TYPENAMENSP,
-							 CStringGetDatum(typeName),
-							 ObjectIdGetDatum(typeNamespace),
-							 0, 0);
+	tup = SearchSysCacheCopy2(TYPENAMENSP,
+							  CStringGetDatum(typeName),
+							  ObjectIdGetDatum(typeNamespace));
 	if (HeapTupleIsValid(tup))
 	{
 		/*
-		 * check that the type is not already defined.	It may exist as a
+		 * check that the type is not already defined.  It may exist as a
 		 * shell type, however.
 		 */
 		if (((Form_pg_type) GETSTRUCT(tup))->typisdefined)
@@ -430,10 +445,11 @@ TypeCreateWithOptions(Oid newTypeOid,
 		 * Okay to update existing shell type tuple
 		 */
 		tup = heap_modify_tuple(tup,
-							   RelationGetDescr(pg_type_desc),
-							   values,
-							   nulls,
-							   replaces);
+								RelationGetDescr(pg_type_desc),
+								values,
+								nulls,
+								replaces);
+
 		simple_heap_update(pg_type_desc, &tup->t_self, tup);
 
 		typeObjectId = HeapTupleGetOid(tup);
@@ -443,12 +459,13 @@ TypeCreateWithOptions(Oid newTypeOid,
 	else
 	{
 		tup = heap_form_tuple(RelationGetDescr(pg_type_desc),
-							 values,
-							 nulls);
+							  values,
+							  nulls);
 
-		/* Force the OID if requested by caller, else heap_insert does it */
+		/* Force the OID if requested by caller */
 		if (OidIsValid(newTypeOid))
 			HeapTupleSetOid(tup, newTypeOid);
+		/* else allow system to assign oid */
 
 		typeObjectId = simple_heap_insert(pg_type_desc, tup);
 	}
@@ -475,10 +492,14 @@ TypeCreateWithOptions(Oid newTypeOid,
 								 elementType,
 								 isImplicitArray,
 								 baseType,
+								 typeCollation,
 								 (defaultTypeBin ?
 								  stringToNode(defaultTypeBin) :
 								  NULL),
 								 rebuildDeps);
+
+	/* Post creation hook for new type */
+	InvokeObjectPostCreateHook(TypeRelationId, typeObjectId, 0);
 
 	/*
 	 * finish up with pg_type
@@ -522,7 +543,8 @@ TypeCreate(Oid newTypeOid,
 		   char storage,
 		   int32 typeMod,
 		   int32 typNDims,
-		   bool typeNotNull)
+		   bool typeNotNull,
+		   Oid typeCollation)
 {
 	return TypeCreateWithOptions(newTypeOid,
 		   typeName,
@@ -554,6 +576,7 @@ TypeCreate(Oid newTypeOid,
 		   typeMod,
 		   typNDims,
 		   typeNotNull,
+		   typeCollation,
 		   (Datum) 0);
 }
 
@@ -562,7 +585,11 @@ TypeCreate(Oid newTypeOid,
  *
  * If rebuild is true, we remove existing dependencies and rebuild them
  * from scratch.  This is needed for ALTER TYPE, and also when replacing
- * a shell type.
+ * a shell type.  We don't remove an existing extension dependency, though.
+ * (That means an extension can't absorb a shell type created in another
+ * extension, nor ALTER a type created by another extension.  Also, if it
+ * replaces a free-standing shell type or ALTERs a free-standing type,
+ * that type will become a member of the extension.)
  */
 void
 GenerateTypeDependencies(Oid typeNamespace,
@@ -580,16 +607,18 @@ GenerateTypeDependencies(Oid typeNamespace,
 						 Oid elementType,
 						 bool isImplicitArray,
 						 Oid baseType,
+						 Oid typeCollation,
 						 Node *defaultExpr,
 						 bool rebuild)
 {
 	ObjectAddress myself,
 				referenced;
 
+	/* If rebuild, first flush old dependencies, except extension deps */
 	if (rebuild)
 	{
 		deleteDependencyRecordsFor(TypeRelationId, typeObjectId, true);
-		deleteSharedDependencyRecordsFor(TypeRelationId, typeObjectId);
+		deleteSharedDependencyRecordsFor(TypeRelationId, typeObjectId, 0);
 	}
 
 	myself.classId = TypeRelationId;
@@ -597,7 +626,7 @@ GenerateTypeDependencies(Oid typeNamespace,
 	myself.objectSubId = 0;
 
 	/*
-	 * Make dependency on namespace and shared dependency on owner.
+	 * Make dependencies on namespace, owner, extension.
 	 *
 	 * For a relation rowtype (that's not a composite type), we should skip
 	 * these because we'll depend on them indirectly through the pg_class
@@ -718,6 +747,16 @@ GenerateTypeDependencies(Oid typeNamespace,
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
 
+	/* Normal dependency from a domain to its collation. */
+	/* We know the default collation is pinned, so don't bother recording it */
+	if (OidIsValid(typeCollation) && typeCollation != DEFAULT_COLLATION_OID)
+	{
+		referenced.classId = CollationRelationId;
+		referenced.objectId = typeCollation;
+		referenced.objectSubId = 0;
+		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	}
+
 	/* Normal dependency on the default expression. */
 	if (defaultExpr)
 		recordDependencyOnExpr(&myself, defaultExpr, NIL, DEPENDENCY_NORMAL);
@@ -739,12 +778,11 @@ RenameTypeInternal(Oid typeOid, const char *newTypeName, Oid typeNamespace)
 	HeapTuple	tuple;
 	Form_pg_type typ;
 	Oid			arrayOid;
+	Oid			oldTypeOid;
 
 	pg_type_desc = heap_open(TypeRelationId, RowExclusiveLock);
 
-	tuple = SearchSysCacheCopy(TYPEOID,
-							   ObjectIdGetDatum(typeOid),
-							   0, 0, 0);
+	tuple = SearchSysCacheCopy1(TYPEOID, ObjectIdGetDatum(typeOid));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for type %u", typeOid);
 	typ = (Form_pg_type) GETSTRUCT(tuple);
@@ -754,14 +792,28 @@ RenameTypeInternal(Oid typeOid, const char *newTypeName, Oid typeNamespace)
 
 	arrayOid = typ->typarray;
 
-	/* Just to give a more friendly error than unique-index violation */
-	if (SearchSysCacheExists(TYPENAMENSP,
-							 CStringGetDatum(newTypeName),
-							 ObjectIdGetDatum(typeNamespace),
-							 0, 0))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("type \"%s\" already exists", newTypeName)));
+	/* Check for a conflicting type name. */
+	oldTypeOid = GetSysCacheOid2(TYPENAMENSP,
+								 CStringGetDatum(newTypeName),
+								 ObjectIdGetDatum(typeNamespace));
+
+	/*
+	 * If there is one, see if it's an autogenerated array type, and if so
+	 * rename it out of the way.  (But we must skip that for a shell type
+	 * because moveArrayTypeName will do the wrong thing in that case.)
+	 * Otherwise, we can at least give a more friendly error than unique-index
+	 * violation.
+	 */
+	if (OidIsValid(oldTypeOid))
+	{
+		if (get_typisdefined(oldTypeOid) &&
+			moveArrayTypeName(oldTypeOid, newTypeName, typeNamespace))
+			 /* successfully dodged the problem */ ;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("type \"%s\" already exists", newTypeName)));
+	}
 
 	/* OK, do the rename --- tuple is a copy, so OK to scribble on it */
 	namestrcpy(&(typ->typname), newTypeName);
@@ -771,11 +823,17 @@ RenameTypeInternal(Oid typeOid, const char *newTypeName, Oid typeNamespace)
 	/* update the system catalog indexes */
 	CatalogUpdateIndexes(pg_type_desc, tuple);
 
+	InvokeObjectPostAlterHook(TypeRelationId, typeOid, 0);
+
 	heap_freetuple(tuple);
 	heap_close(pg_type_desc, RowExclusiveLock);
 
-	/* If the type has an array type, recurse to handle that */
-	if (OidIsValid(arrayOid))
+	/*
+	 * If the type has an array type, recurse to handle that.  But we don't
+	 * need to do anything more if we already renamed that array type above
+	 * (which would happen when, eg, renaming "foo" to "_foo").
+	 */
+	if (OidIsValid(arrayOid) && arrayOid != oldTypeOid)
 	{
 		char	   *arrname = makeArrayTypeName(newTypeName, typeNamespace);
 
@@ -815,10 +873,9 @@ makeArrayTypeName(const char *typeName, Oid typeNamespace)
 			memcpy(arr + i, typeName, NAMEDATALEN - i);
 			truncate_identifier(arr, NAMEDATALEN, false);
 		}
-		if (!SearchSysCacheExists(TYPENAMENSP,
-								  CStringGetDatum(arr),
-								  ObjectIdGetDatum(typeNamespace),
-								  0, 0))
+		if (!SearchSysCacheExists2(TYPENAMENSP,
+								   CStringGetDatum(arr),
+								   ObjectIdGetDatum(typeNamespace)))
 			break;
 	}
 

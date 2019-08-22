@@ -10,6 +10,7 @@ include $(top_srcdir)/src/Makefile.mock
 override CPPFLAGS+= -I$(top_srcdir)/src/backend/libpq \
 					-I$(libpq_srcdir) \
 					-I$(top_srcdir)/src/backend/postmaster \
+					-I$(top_srcdir)/src/test/unit/mock/ \
 					-I. -I$(top_builddir)/src/port \
 					-DDLSUFFIX=$(DLSUFFIX) \
 					-I$(top_srcdir)/src/backend/utils/stat
@@ -35,35 +36,26 @@ EXCL_OBJS=\
 # of the test programs. Feel free to link them back (i.e. remove them from
 # this exclusion list) as needed.
 EXCL_OBJS+=\
-	src/backend/access/gist/%.o \
-	src/backend/access/gin/%.o \
 	src/backend/access/hash/hash.o \
 	src/backend/access/hash/hashsearch.o \
 	\
-	src/backend/utils/adt/ascii.o \
 	src/backend/utils/adt/cash.o \
 	src/backend/utils/adt/char.o \
 	src/backend/utils/adt/complex_type.o \
-	src/backend/utils/adt/domains.o \
 	src/backend/utils/adt/enum.o \
-	src/backend/utils/adt/geo_ops.o \
 	src/backend/utils/adt/geo_selfuncs.o \
-	src/backend/utils/adt/gp_dump_oids.o \
 	src/backend/utils/adt/gp_optimizer_functions.o \
 	src/backend/utils/adt/interpolate.o \
-	src/backend/utils/adt/json.o \
 	src/backend/utils/adt/jsonfuncs.o \
 	src/backend/utils/adt/like.o \
 	src/backend/utils/adt/like_match.o \
 	src/backend/utils/adt/lockfuncs.o \
 	src/backend/utils/adt/mac.o \
 	src/backend/utils/adt/matrix.o \
-	src/backend/utils/adt/misc.o \
 	src/backend/utils/adt/oracle_compat.o \
 	src/backend/utils/adt/pgstatfuncs.o \
 	src/backend/utils/adt/pivot.o \
 	src/backend/utils/adt/pseudotypes.o \
-	src/backend/utils/adt/quote.o \
 	src/backend/utils/adt/rowtypes.o \
 	src/backend/utils/adt/tsginidx.o \
 	src/backend/utils/adt/tsgistidx.o \
@@ -79,7 +71,6 @@ EXCL_OBJS+=\
 	src/backend/utils/adt/tsvector_parser.o \
 	src/backend/utils/adt/txid.o \
 	src/backend/utils/adt/uuid.o \
-	src/backend/utils/adt/xid.o \
 	src/backend/tsearch/dict.o \
 	src/backend/tsearch/dict_ispell.o \
 	src/backend/tsearch/dict_simple.o \
@@ -103,12 +94,6 @@ MOCK_OBJS=\
 # mock that instead of linking with the real library.
 ifeq ($(enable_orca),yes)
 MOCK_OBJS+=$(top_srcdir)/src/test/unit/mock/gpopt_mock.o
-endif
-
-# No test programs in GPDB currently exercise codegen, so
-# mock that instead of linking with the real library.
-ifeq ($(enable_codegen),yes)
-MOCK_OBJS+=$(top_srcdir)/src/test/unit/mock/gpcodegen_mock.o
 endif
 
 # $(OBJFILES) contains %/objfiles.txt, because src/backend/Makefile will

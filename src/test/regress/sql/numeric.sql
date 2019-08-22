@@ -655,6 +655,14 @@ INSERT INTO fract_only VALUES (8, '0.00017');
 SELECT * FROM fract_only;
 DROP TABLE fract_only;
 
+-- Check inf/nan conversion behavior
+SELECT 'NaN'::float8::numeric;
+SELECT 'Infinity'::float8::numeric;
+SELECT '-Infinity'::float8::numeric;
+SELECT 'NaN'::float4::numeric;
+SELECT 'Infinity'::float4::numeric;
+SELECT '-Infinity'::float4::numeric;
+
 -- Simple check that ceil(), floor(), and round() work correctly
 CREATE TABLE ceil_floor_round (a numeric);
 INSERT INTO ceil_floor_round VALUES ('-5.5');
@@ -732,7 +740,7 @@ DROP TABLE width_bucket_test;
 
 -- TO_CHAR()
 --
-SELECT '' AS to_char_1, to_char(val, '9G999G999G999G999G999') 
+SELECT '' AS to_char_1, to_char(val, '9G999G999G999G999G999')
 	FROM num_data;
 
 SELECT '' AS to_char_2, to_char(val, '9G999G999G999G999G999D999G999G999G999G999')
@@ -762,6 +770,7 @@ SELECT '' AS to_char_19, to_char(val, 'FMS 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 . 9 9
 SELECT '' AS to_char_20, to_char(val, E'99999 "text" 9999 "9999" 999 "\\"text between quote marks\\"" 9999') FROM num_data;
 SELECT '' AS to_char_21, to_char(val, '999999SG9999999999')			FROM num_data;
 SELECT '' AS to_char_22, to_char(val, 'FM9999999999999999.999999999999999')	FROM num_data;
+SELECT '' AS to_char_23, to_char(val, '9.999EEEE')				FROM num_data;
 
 SELECT '' AS to_char_24, to_char('100'::numeric, 'FM999.9');
 SELECT '' AS to_char_25, to_char('100'::numeric, 'FM999.');
@@ -811,6 +820,18 @@ INSERT INTO num_input_test(n1) VALUES (' N aN ');
 SELECT * FROM num_input_test;
 
 --
+-- Test some corner cases for multiplication
+--
+
+select 4790999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;
+
+select 4789999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;
+
+select 4770999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;
+
+select 4769999999999999999999999999999999999999999999999999999999999999999999999999999999999999 * 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999;
+
+--
 -- Test some corner cases for division
 --
 
@@ -827,3 +848,12 @@ select 12345678901234567890 % 123;
 select 12345678901234567890 / 123;
 select div(12345678901234567890, 123);
 select div(12345678901234567890, 123) * 123 + 12345678901234567890 % 123;
+
+--
+-- Test code path for raising to integer powers
+--
+
+select 10.0 ^ -2147483648 as rounds_to_zero;
+select 10.0 ^ -2147483647 as rounds_to_zero;
+select 10.0 ^ 2147483647 as overflows;
+select 117743296169.0 ^ 1000000000 as overflows;

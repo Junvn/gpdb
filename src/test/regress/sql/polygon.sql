@@ -21,12 +21,12 @@ INSERT INTO POLYGON_TBL(f1) VALUES ('(2.0,0.0),(2.0,4.0),(0.0,0.0)');
 
 INSERT INTO POLYGON_TBL(f1) VALUES ('(3.0,1.0),(3.0,3.0),(1.0,0.0)');
 
--- degenerate polygons 
+-- degenerate polygons
 INSERT INTO POLYGON_TBL(f1) VALUES ('(0.0,0.0)');
 
 INSERT INTO POLYGON_TBL(f1) VALUES ('(0.0,1.0),(0.0,1.0)');
 
--- bad polygon input strings 
+-- bad polygon input strings
 INSERT INTO POLYGON_TBL(f1) VALUES ('0.0');
 
 INSERT INTO POLYGON_TBL(f1) VALUES ('(0.0 0.0');
@@ -40,42 +40,42 @@ INSERT INTO POLYGON_TBL(f1) VALUES ('asdf');
 
 SELECT '' AS four, * FROM POLYGON_TBL;
 
--- overlap 
+-- overlap
 SELECT '' AS three, p.*
    FROM POLYGON_TBL p
    WHERE p.f1 && '(3.0,1.0),(3.0,3.0),(1.0,0.0)';
 
--- left overlap 
-SELECT '' AS four, p.* 
+-- left overlap
+SELECT '' AS four, p.*
    FROM POLYGON_TBL p
    WHERE p.f1 &< '(3.0,1.0),(3.0,3.0),(1.0,0.0)';
 
--- right overlap 
-SELECT '' AS two, p.* 
+-- right overlap
+SELECT '' AS two, p.*
    FROM POLYGON_TBL p
    WHERE p.f1 &> '(3.0,1.0),(3.0,3.0),(1.0,0.0)';
 
--- left of 
+-- left of
 SELECT '' AS one, p.*
    FROM POLYGON_TBL p
    WHERE p.f1 << '(3.0,1.0),(3.0,3.0),(1.0,0.0)';
 
--- right of 
+-- right of
 SELECT '' AS zero, p.*
    FROM POLYGON_TBL p
    WHERE p.f1 >> '(3.0,1.0),(3.0,3.0),(1.0,0.0)';
 
--- contained 
-SELECT '' AS one, p.* 
+-- contained
+SELECT '' AS one, p.*
    FROM POLYGON_TBL p
    WHERE p.f1 <@ polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)';
 
--- same 
+-- same
 SELECT '' AS one, p.*
    FROM POLYGON_TBL p
    WHERE p.f1 ~= polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)';
 
--- contains 
+-- contains
 SELECT '' AS one, p.*
    FROM POLYGON_TBL p
    WHERE p.f1 @> polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)';
@@ -93,27 +93,81 @@ SELECT '' AS one, p.*
 --
 --	0 1 2 3 4
 --
--- left of 
+-- left of
 SELECT polygon '(2.0,0.0),(2.0,4.0),(0.0,0.0)' << polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)' AS false;
 
--- left overlap 
+-- left overlap
 SELECT polygon '(2.0,0.0),(2.0,4.0),(0.0,0.0)' << polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)' AS true;
 
--- right overlap 
+-- right overlap
 SELECT polygon '(2.0,0.0),(2.0,4.0),(0.0,0.0)' &> polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)' AS false;
 
--- right of 
+-- right of
 SELECT polygon '(2.0,0.0),(2.0,4.0),(0.0,0.0)' >> polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)' AS false;
 
--- contained in 
+-- contained in
 SELECT polygon '(2.0,0.0),(2.0,4.0),(0.0,0.0)' <@ polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)' AS false;
 
--- contains 
+-- contains
 SELECT polygon '(2.0,0.0),(2.0,4.0),(0.0,0.0)' @> polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)' AS false;
 
--- same 
+--     +------------------------+
+--     |    *---*               1
+--     |  + |   |
+--     |  2 *---*
+--     +------------------------+
+--                              3
+--     endpoints '+' is ofr one polygon, '*' - for another
+--     Edges 1-2, 2-3 are not shown on picture
+SELECT '((0,4),(6,4),(1,2),(6,0),(0,0))'::polygon @> '((2,1),(2,3),(3,3),(3,1))'::polygon AS "false";
+
+--     +-----------+
+--     |    *---* /
+--     |    |   |/
+--     |    |   +
+--     |    |   |\
+--     |    *---* \
+--     +-----------+
+SELECT '((0,4),(6,4),(3,2),(6,0),(0,0))'::polygon @> '((2,1),(2,3),(3,3),(3,1))'::polygon AS "true";
+
+--     +-----------------+
+--     |                 |
+--     |   +---*---*-----+
+--     |   |   |   |
+--     |   +---*---*-----+
+--     |                 |
+--     +-----------------+
+SELECT '((1,1),(1,4),(5,4),(5,3),(2,3),(2,2),(5,2),(5,1))'::polygon @> '((3,2),(3,3),(4,3),(4,2))'::polygon AS "false";
+
+--     +---------+
+--     |         |
+--     |    *----*
+--     |    |    |
+--     |    *----*
+--     |         |
+--     +---------+
+SELECT '((0,0),(0,3),(3,3),(3,0))'::polygon @> '((2,1),(2,2),(3,2),(3,1))'::polygon AS "true";
+
+-- same
 SELECT polygon '(2.0,0.0),(2.0,4.0),(0.0,0.0)' ~= polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)' AS false;
 
--- overlap 
+-- overlap
 SELECT polygon '(2.0,0.0),(2.0,4.0),(0.0,0.0)' && polygon '(3.0,1.0),(3.0,3.0),(1.0,0.0)' AS true;
 
+--     +--------------------+
+--     |    *---*       	1
+--     |  + |   |
+--     |  2 *---*
+--     +--------------------+
+--                      	3
+--     Edges 1-2, 2-3 are not shown on picture
+SELECT '((0,4),(6,4),(1,2),(6,0),(0,0))'::polygon && '((2,1),(2,3),(3,3),(3,1))'::polygon AS "true";
+
+--     +--+ *--*
+--     |  | |  |
+--     |  | *--*
+--     |  +----+
+--     |       |
+--     +-------+
+SELECT '((1,4),(1,1),(4,1),(4,2),(2,2),(2,4),(1,4))'::polygon && '((3,3),(4,3),(4,4),(3,4),(3,3))'::polygon AS "false";
+SELECT '((200,800),(800,800),(800,200),(200,200))' &&  '(1000,1000,0,0)'::polygon AS "true";

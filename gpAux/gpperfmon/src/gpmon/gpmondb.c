@@ -523,8 +523,7 @@ void gpdb_get_hostlist(int* hostcnt, host_t** host_table, apr_pool_t* global_poo
 	int e;
 
 	// 0 -- hostname, 1 -- address, 2 -- datadir, 3 -- is_master,
-	const char *QUERY = "SELECT distinct hostname, address, case when content < 0 then 1 else 0 end as is_master, MAX(fselocation) as datadir FROM pg_filespace_entry "
-			    "JOIN gp_segment_configuration on (dbid = fsedbid) WHERE fsefsoid = (select oid from pg_filespace where fsname='pg_system') "
+	const char *QUERY = "SELECT distinct hostname, address, case when content < 0 then 1 else 0 end as is_master, MAX(datadir) as datadir FROM gp_segment_configuration "
 		  	    "GROUP BY (hostname, address, is_master) order by hostname";
 
 	if (0 != (e = apr_pool_create_alloc(&pool, NULL)))
@@ -534,8 +533,7 @@ void gpdb_get_hostlist(int* hostcnt, host_t** host_table, apr_pool_t* global_poo
 
 	const char* errmsg = gpdb_exec(&conn, &result, QUERY);
 
-	TR2((QUERY));
-	TR2(("\n"));
+	TR2(("%s\n", QUERY));
 
 	if (errmsg)
 	{
@@ -870,7 +868,7 @@ static apr_status_t check_partition(const char* tbl, apr_pool_t* pool, PGconn* c
 
 	if (year[0] < 1 || month[0] < 1 || year[0] > 2030 || month[0] > 12)
 	{
-		gpmon_warning(FLINE, "invalid current month/year in check_partition %u/%u\n", month, year);
+		gpmon_warning(FLINE, "invalid current month/year in check_partition %u/%u\n", month[0], year[0]);
 		return APR_EGENERAL;
 	}
 
@@ -1368,7 +1366,7 @@ apr_hash_t *get_active_queries(apr_pool_t *pool)
 		return NULL;
 	}
 
-	const char *qry= "SELECT sess_id, current_query FROM pg_stat_activity;";
+	const char *qry= "SELECT sess_id, query FROM pg_stat_activity;";
 	const char *errmsg = gpdb_exec_only(conn, &result, qry);
 	if (errmsg)
 	{
@@ -1659,7 +1657,7 @@ void upgrade_log_alert_table_distributed_key(PGconn* conn)
 	    INNER JOIN pg_attribute b on a.oid=b.attrelid\
 	    INNER JOIN gp_distribution_policy c on a.oid = c.localoid\
 	    INNER JOIN pg_namespace d on a.relnamespace = d.oid\
-	    WHERE a.relkind = 'r' AND b.attnum = any(c.attrnums) AND a.relname = 'log_alert_history'";
+	    WHERE a.relkind = 'r' AND b.attnum = any(c.distkey) AND a.relname = 'log_alert_history'";
 
 	PGresult* result = NULL;
 	const char* errmsg = gpdb_exec_only(conn, &result, qry);

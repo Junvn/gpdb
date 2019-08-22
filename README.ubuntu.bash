@@ -25,6 +25,7 @@ apt-get install -y \
   libxerces-c-dev \
   libxml2-dev \
   libyaml-dev \
+  libzstd-dev \
   locales \
   net-tools \
   ninja-build \
@@ -33,7 +34,6 @@ apt-get install -y \
   openssl \
   python-dev \
   python-lockfile \
-  python-paramiko \
   python-pip \
   python-psutil \
   python-yaml \

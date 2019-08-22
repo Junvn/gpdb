@@ -2,7 +2,7 @@
 #
 # Makefile for src/backend/snowball
 #
-# $PostgreSQL: pgsql/src/backend/snowball/Makefile,v 1.6 2008/04/07 14:15:58 petere Exp $
+# src/backend/snowball/Makefile
 #
 #-------------------------------------------------------------------------
 
@@ -71,11 +71,7 @@ LANGUAGES=  \
 SQLSCRIPT= snowball_create.sql
 DICTDIR=tsearch_data
 
-ifdef VPATH
-override VPATH := $(srcdir)/libstemmer:$(VPATH)
-else
-VPATH = $(srcdir)/libstemmer
-endif
+VPATH += $(srcdir)/libstemmer
 
 NAME := dict_snowball
 rpath =
@@ -85,9 +81,8 @@ all: all-shared-lib $(SQLSCRIPT)
 include $(top_srcdir)/src/Makefile.shlib
 
 $(SQLSCRIPT): Makefile snowball_func.sql.in snowball.sql.in
-ifeq ($(enable_shared), yes)
 	echo '-- Language-specific snowball dictionaries' > $@
-	cat $(srcdir)/snowball_func.sql.in >> $@	
+	cat $(srcdir)/snowball_func.sql.in >> $@
 	@set -e; \
 	set $(LANGUAGES) ; \
 	while [ "$$#" -gt 0 ] ; \
@@ -108,9 +103,6 @@ ifeq ($(enable_shared), yes)
 			sed -e "s#_NONASCDICTNAME_#$${nonascdictname}_stem#g" | \
 			sed -e "s#_STOPWORDS_#$$stop#g" ; \
 	done >> $@
-else
-	echo "-- No language-specific snowball dictionaries, for lack of shared library support" > $@
-endif
 
 install: all installdirs install-lib
 	$(INSTALL_DATA) $(SQLSCRIPT) '$(DESTDIR)$(datadir)'
@@ -125,7 +117,7 @@ install: all installdirs install-lib
 	done
 
 installdirs: installdirs-lib
-	$(mkinstalldirs) '$(DESTDIR)$(datadir)' '$(DESTDIR)$(datadir)/$(DICTDIR)'
+	$(MKDIR_P) '$(DESTDIR)$(datadir)' '$(DESTDIR)$(datadir)/$(DICTDIR)'
 
 uninstall: uninstall-lib
 	rm -f '$(DESTDIR)$(datadir)/$(SQLSCRIPT)'

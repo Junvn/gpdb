@@ -1,6 +1,12 @@
 --
 -- OLAP_GROUP - Test OLAP GROUP BY extensions
 --
+-- Many of the tests here test different queries that are expected to
+-- produce the same result. Such queries are kept in "start_equiv" /
+-- "end_equiv" comments. We used to have special support in gpdiff.pl to
+-- check that they really produce the same result, but they no longer
+-- bear any special meaning, the markers are for human consumption only.
+--
 
 -- Syntactic equivalents --
 
@@ -59,7 +65,7 @@ select cn, vn, pn, sum(qty*prc) from sale group by cube (cn, vn, pn);
 select cn, vn, pn, sum(qty*prc) from sale group by grouping sets ((), (cn), (vn), (pn), (cn,vn), (cn,pn), (vn,pn), (cn,vn,pn));
 --end_equiv
 
--- start_equiv
+--start_equiv
 select cn, vn, pn, count(distinct dt) from sale group by cn, vn, pn
 union all
 select cn, vn, null, count(distinct dt) from sale group by cn, vn
@@ -69,7 +75,7 @@ union all
 select null, null, null, count(distinct dt) from sale;    --mvd 1,2,3->4
 select cn, vn, pn, count(distinct dt) from sale group by rollup(cn,vn,pn);--mvd 1,2,3->4
 select cn, vn, pn, count(distinct dt) from sale group by grouping sets((), (cn), (cn,vn), (cn,vn,pn));--mvd 1,2,3->4
--- end_equiv
+--end_equiv
 
 --start_equiv order 1,2,3
 select cn, vn, pn, count(distinct dt) from sale group by cn, vn, pn
@@ -91,7 +97,6 @@ order by 1,2,3; -- order 1,2,3
 select cn, vn, pn, count(distinct dt) from sale group by cube (cn, vn, pn) order by 1,2,3; -- order 1,2,3
 select cn, vn, pn, count(distinct dt) from sale group by grouping sets ((), (cn), (vn), (pn), (cn,vn), (cn,pn), (vn,pn), (cn,vn,pn)) order by 1,2,3; -- order 1,2,3
 --end_equiv
-
 --start_equiv order 1,2,3
 select cn, vn, pn, sum(qty*prc) from sale group by cn, vn, pn
 union all
@@ -173,7 +178,6 @@ order by 1,2,3; -- order 1,2,3
 select cn, vn, pn, count(distinct dt) from sale group by cube (cn, vn, pn) order by 1,2,3; -- order 1,2,3
 select cn, vn, pn, count(distinct dt) from sale group by grouping sets ((), (cn), (vn), (pn), (cn,vn), (cn,pn), (vn,pn), (cn,vn,pn)) order by 1,2,3; -- order 1,2,3
 --end_equiv
-
 
 -- Ordinary Grouping Set Specifications --
 
@@ -596,11 +600,6 @@ drop table s6756 cascade; --ignore
 -- begin MPP-14021
 select sum((select prc from sale where cn = s.cn and vn = s.vn and pn = s.pn)) from sale s;
 -- end MPP-14021
-
--- begin MPP-14125: if prelim function is missing, do not choose hash agg.
-create temp table mpp14125 as select repeat('a', a) a, a % 10 b from generate_series(1, 100)a;
-explain select string_agg(a) from mpp14125 group by b;
--- end MPP-14125
 
 -- Test COUNT in a subquery
 create table prod_agg (sale integer, prod varchar);

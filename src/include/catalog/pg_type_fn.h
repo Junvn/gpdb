@@ -1,13 +1,13 @@
 /*-------------------------------------------------------------------------
  *
  * pg_type_fn.h
- * 	 prototypes for functions in catalog/pg_type.c
+ *	 prototypes for functions in catalog/pg_type.c
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/catalog/pg_type_fn.h,v 1.2 2008/07/30 17:05:05 tgl Exp $
+ * src/include/catalog/pg_type_fn.h
  *
  *-------------------------------------------------------------------------
  */
@@ -50,7 +50,8 @@ extern Oid TypeCreate(Oid newTypeOid,
 		   char storage,
 		   int32 typeMod,
 		   int32 typNDims,
-		   bool typeNotNull);
+		   bool typeNotNull,
+		   Oid typeCollation);
 
 extern Oid TypeCreateWithOptions(Oid newtypeOid,
 		   const char *typeName,
@@ -82,6 +83,7 @@ extern Oid TypeCreateWithOptions(Oid newtypeOid,
 		   int32 typeMod,
 		   int32 typNDims,
 		   bool typeNotNull,
+		   Oid typeCollation,
 		   Datum typoptions);
 
 extern void GenerateTypeDependencies(Oid typeNamespace,
@@ -99,11 +101,12 @@ extern void GenerateTypeDependencies(Oid typeNamespace,
 						 Oid elementType,
 						 bool isImplicitArray,
 						 Oid baseType,
+						 Oid typeCollation,
 						 Node *defaultExpr,
 						 bool rebuild);
 
 extern void RenameTypeInternal(Oid typeOid, const char *newTypeName,
-		   Oid typeNamespace);
+				   Oid typeNamespace);
 
 extern char *makeArrayTypeName(const char *typeName, Oid typeNamespace);
 

@@ -3,26 +3,24 @@
  * vacuum.c
  *	  The postgres vacuum cleaner.
  *
- * This file includes the "full" version of VACUUM, as well as control code
- * used by all three of full VACUUM, lazy VACUUM, and ANALYZE.	See
- * vacuumlazy.c and analyze.c for the rest of the code for the latter two.
+ * This file now includes only control and dispatch code for VACUUM and
+ * ANALYZE commands.  Regular VACUUM is implemented in vacuumlazy.c,
+ * ANALYZE in analyze.c, and VACUUM FULL is a variant of CLUSTER, handled
+ * in cluster.c.
  *
  *
  * Portions Copyright (c) 2005-2010, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/vacuum.c,v 1.383 2008/12/17 09:15:02 heikki Exp $
+ *	  src/backend/commands/vacuum.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
-#include <sys/time.h>
-#include <unistd.h>
 
 #include <math.h>
 
@@ -31,11 +29,11 @@
 #include "access/heapam.h"
 #include "access/appendonlywriter.h"
 #include "access/appendonlytid.h"
-#include "catalog/heap.h"
-#include "access/transam.h"
 #include "access/visibilitymap.h"
+#include "access/htup_details.h"
+#include "access/multixact.h"
+#include "access/transam.h"
 #include "access/xact.h"
-#include "access/xlog.h"
 #include "access/appendonly_compaction.h"
 #include "access/appendonly_visimap.h"
 #include "access/aocs_compaction.h"
@@ -46,153 +44,55 @@
 #include "catalog/pg_index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_namespace.h"
-#include "catalog/storage.h"
-#include "commands/dbcommands.h"
+#include "commands/analyzeutils.h"
+#include "commands/cluster.h"
 #include "commands/tablecmds.h"
 #include "commands/vacuum.h"
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbpartition.h"
+#include "cdb/cdbutil.h"
 #include "cdb/cdbvars.h"
-#include "cdb/cdbsrlz.h"
 #include "cdb/cdbdispatchresult.h"      /* CdbDispatchResults */
-#include "cdb/cdbfilerepprimary.h"
-#include "cdb/cdbpersistentfilesysobj.h"
 #include "cdb/cdbappendonlyblockdirectory.h"
-#include "executor/executor.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"             /* pq_beginmessage() etc. */
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "parser/parse_relation.h"
 #include "postmaster/autovacuum.h"
 #include "storage/bufmgr.h"
-#include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
-#include "utils/faultinjector.h"
-#include "utils/flatfiles.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
-#include "utils/inval.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/pg_rusage.h"
-#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
 #include "access/distributedlog.h"
+#include "catalog/heap.h"
+#include "catalog/oid_dispatch.h"
+#include "catalog/pg_inherits_fn.h"
 #include "libpq-fe.h"
 #include "libpq-int.h"
 #include "nodes/makefuncs.h"     /* makeRangeVar */
 #include "pgstat.h"
+#include "utils/faultinjector.h"
+#include "utils/lsyscache.h"
+#include "utils/pg_rusage.h"
 
 
 /*
  * GUC parameters
  */
 int			vacuum_freeze_min_age;
+int			vacuum_freeze_table_age;
+int			vacuum_multixact_freeze_min_age;
+int			vacuum_multixact_freeze_table_age;
 
-/*
- * VacPage structures keep track of each page on which we find useful
- * amounts of free space.
- */
-typedef struct VacPageData
-{
-	BlockNumber blkno;			/* BlockNumber of this Page */
-	Size		free;			/* FreeSpace on this Page */
-	uint16		offsets_used;	/* Number of OffNums used by vacuum */
-	uint16		offsets_free;	/* Number of OffNums free or to be free */
-	OffsetNumber offsets[1];	/* Array of free OffNums */
-} VacPageData;
-
-typedef VacPageData *VacPage;
-
-typedef struct VacPageListData
-{
-	BlockNumber empty_end_pages;	/* Number of "empty" end-pages */
-	int			num_pages;		/* Number of pages in pagedesc */
-	int			num_allocated_pages;	/* Number of allocated pages in
-										 * pagedesc */
-	VacPage    *pagedesc;		/* Descriptions of pages */
-} VacPageListData;
-
-typedef VacPageListData *VacPageList;
-
-/*
- * The "vtlinks" array keeps information about each recently-updated tuple
- * ("recent" meaning its XMAX is too new to let us recycle the tuple).
- * We store the tuple's own TID as well as its t_ctid (its link to the next
- * newer tuple version).  Searching in this array allows us to follow update
- * chains backwards from newer to older tuples.  When we move a member of an
- * update chain, we must move *all* the live members of the chain, so that we
- * can maintain their t_ctid link relationships (we must not just overwrite
- * t_ctid in an existing tuple).
- *
- * Note: because t_ctid links can be stale (this would only occur if a prior
- * VACUUM crashed partway through), it is possible that new_tid points to an
- * empty slot or unrelated tuple.  We have to check the linkage as we follow
- * it, just as is done in EvalPlanQual.
- */
-typedef struct VTupleLinkData
-{
-	ItemPointerData new_tid;	/* t_ctid of an updated tuple */
-	ItemPointerData this_tid;	/* t_self of the tuple */
-} VTupleLinkData;
-
-typedef VTupleLinkData *VTupleLink;
-
-/*
- * We use an array of VTupleMoveData to plan a chain tuple move fully
- * before we do it.
- */
-typedef struct VTupleMoveData
-{
-	ItemPointerData tid;		/* tuple ID */
-	VacPage		vacpage;		/* where to move it to */
-	bool		cleanVpd;		/* clean vacpage before using? */
-} VTupleMoveData;
-
-typedef VTupleMoveData *VTupleMove;
-
-/*
- * VRelStats contains the data acquired by scan_heap for use later
- */
-typedef struct VRelStats
-{
-	/* miscellaneous statistics */
-	BlockNumber rel_pages;		/* pages in relation */
-	double		rel_tuples;		/* tuples that remain after vacuuming */
-	double		rel_indexed_tuples;		/* indexed tuples that remain */
-	Size		min_tlen;		/* min surviving tuple size */
-	Size		max_tlen;		/* max surviving tuple size */
-	bool		hasindex;
-	/* vtlinks array for tuple chain following - sorted by new_tid */
-	int			num_vtlinks;
-	VTupleLink	vtlinks;
-} VRelStats;
-
-/*----------------------------------------------------------------------
- * ExecContext:
- *
- * As these variables always appear together, we put them into one struct
- * and pull initialization and cleanup into separate routines.
- * ExecContext is used by repair_frag() and move_xxx_tuple().  More
- * accurately:	It is *used* only in move_xxx_tuple(), but because this
- * routine is called many times, we initialize the struct just once in
- * repair_frag() and pass it on to move_xxx_tuple().
- */
-typedef struct ExecContextData
-{
-	ResultRelInfo *resultRelInfo;
-	EState	   *estate;
-	TupleTableSlot *slot;
-} ExecContextData;
-
-typedef ExecContextData *ExecContext;
 
 typedef struct VacuumStatsContext
 {
@@ -205,141 +105,48 @@ typedef struct VacuumStatsContext
  */
 typedef struct AppendOnlyIndexVacuumState
 {
+	Snapshot	appendOnlyMetaDataSnapshot;
 	AppendOnlyVisimap visiMap;
 	AppendOnlyBlockDirectory blockDirectory;
 	AppendOnlyBlockDirectoryEntry blockDirectoryEntry;
 } AppendOnlyIndexVacuumState;
 
-static void
-ExecContext_Init(ExecContext ec, Relation rel)
-{
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-
-	/*
-	 * We need a ResultRelInfo and an EState so we can use the regular
-	 * executor's index-entry-making machinery.
-	 */
-	ec->estate = CreateExecutorState();
-
-	ec->resultRelInfo = makeNode(ResultRelInfo);
-	ec->resultRelInfo->ri_RangeTableIndex = 1;	/* dummy */
-	ec->resultRelInfo->ri_RelationDesc = rel;
-	ec->resultRelInfo->ri_TrigDesc = NULL;		/* we don't fire triggers */
-
-	ExecOpenIndices(ec->resultRelInfo);
-
-	ec->estate->es_result_relations = ec->resultRelInfo;
-	ec->estate->es_num_result_relations = 1;
-	ec->estate->es_result_relation_info = ec->resultRelInfo;
-
-	/* Set up a tuple slot too */
-	ec->slot = MakeSingleTupleTableSlot(tupdesc);
-}
-
-static void
-ExecContext_Finish(ExecContext ec)
-{
-	ExecDropSingleTupleTableSlot(ec->slot);
-	ExecCloseIndices(ec->resultRelInfo);
-	FreeExecutorState(ec->estate);
-}
-
-/*
- * End of ExecContext Implementation
- *----------------------------------------------------------------------
- */
-
 /* A few variables that don't seem worth passing around as parameters */
 static MemoryContext vac_context = NULL;
-
-static int	elevel = -1;
-
-static TransactionId OldestXmin;
-static TransactionId FreezeLimit;
-
-/*
- * For two-step full vacuum, we optimize the second scan by remembering
- * relation stats figured by the first scan.  Since QE runs in a different
- * mpp command/transaction, there is no place to keep this information
- * than global variable.  It is very ugly, but as far as QD runs the
- * right order of operation, it should be ok.
- */
-/* we need the max number of aux relation for one base rel. */
-#define MaxVacFullInitialStatsSize 8
-static VPgClassStats VacFullInitialStats[MaxVacFullInitialStatsSize];
-static int VacFullInitialStatsSize = 0;
 
 static BufferAccessStrategy vac_strategy;
 
 /* non-export function prototypes */
-static List *get_rel_oids(Oid relid, VacuumStmt *vacstmt,
-			 const char *stmttype);
-static void vac_truncate_clog(TransactionId frozenXID);
-static void vacuum_rel(Relation onerel, VacuumStmt *vacstmt, LOCKMODE lmode, List *updated_stats,
+static List *get_rel_oids(Oid relid, VacuumStmt *vacstmt, int stmttype);
+static void vac_truncate_clog(TransactionId frozenXID,
+							  MultiXactId minMulti,
+							  TransactionId lastSaneFrozenXid,
+							  MultiXactId lastSaneMinMulti);
+static bool vacuum_rel(Relation onerel, Oid relid, VacuumStmt *vacstmt, LOCKMODE lmode,
 		   bool for_wraparound);
-static bool full_vacuum_rel(Relation onerel, VacuumStmt *vacstmt, List *updated_stats);
-static void scan_heap_for_truncate(VRelStats *vacrelstats, Relation onerel,
-		  VacPageList vacuum_pages);
-static void scan_heap(VRelStats *vacrelstats, Relation onerel,
-		  VacPageList vacuum_pages, VacPageList fraged_pages);
-static bool repair_frag(VRelStats *vacrelstats, Relation onerel,
-			VacPageList vacuum_pages, VacPageList fraged_pages,
-						int nindexes, Relation *Irel, List *updated_stats,
-						int reindex_count);
-static void move_chain_tuple(Relation rel,
-				 Buffer old_buf, Page old_page, HeapTuple old_tup,
-				 Buffer dst_buf, Page dst_page, VacPage dst_vacpage,
-				 ExecContext ec, ItemPointer ctid, bool cleanVpd);
-static void move_plain_tuple(Relation rel,
-				 Buffer old_buf, Page old_page, HeapTuple old_tup,
-				 Buffer dst_buf, Page dst_page, VacPage dst_vacpage,
-				 ExecContext ec);
-static void vacuum_heap(VRelStats *vacrelstats, Relation onerel,
-			VacPageList vacpagelist);
-static void vacuum_page(Relation onerel, Buffer buffer, VacPage vacpage);
-static void vacuum_index(VacPageList vacpagelist, Relation indrel,
-						 double num_tuples, int keep_tuples, List *updated_stats,
-						 bool check_stats);
-static void scan_index(Relation indrel, double num_tuples, List *updated_stats, bool isfull,
-			bool check_stats);
-static bool tid_reaped(ItemPointer itemptr, void *state);
+static void scan_index(Relation indrel, double num_tuples,
+					   bool check_stats, int elevel);
 static bool appendonly_tid_reaped(ItemPointer itemptr, void *state);
-static void vac_update_fsm(Relation onerel, VacPageList fraged_pages,
-			   BlockNumber rel_pages);
-static VacPage copy_vac_page(VacPage vacpage);
-static void vpage_insert(VacPageList vacpagelist, VacPage vpnew);
-static void *vac_bsearch(const void *key, const void *base,
-			size_t nelem, size_t size,
-			int (*compar) (const void *, const void *));
-static int	vac_cmp_blk(const void *left, const void *right);
-static int	vac_cmp_offno(const void *left, const void *right);
-static int	vac_cmp_vtlinks(const void *left, const void *right);
-static bool enough_space(VacPage vacpage, Size len);
-static Size PageGetFreeSpaceWithFillFactor(Relation relation, Page page);
 static void dispatchVacuum(VacuumStmt *vacstmt, VacuumStatsContext *ctx);
-static Relation open_relation_and_check_permission(VacuumStmt *vacstmt,
-												   Oid relid,
-												   char expected_relkind,
-												   bool forceAccessExclusiveLock);
 static void vacuumStatement_Relation(VacuumStmt *vacstmt, Oid relid,
 						 List *relations, BufferAccessStrategy bstrategy,
 						 bool do_toast,
 						 bool for_wraparound, bool isTopLevel);
 
 static void
+vacuum_rel_ao_phase(Relation onerel, Oid relid, VacuumStmt *vacstmt, LOCKMODE lmode,
+					bool for_wraparound,
+					List *compaction_insert_segno,
+					List *compaction_segno,
+					AOVacuumPhase phase);
+
+static void
 vacuum_combine_stats(VacuumStatsContext *stats_context,
 					CdbPgResults* cdb_pgresults);
 
 static void vacuum_appendonly_index(Relation indexRelation,
-		AppendOnlyIndexVacuumState *vacuumIndexState,
-		List* updated_stats, double rel_tuple_count, bool isfull);
-
-/****************************************************************************
- *																			*
- *			Code common to all flavors of VACUUM and ANALYZE				*
- *																			*
- ****************************************************************************
- */
+						AppendOnlyIndexVacuumState *vacuumIndexState,
+						double rel_tuple_count, int elevel);
 
 /*
  * Primary entry point for VACUUM and ANALYZE commands.
@@ -352,7 +159,7 @@ static void vacuum_appendonly_index(Relation indexRelation,
  * tables separately.
  *
  * for_wraparound is used by autovacuum to let us know when it's forcing
- * a vacuum for wraparound, which should not be auto-cancelled.
+ * a vacuum for wraparound, which should not be auto-canceled.
  *
  * bstrategy is normally given as NULL, but in autovacuum it can be passed
  * in to use the same buffer strategy object across multiple vacuum() calls.
@@ -367,42 +174,36 @@ void
 vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 	   BufferAccessStrategy bstrategy, bool for_wraparound, bool isTopLevel)
 {
-	const char *stmttype = vacstmt->vacuum ? "VACUUM" : "ANALYZE";
-	volatile MemoryContext anl_context = NULL;
-	volatile bool all_rels,
-				in_outer_xact,
+	const char *stmttype;
+	volatile bool in_outer_xact,
 				use_own_xacts;
-	List	   *vacuum_relations;
-	List	   *analyze_relations;
+	List	   *vacuum_relations = NIL;
+	List	   *analyze_relations = NIL;
 
-	if (vacstmt->vacuum && vacstmt->rootonly)
+	if ((vacstmt->options & VACOPT_VACUUM) &&
+		(vacstmt->options & VACOPT_ROOTONLY))
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("ROOTPARTITION option cannot be used together with VACUUM, try ANALYZE ROOTPARTITION")));
+	static bool in_vacuum = false;
 
-	if (vacstmt->verbose)
-		elevel = INFO;
-	else
-		elevel = DEBUG2;
+	/* sanity checks on options */
+	Assert(vacstmt->options & (VACOPT_VACUUM | VACOPT_ANALYZE));
+	Assert((vacstmt->options & VACOPT_VACUUM) ||
+		   !(vacstmt->options & (VACOPT_FULL | VACOPT_FREEZE)));
+	Assert((vacstmt->options & VACOPT_ANALYZE) || vacstmt->va_cols == NIL);
 
-	if (Gp_role == GP_ROLE_DISPATCH)
-		elevel = DEBUG2; /* vacuum messages aren't interesting from the QD */
+	stmttype = (vacstmt->options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
 
 	/*
 	 * We cannot run VACUUM inside a user transaction block; if we were inside
 	 * a transaction, then our commit- and start-transaction-command calls
-	 * would not have the intended effect! Furthermore, the forced commit that
-	 * occurs before truncating the relation's file would have the effect of
-	 * committing the rest of the user's transaction too, which would
-	 * certainly not be the desired behavior.  (This only applies to VACUUM
-	 * FULL, though.  We could in theory run lazy VACUUM inside a transaction
-	 * block, but we choose to disallow that case because we'd rather commit
-	 * as soon as possible after finishing the vacuum.	This is mainly so that
-	 * we can let go the AccessExclusiveLock that we may be holding.)
+	 * would not have the intended effect!	There are numerous other subtle
+	 * dependencies on this, too.
 	 *
 	 * ANALYZE (without VACUUM) can run either way.
 	 */
-	if (vacstmt->vacuum)
+	if (vacstmt->options & VACOPT_VACUUM)
 	{
 		if (Gp_role == GP_ROLE_DISPATCH)
 			PreventTransactionChain(isTopLevel, stmttype);
@@ -412,10 +213,18 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 		in_outer_xact = IsInTransactionChain(isTopLevel);
 
 	/*
+	 * Due to static variables vac_context, anl_context and vac_strategy,
+	 * vacuum() is not reentrant.  This matters when VACUUM FULL or ANALYZE
+	 * calls a hostile index expression that itself calls ANALYZE.
+	 */
+	if (in_vacuum)
+		elog(ERROR, "%s cannot be executed from VACUUM or ANALYZE", stmttype);
+
+	/*
 	 * Send info about dead objects to the statistics collector, unless we are
 	 * in autovacuum --- autovacuum.c does this for itself.
 	 */
-	if (vacstmt->vacuum && !IsAutoVacuumWorkerProcess())
+	if ((vacstmt->options & VACOPT_VACUUM) && !IsAutoVacuumWorkerProcess())
 		pgstat_vacuum_stat();
 
 	/*
@@ -443,9 +252,6 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 	}
 	vac_strategy = bstrategy;
 
-	/* Remember whether we are processing everything in the DB */
-	all_rels = (!OidIsValid(relid) && vacstmt->relation == NULL);
-
 	/*
 	 * Build list of relations to process, unless caller gave us one. (If we
 	 * build one, we put it in vac_context for safekeeping.)
@@ -459,18 +265,21 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 	 * contain all the OIDs of partition of a partitioned table except midlevel
 	 * partition unless GUC optimizer_analyze_midlevel_partition is set to on.
 	 */
-	if (vacstmt->vacuum)
-		vacuum_relations = get_rel_oids(relid, vacstmt, stmttype);
-	if (vacstmt->analyze)
-		analyze_relations = get_rel_oids(relid, vacstmt, stmttype);
+	if (vacstmt->options & VACOPT_VACUUM)
+	{
+		vacuum_relations = get_rel_oids(relid, vacstmt, VACOPT_VACUUM);
+	}
+	if (vacstmt->options & VACOPT_ANALYZE)
+		analyze_relations = get_rel_oids(relid, vacstmt, VACOPT_ANALYZE);
 
 	/*
 	 * Decide whether we need to start/commit our own transactions.
 	 *
-	 * For VACUUM (with or without ANALYZE): always do so, so that we can
-	 * release locks as soon as possible.  (We could possibly use the outer
-	 * transaction for a one-table VACUUM, but handling TOAST tables would be
-	 * problematic.)
+	 * For VACUUM (with or without ANALYZE): always do so on the query
+	 * dispatcher, so that we can release locks as soon as possible.  On the
+	 * query executor we skip this and use the outer transaction when skipping
+	 * two phase commit, as the expectation is that it will be a separate
+	 * dispatch for every table to be vacuumed.
 	 *
 	 * For ANALYZE (no VACUUM): if inside a transaction block, we cannot
 	 * start/commit our own transactions.  Also, there's no need to do so if
@@ -478,11 +287,14 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 	 * transaction block, and also in an autovacuum worker, use own
 	 * transactions so we can release locks sooner.
 	 */
-	if (vacstmt->vacuum)
-		use_own_xacts = true;
+	if (vacstmt->options & VACOPT_VACUUM)
+		if (Gp_role == GP_ROLE_EXECUTE && vacstmt->skip_twophase)
+			use_own_xacts = false;
+		else
+			use_own_xacts = true;
 	else
 	{
-		Assert(vacstmt->analyze);
+		Assert(vacstmt->options & VACOPT_ANALYZE);
 		if (IsAutoVacuumWorkerProcess())
 			use_own_xacts = true;
 		else if (in_outer_xact)
@@ -494,17 +306,6 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 	}
 
 	/*
-	 * If we are running ANALYZE without per-table transactions, we'll need a
-	 * memory context with table lifetime.
-	 */
-	if (!use_own_xacts)
-		anl_context = AllocSetContextCreate(PortalContext,
-											"Analyze",
-											ALLOCSET_DEFAULT_MINSIZE,
-											ALLOCSET_DEFAULT_INITSIZE,
-											ALLOCSET_DEFAULT_MAXSIZE);
-
-	/*
 	 * vacuum_rel expects to be entered with no transaction active; it will
 	 * start and commit its own transaction.  But we are called by an SQL
 	 * command, and so we are executing inside a transaction already. We
@@ -514,6 +315,8 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 	 */
 	if (use_own_xacts)
 	{
+		Assert(!in_outer_xact);
+
 		/* ActiveSnapshot is not set by autovacuum */
 		if (ActiveSnapshotSet())
 			PopActiveSnapshot();
@@ -528,18 +331,14 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 	{
 		ListCell   *cur;
 
+		in_vacuum = true;
 		VacuumCostActive = (VacuumCostDelay > 0);
 		VacuumCostBalance = 0;
+		VacuumPageHit = 0;
+		VacuumPageMiss = 0;
+		VacuumPageDirty = 0;
 
-		if (Gp_role == GP_ROLE_DISPATCH)
-		{
-			vacstmt->appendonly_compaction_segno = NIL;
-			vacstmt->appendonly_compaction_insert_segno = NIL;
-			vacstmt->appendonly_compaction_vacuum_cleanup = false;
-			vacstmt->appendonly_relation_empty = false;
-		}
-
-		if (vacstmt->vacuum)
+		if (vacstmt->options & VACOPT_VACUUM)
 		{
 			/*
 			 * Loop to process each selected relation which needs to be
@@ -553,14 +352,14 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 			}
 		}
 
-		if (vacstmt->analyze)
+		if (vacstmt->options & VACOPT_ANALYZE)
 		{
 			/*
 			 * If there are no partition tables in the database and ANALYZE
 			 * ROOTPARTITION ALL is executed, report a WARNING as no root
 			 * partitions are there to be analyzed
 			 */
-			if (vacstmt->rootonly && NIL == analyze_relations && !vacstmt->relation)
+			if ((vacstmt->options & VACOPT_ROOTONLY) && NIL == analyze_relations && !vacstmt->relation)
 			{
 				ereport(NOTICE,
 						(errmsg("there are no partitioned tables in database to ANALYZE ROOTPARTITION")));
@@ -572,14 +371,10 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 			foreach(cur, analyze_relations)
 			{
 				Oid			relid = lfirst_oid(cur);
-				MemoryContext old_context = NULL;
 
 				/*
 				 * If using separate xacts, start one for analyze. Otherwise,
-				 * we can use the outer transaction, but we still need to call
-				 * analyze_rel in a memory context that will be cleaned up on
-				 * return (else we leak memory while processing multiple
-				 * tables).
+				 * we can use the outer transaction.
 				 */
 				if (use_own_xacts)
 				{
@@ -587,33 +382,26 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 					/* functions in indexes may want a snapshot set */
 					PushActiveSnapshot(GetTransactionSnapshot());
 				}
-				else
-					old_context = MemoryContextSwitchTo(anl_context);
 
-				analyze_rel(relid, vacstmt, vac_strategy);
+				analyze_rel(relid, vacstmt, in_outer_xact, vac_strategy);
 
 				if (use_own_xacts)
 				{
 					PopActiveSnapshot();
 					CommitTransactionCommand();
 				}
-				else
-				{
-					MemoryContextSwitchTo(old_context);
-					MemoryContextResetAndDeleteChildren(anl_context);
-				}
 			}
 		}
 	}
 	PG_CATCH();
 	{
-		/* Make sure cost accounting is turned off after error */
+		in_vacuum = false;
 		VacuumCostActive = false;
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	/* Turn off vacuum cost accounting */
+	in_vacuum = false;
 	VacuumCostActive = false;
 
 	/*
@@ -626,7 +414,7 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 		StartTransactionCommand();
 	}
 
-	if (vacstmt->vacuum && !IsAutoVacuumWorkerProcess())
+	if ((vacstmt->options & VACOPT_VACUUM) && !IsAutoVacuumWorkerProcess())
 	{
 		/*
 		 * Update pg_database.datfrozenxid, and truncate pg_clog if possible.
@@ -642,38 +430,36 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 	 */
 	MemoryContextDelete(vac_context);
 	vac_context = NULL;
-
-	if (anl_context)
-		MemoryContextDelete(anl_context);
 }
 
 /*
  * Assigns the compaction segment information.
  *
- * The vacuum statement will be modified.
- *
+ * The segment to compact is returned in *compact_segno, and
+ * the segment to move rows to, is returned in *insert_segno.
  */
-static bool vacuum_assign_compaction_segno(
-		Relation onerel,
-		List *compactedSegmentFileList,
-		List *insertedSegmentFileList,
-		VacuumStmt *vacstmt)
+static bool
+vacuum_assign_compaction_segno(Relation onerel,
+							   List *compactedSegmentFileList,
+							   List *insertedSegmentFileList,
+							   List **compactNowList,
+							   int *insert_segno)
 {
 	List *new_compaction_list;
-	List *insert_segno;
 	bool is_drop;
 
 	Assert(Gp_role != GP_ROLE_EXECUTE);
-	Assert(vacstmt->appendonly_compaction_segno == NIL);
-	Assert(vacstmt->appendonly_compaction_insert_segno == NIL);
-	Assert (RelationIsValid(onerel));
+	Assert(RelationIsValid(onerel));
+	Assert(RelationIsAppendOptimized(onerel));
 
 	/*
 	 * Assign a compaction segment num and insert segment num
 	 * on master or on segment if in utility mode
 	 */
-	if (!(RelationIsAoRows(onerel) || RelationIsAoCols(onerel)) || !gp_appendonly_compaction)
+	if (!gp_appendonly_compaction)
 	{
+		*insert_segno = -1;
+		*compactNowList = NIL;
 		return true;
 	}
 
@@ -689,8 +475,9 @@ static bool vacuum_assign_compaction_segno(
 	{
 		if (!is_drop)
 		{
-			insert_segno = lappend_int(NIL, SetSegnoForCompactionInsert(onerel,
-				new_compaction_list, compactedSegmentFileList, insertedSegmentFileList));
+			*insert_segno = SetSegnoForCompactionInsert(onerel,
+														new_compaction_list,
+														compactedSegmentFileList);
 		}
 		else
 		{
@@ -698,27 +485,22 @@ static bool vacuum_assign_compaction_segno(
 			 * If we continue an aborted drop phase, we do not assign a real
 			 * insert segment file.
 			 */
-			insert_segno = list_make1_int(APPENDONLY_COMPACTION_SEGNO_INVALID);
+			*insert_segno = APPENDONLY_COMPACTION_SEGNO_INVALID;
 		}
+		*compactNowList = new_compaction_list;
 
 		elogif(Debug_appendonly_print_compaction, LOG,
 				"Schedule compaction on AO table: "
-				"compact segno list length %d, insert segno length %d",
-				list_length(new_compaction_list), list_length(insert_segno));
-	}
-
-	if (!new_compaction_list)
-	{
-		elog(DEBUG3, "No valid compact segno for releation %s (%d)",
-				RelationGetRelationName(onerel),
-				RelationGetRelid(onerel));
-		return false;
+				"compact segno list length %d, insert segno %d",
+				list_length(new_compaction_list), *insert_segno);
+		return true;
 	}
 	else
 	{
-		vacstmt->appendonly_compaction_insert_segno = insert_segno;
-		vacstmt->appendonly_compaction_segno = new_compaction_list;
-		return true;
+		elog(DEBUG3, "No valid compact segno for relation %s (%d)",
+				RelationGetRelationName(onerel),
+				RelationGetRelid(onerel));
+		return false;
 	}
 }
 
@@ -733,7 +515,7 @@ vacuumStatement_IsTemporary(Relation onerel)
 			/* MPP-7773: don't track objects in system namespace
 			 * if modifying system tables (eg during upgrade)
 			 */
-			if (allowSystemTableModsDDL)
+			if (allowSystemTableMods)
 				bTemp = true;
 			break;
 
@@ -788,108 +570,6 @@ vacuumStatement_AssignRelation(VacuumStmt *vacstmt, Oid relid, List *relations)
 }
 
 /*
- * Chose a source and destination segfile for compaction.  It assumes that we
- * are in the vacuum memory context, and executing in DISPATCH or UTILITY mode.
- * Return false if we are done with all segfiles.
- */
-static bool
-vacuumStatement_AssignAppendOnlyCompactionInfo(VacuumStmt *vacstmt,
-		Relation onerel,
-		List *compactedSegmentFileList,
-		List *insertedSegmentFileList,
-		bool *getnextrelation)
-{
-	Assert(Gp_role != GP_ROLE_EXECUTE);
-	Assert(vacstmt);
-	Assert(getnextrelation);
-	Assert(RelationIsAoRows(onerel) || RelationIsAoCols(onerel));
-
-	if (!vacuum_assign_compaction_segno(onerel,
-				compactedSegmentFileList,
-				insertedSegmentFileList,
-				vacstmt))
-	{
-		/* There is nothing left to do for this relation */
-		if (list_length(compactedSegmentFileList) > 0)
-		{
-			/*
-			 * We now need to vacuum the auxility relations of the
-			 * append-only relation
-			 */
-			vacstmt->appendonly_compaction_vacuum_cleanup = true;
-
-			/* Provide the list of all compacted segment numbers with it */
-			list_free(vacstmt->appendonly_compaction_segno);
-			vacstmt->appendonly_compaction_segno = list_copy(compactedSegmentFileList);
-			list_free(vacstmt->appendonly_compaction_insert_segno);
-			vacstmt->appendonly_compaction_insert_segno = list_copy(insertedSegmentFileList);
-		}
-		else
-		{
-			return false;
-		}
-	}
-
-	if (vacstmt->appendonly_compaction_segno &&
-			vacstmt->appendonly_compaction_insert_segno &&
-			!vacstmt->appendonly_compaction_vacuum_cleanup)
-	{
-		/*
-		 * as long as there are real segno to compact, we
-		 * keep processing this relation.
-		 */
-		*getnextrelation = false;
-	}
-	return true;
-}
-
-bool
-vacuumStatement_IsInAppendOnlyDropPhase(VacuumStmt *vacstmt)
-{
-	Assert(vacstmt);
-	return (vacstmt->appendonly_compaction_segno &&
-			!vacstmt->appendonly_compaction_insert_segno &&
-			!vacstmt->appendonly_compaction_vacuum_prepare &&
-			!vacstmt->appendonly_compaction_vacuum_cleanup);
-}
-
-bool
-vacuumStatement_IsInAppendOnlyCompactionPhase(VacuumStmt *vacstmt)
-{
-	Assert(vacstmt);
-	return (vacstmt->appendonly_compaction_segno &&
-			vacstmt->appendonly_compaction_insert_segno &&
-			!vacstmt->appendonly_compaction_vacuum_prepare &&
-			!vacstmt->appendonly_compaction_vacuum_cleanup);
-}
-
-bool
-vacuumStatement_IsInAppendOnlyPseudoCompactionPhase(VacuumStmt *vacstmt)
-{
-	Assert(vacstmt);
-	return (vacstmt->appendonly_compaction_segno &&
-			vacstmt->appendonly_compaction_insert_segno &&
-			linitial_int(vacstmt->appendonly_compaction_insert_segno)
-				== APPENDONLY_COMPACTION_SEGNO_INVALID &&
-			!vacstmt->appendonly_compaction_vacuum_prepare &&
-			!vacstmt->appendonly_compaction_vacuum_cleanup);
-}
-
-bool
-vacuumStatement_IsInAppendOnlyPreparePhase(VacuumStmt* vacstmt)
-{
-	Assert(vacstmt);
-	return (vacstmt->appendonly_compaction_vacuum_prepare);
-}
-
-bool
-vacummStatement_IsInAppendOnlyCleanupPhase(VacuumStmt *vacstmt)
-{
-	Assert(vacstmt);
-	return (vacstmt->appendonly_compaction_vacuum_cleanup);
-}
-
-/*
  * Processing of the vacuumStatement for given relid.
  *
  * The function is called by vacuumStatement once for each relation to vacuum.
@@ -904,15 +584,11 @@ vacummStatement_IsInAppendOnlyCleanupPhase(VacuumStmt *vacstmt)
  * and QD makes some decision what kind of stage we perform, and tells it
  * to QE with vacstmt fields through dispatch.
  *
- * For heap VACUUM FULL, we need two transactions.  One is to move tuples
- * from a page to another, to empty out last pages, which typically goes
- * into repair_frag.  We used to perform truncate operation there, but
- * it required to record transaction commit locally, which is not pleasant
- * if QD decides to cancel the whoe distributed transaction.  So the truncate
- * step is separated to a second transaction.  This two step operation is
- * performed on both base relation and toast relation at the same time.
- *
- * Lazy vacuum to heap is one step operation.
+ * For heap VACUUM we disable two-phase commit, because we do not actually make
+ * any logical changes to the tables. Even if a VACUUM transaction fails on one
+ * of the QE segments, it should not matter, because the data has not logically
+ * changed on disk. VACUUM FULL and lazy vacuum are both completed in one
+ * transaction.
  *
  * AO compaction is rather complicated.  There are four phases.
  *   - prepare phase
@@ -959,448 +635,334 @@ vacuumStatement_Relation(VacuumStmt *vacstmt, Oid relid,
 	LOCKMODE			lmode = NoLock;
 	Relation			onerel;
 	LockRelId			onerelid;
-	MemoryContext		oldctx;
-	VacuumStatsContext stats_context;
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(vac_context);
 
 	vacstmt = copyObject(vacstmt);
-	vacstmt->analyze = false;
-	vacstmt->vacuum = true;
+	/* VACUUM, without ANALYZE */
+	vacstmt->options &= ~VACOPT_ANALYZE;
+	vacstmt->options |= VACOPT_VACUUM;
+	vacstmt->va_cols = NIL;		/* A plain VACUUM cannot list columns */
+
+	MemoryContextSwitchTo(oldcontext);
 
 	/*
-	 * We compact segment file by segment file.
-	 * Therefore in some cases, we have multiple vacuum dispatches
-	 * per relation.
+	 * For each iteration we start/commit our own transactions,
+	 * so that we can release resources such as locks and memories,
+	 * and we can also safely perform non-transactional work
+	 * along with transactional work. If we are a query executor and skipping
+	 * a two phase commit, the expectation is that we will vacuum one relation
+	 * per dispatch, so we can use the outer transaction for this instead.
 	 */
-	bool getnextrelation = false;
-
-	/* Number of rounds performed on this relation */
-	int relationRound = 0;
-
-	List* compactedSegmentFileList = NIL;
-	List* insertedSegmentFileList = NIL;
-
-	bool dropPhase = false;
-	bool truncatePhase = false;
-
-	Assert(vacstmt);
-
-	if (Gp_role != GP_ROLE_EXECUTE)
-	{
-		/* First call on a relation is the prepare phase */
-		vacstmt->appendonly_compaction_vacuum_prepare = true;
-
-		/*
-		 * Reset truncate flag always as we may iterate more than one relation.
-		 */
-		vacstmt->heap_truncate = false;
-	}
-
-	while (!getnextrelation)
-	{
-		getnextrelation = true;
-
-		/*
-		 * The following block of code is relevant only for AO tables.  The
-		 * only phases relevant are prepare phase, compaction phase and the
-		 * first phase of cleanup for VACUUM FULL (truncatePhase set to true
-		 * refers to this phase). 
-		 */
-		if (Gp_role != GP_ROLE_EXECUTE && (!dropPhase || truncatePhase))
-		{
-			 /* Reset the compaction segno if new relation or segment file is
-			  * started
-			  */
-			list_free(vacstmt->appendonly_compaction_segno);
-			list_free(vacstmt->appendonly_compaction_insert_segno);
-			vacstmt->appendonly_compaction_segno = NIL;
-			vacstmt->appendonly_compaction_insert_segno = NIL;
-			/*
-			 * We should not reset the cleanup flag for truncate phase because
-			 * it is a sub part of the cleanup phase for VACUUM FULL case 
-			 */ 
-			if (!truncatePhase)
-				vacstmt->appendonly_compaction_vacuum_cleanup = false;
-		}
-
-		/*
-		 * For each iteration we start/commit our own transactions,
-		 * so that we can release resources such as locks and memories,
-		 * and we can also safely perform non-transactional work
-		 * along with transactional work.
-		 */
+	if (Gp_role != GP_ROLE_EXECUTE || !vacstmt->skip_twophase)
 		StartTransactionCommand();
 
-		/*
-		 * Functions in indexes may want a snapshot set. Also, setting
-		 * a snapshot ensures that RecentGlobalXmin is kept truly recent.
-		 */
-		PushActiveSnapshot(GetTransactionSnapshot());
+	/*
+	 * Functions in indexes may want a snapshot set. Also, setting
+	 * a snapshot ensures that RecentGlobalXmin is kept truly recent.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
 
-		if (!vacstmt->full)
+	/*
+	 * Determine the type of lock we want --- hard exclusive lock for a FULL
+	 * vacuum, but just ShareUpdateExclusiveLock for concurrent vacuum. Either
+	 * way, we can be sure that no other backend is vacuuming the same table.
+	 * For analyze, we use ShareUpdateExclusiveLock.
+	 */
+	if (vacstmt->appendonly_phase == AOVAC_DROP)
+	{
+		Assert(Gp_role == GP_ROLE_EXECUTE);
+		lmode = AccessExclusiveLock;
+		SIMPLE_FAULT_INJECTOR("vacuum_relation_open_relation_during_drop_phase");
+	}
+	else if (!(vacstmt->options & VACOPT_VACUUM))
+		lmode = ShareUpdateExclusiveLock;
+	else
+		lmode = (vacstmt->options & VACOPT_FULL) ? AccessExclusiveLock : ShareUpdateExclusiveLock;
+
+	/*
+	 * Open the relation and get the appropriate lock on it.
+	 *
+	 * There's a race condition here: the rel may have gone away since the
+	 * last time we saw it.  If so, we don't need to vacuum it.
+	 */
+	onerel = try_relation_open(relid, lmode, false /* dontwait */);
+	if (!onerel)
+	{
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return;
+	}
+
+	/*
+	 * Check permissions.
+	 *
+	 * We allow the user to vacuum a table if he is superuser, the table
+	 * owner, or the database owner (but in the latter case, only if it's not
+	 * a shared relation).	pg_class_ownercheck includes the superuser case.
+	 *
+	 * Note we choose to treat permissions failure as a WARNING and keep
+	 * trying to vacuum the rest of the DB --- is this appropriate?
+	 */
+	if (!(pg_class_ownercheck(RelationGetRelid(onerel), GetUserId()) ||
+		  (pg_database_ownercheck(MyDatabaseId, GetUserId()) && !onerel->rd_rel->relisshared)))
+	{
+		if (Gp_role != GP_ROLE_EXECUTE)
 		{
-			/*
-			 * PostgreSQL does this:
-			 * During a lazy VACUUM we can set the PROC_IN_VACUUM flag, which lets other
-			 * concurrent VACUUMs know that they can ignore this one while
-			 * determining their OldestXmin.  (The reason we don't set it during a
-			 * full VACUUM is exactly that we may have to run user- defined
-			 * functions for functional indexes, and we want to make sure that if
-			 * they use the snapshot set above, any tuples it requires can't get
-			 * removed from other tables.  An index function that depends on the
-			 * contents of other tables is arguably broken, but we won't break it
-			 * here by violating transaction semantics.)
-			 *
-			 * GPDB doesn't use PROC_IN_VACUUM, as lazy vacuum for bitmap
-			 * indexed tables performs reindex causing updates to pg_class
-			 * tuples for index entries.
-			 *
-			 * We also set the VACUUM_FOR_WRAPAROUND flag, which is passed down
-			 * by autovacuum; it's used to avoid cancelling a vacuum that was
-			 * invoked in an emergency.
-			 *
-			 * Note: this flag remains set until CommitTransaction or
-			 * AbortTransaction.  We don't want to clear it until we reset
-			 * MyProc->xid/xmin, else OldestXmin might appear to go backwards,
-			 * which is probably Not Good.
-			 */
-			LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-#if 0 /* Upstream code not applicable to GPDB */
-			MyProc->vacuumFlags |= PROC_IN_VACUUM;
-#endif
-			if (for_wraparound)
-				MyProc->vacuumFlags |= PROC_VACUUM_FOR_WRAPAROUND;
-			LWLockRelease(ProcArrayLock);
+			if (onerel->rd_rel->relisshared)
+				ereport(WARNING,
+						(errmsg("skipping \"%s\" --- only superuser can vacuum it",
+								RelationGetRelationName(onerel))));
+			else if (onerel->rd_rel->relnamespace == PG_CATALOG_NAMESPACE)
+				ereport(WARNING,
+						(errmsg("skipping \"%s\" --- only superuser or database owner can vacuum it",
+								RelationGetRelationName(onerel))));
+			else
+				ereport(WARNING,
+						(errmsg("skipping \"%s\" --- only table or database owner can vacuum it",
+								RelationGetRelationName(onerel))));
+		}
+		relation_close(onerel, lmode);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return;
+	}
+
+	/*
+	 * Check that it's a vacuumable relation; we used to do this in
+	 * get_rel_oids() but seems safer to check after we've locked the
+	 * relation.
+	 */
+	if ((onerel->rd_rel->relkind != RELKIND_RELATION &&
+		 onerel->rd_rel->relkind != RELKIND_MATVIEW &&
+		 onerel->rd_rel->relkind != RELKIND_TOASTVALUE &&
+		 onerel->rd_rel->relkind != RELKIND_AOSEGMENTS &&
+		 onerel->rd_rel->relkind != RELKIND_AOBLOCKDIR &&
+		 onerel->rd_rel->relkind != RELKIND_AOVISIMAP)
+		|| RelationIsExternal(onerel) || RelationIsForeign(onerel))
+	{
+		ereport(WARNING,
+				(errmsg("skipping \"%s\" --- cannot vacuum non-tables, external tables, foreign tables or special system tables",
+						RelationGetRelationName(onerel))));
+		relation_close(onerel, lmode);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return;
+	}
+
+	/*
+	 * Silently ignore tables that are temp tables of other backends ---
+	 * trying to vacuum these will lead to great unhappiness, since their
+	 * contents are probably not up-to-date on disk.  (We don't throw a
+	 * warning here; it would just lead to chatter during a database-wide
+	 * VACUUM.)
+	 */
+	if (isOtherTempNamespace(RelationGetNamespace(onerel)))
+	{
+		relation_close(onerel, lmode);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return;
+	}
+
+	/*
+	 * Get a session-level lock too. This will protect our access to the
+	 * relation across multiple transactions, so that we can vacuum the
+	 * relation's TOAST table (if any) secure in the knowledge that no one is
+	 * deleting the parent relation.
+	 *
+	 * NOTE: this cannot block, even if someone else is waiting for access,
+	 * because the lock manager knows that both lock requests are from the
+	 * same process.
+	 */
+	onerelid = onerel->rd_lockInfo.lockRelId;
+	LockRelationIdForSession(&onerelid, lmode);
+
+	oldcontext = MemoryContextSwitchTo(vac_context);
+	vacuumStatement_AssignRelation(vacstmt, relid, relations);
+	MemoryContextSwitchTo(oldcontext);
+
+	if (RelationIsHeap(onerel) || Gp_role == GP_ROLE_EXECUTE)
+	{
+		/* skip two-phase commit on heap table VACUUM */
+		if (Gp_role == GP_ROLE_DISPATCH)
+			vacstmt->skip_twophase = true;
+
+		if (vacstmt->appendonly_phase == AOVAC_DROP)
+		{
+			SIMPLE_FAULT_INJECTOR("vacuum_relation_open_relation_during_drop_phase");
 		}
 
-		/*
-		 * AO only: QE can tell drop phase here with dispatched vacstmt.
-		 */
-		if (Gp_role == GP_ROLE_EXECUTE)
-			dropPhase = vacuumStatement_IsInAppendOnlyDropPhase(vacstmt);
+		vacuum_rel(onerel, relid, vacstmt, lmode, for_wraparound);
+		onerel = NULL;
+	}
+	else
+	{
+		List	   *compactedSegmentFileList = NIL;
+		List	   *insertedSegmentFileList = NIL;
+
+		vacstmt->appendonly_compaction_segno = NIL;
+		vacstmt->appendonly_compaction_insert_segno = NIL;
+		vacstmt->appendonly_relation_empty = false;
+		vacstmt->skip_twophase = false;
 
 		/*
-		 * Open the relation with an appropriate lock, and check the permission.
+		 * 1. Prepare phase
 		 */
-		onerel = open_relation_and_check_permission(vacstmt, relid, RELKIND_RELATION, dropPhase);
+		vacuum_rel_ao_phase(onerel, relid, vacstmt, lmode, for_wraparound,
+							NIL,
+							NIL,
+							AOVAC_PREPARE);
+		onerel = NULL;
 
 		/*
-		 * onerel can be NULL for the following cases:
-		 * 1. If the user does not have the permissions to vacuum the table
-		 * 2. For AO tables if the drop phase cannot be performed and should be skipped 
+		 * Loop between compaction and drop phases, until there is nothing more left
+		 * to do for this relation.
 		 */
-		if (onerel == NULL)
+		for (;;)
 		{
-			if ((Gp_role != GP_ROLE_EXECUTE) && dropPhase)
-			{
-				/*
-				 * To ensure that vacuum decreases the age for appendonly
-				 * tables even if drop phase is getting skipped, perform
-				 * cleanup phase so that the relfrozenxid value is updated
-				 * correctly in pg_class
-				 */
-				vacstmt->appendonly_compaction_vacuum_cleanup = true;
-				dropPhase = false;
-				/*
-				 * Since the drop phase needs to be skipped, we need to
-				 * deregister the segnos which were marked for drop in the
-				 * compaction phase
-				 */
-				DeregisterSegnoForCompactionDrop(relid,
-								vacstmt->appendonly_compaction_segno);
-				onerel = open_relation_and_check_permission(vacstmt, relid, RELKIND_RELATION, false);
-			}		
+			List	   *compactNowList = NIL;
+			int			insertSegNo = -1;
 
-			if (onerel == NULL)
+			if (gp_appendonly_compaction)
 			{
+				/*
+				 * 2. Compaction phase
+				 */
+				StartTransactionCommand();
+				PushActiveSnapshot(GetTransactionSnapshot());
+				onerel = try_relation_open(relid, lmode, false /* dontwait */);
+
+				/* Chose a source and destination segfile for compaction. */
+				if (!vacuum_assign_compaction_segno(onerel,
+													compactedSegmentFileList,
+													insertedSegmentFileList,
+													&compactNowList,
+													&insertSegNo))
+				{
+					/*
+					 * There is nothing left to do for this relation. Proceed to
+					 * the cleanup phase.
+					 */
+					break;
+				}
+
+				oldcontext = MemoryContextSwitchTo(vac_context);
+
+				compactNowList = list_copy(compactNowList);
+
+				compactedSegmentFileList =
+					list_union_int(compactedSegmentFileList, compactNowList);
+				insertedSegmentFileList =
+					lappend_int(insertedSegmentFileList, insertSegNo);
+
+				MemoryContextSwitchTo(oldcontext);
+
+				vacuum_rel_ao_phase(onerel, relid, vacstmt, lmode, for_wraparound,
+									list_make1_int(insertSegNo),
+									compactNowList,
+									AOVAC_COMPACT);
+				onerel = NULL;
+			}
+
+			/*
+			 * 3. Drop phase
+			 */
+
+			StartTransactionCommand();
+			PushActiveSnapshot(GetTransactionSnapshot());
+
+			/*
+			 * Upgrade to AccessExclusiveLock from SharedAccessExclusive here
+			 * before doing the drops. We set the dontwait flag here to
+			 * prevent deadlock scenarios such as a concurrent transaction
+			 * holding AccessShareLock and then upgrading to ExclusiveLock to
+			 * run DELETE/UPDATE while VACUUM is waiting here for
+			 * AccessExclusiveLock.
+			 *
+			 * Skipping when we are not able to upgrade to AccessExclusivelock
+			 * can be an issue though because it is possible to accumulate a
+			 * large amount of segfiles marked AOSEG_STATE_AWAITING_DROP.
+			 * However, we do not expect this to happen too frequently such
+			 * that all segfiles are marked.
+			 */
+			SIMPLE_FAULT_INJECTOR("vacuum_relation_open_relation_during_drop_phase");
+			onerel = try_relation_open(relid, AccessExclusiveLock, true /* dontwait */);
+
+			if (!RelationIsValid(onerel))
+			{
+				/* Couldn't get AccessExclusiveLock. */
 				PopActiveSnapshot();
 				CommitTransactionCommand();
+
+				/*
+				 * Skip performing DROP and continue with other segfiles in
+				 * case they have crossed threshold and need to be compacted
+				 * or marked as AOSEG_STATE_AWAITING_DROP. To ensure that
+				 * vacuum decreases the age for appendonly tables even if drop
+				 * phase is getting skipped, perform cleanup phase when done
+				 * iterating through all segfiles so that the relfrozenxid
+				 * value is updated correctly in pg_class.
+				 */
 				continue;
 			}
-		}
 
-		vacuumStatement_AssignRelation(vacstmt, relid, relations);
-
-		if (Gp_role != GP_ROLE_EXECUTE)
-		{
-			/*
-			 * Keep things generated by this QD decision beyond a transaction.
-			 */
-			oldctx = MemoryContextSwitchTo(vac_context);
-			if (RelationIsHeap(onerel))
+			if (HasSerializableBackends(false))
 			{
 				/*
-				 * We perform truncate in the second transaction, to avoid making
-				 * it necessary to record transaction commit in the middle of
-				 * vacuum operation in case we move tuples across pages.  It may
-				 * not need to do so if the relation is clean, but the decision
-				 * to perform truncate is segment-local and QD cannot tell if
-				 * everyone can skip it.
+				 * Checking at this point is safe because
+				 * any serializable transaction that could start afterwards
+				 * will already see the state with AWAITING_DROP. We
+				 * have only to deal with transactions that started before
+				 * our transaction.
+				 *
+				 * We immediatelly get the next relation. There is no
+				 * reason to stay in this relation. Actually, all
+				 * other ao relation will skip the compaction step.
 				 */
-				if (vacstmt->full)
-				{
-					Assert(relationRound == 0 || relationRound == 1);
-					if (relationRound == 0)
-						getnextrelation = false;
-					else if (relationRound == 1)
-						vacstmt->heap_truncate = true;
-				}
+				elogif(Debug_appendonly_print_compaction, LOG,
+					   "Skipping freeing compacted append-only segment file "
+					   "because of concurrent serializable transaction");
+
+				DeregisterSegnoForCompactionDrop(relid, compactNowList);
+				break;
 			}
-			else
-			{
-				/* the rest is about AO tables */
-				if (vacstmt->appendonly_compaction_vacuum_prepare)
-				{
-					getnextrelation = false;
-					dropPhase = false;
-				}
-				else if (dropPhase)
-				{
-					if (HasSerializableBackends(false))
-					{
-						/*
-						 * Checking at this point is safe because
-						 * any serializable transaction that could start afterwards
-						 * will already see the state with AWAITING_DROP. We
-						 * have only to deal with transactions that started before
-						 * our transaction.
-						 *
-						 * We immediatelly get the next relation. There is no
-						 * reason to stay in this relation. Actually, all
-						 * other ao relation will skip the compaction step.
-						 */
-						elogif(Debug_appendonly_print_compaction, LOG,
-								"Skipping freeing compacted append-only segment file "
-								"because of concurrent serializable transaction");
 
-						DeregisterSegnoForCompactionDrop(relid, vacstmt->appendonly_compaction_segno);
-						vacstmt->appendonly_compaction_vacuum_cleanup = true;
-						dropPhase = false;
-						getnextrelation = false;
-					}
-					else
-					{
-						elogif(Debug_appendonly_print_compaction, LOG,
-								"Dispatch drop transaction on append-only relation %s",
-								RelationGetRelationName(onerel));
+			elogif(Debug_appendonly_print_compaction, LOG,
+				   "Dispatch drop transaction on append-only relation %s",
+				   RelationGetRelationName(onerel));
 
-						RegisterSegnoForCompactionDrop(relid, vacstmt->appendonly_compaction_segno);
-						list_free(vacstmt->appendonly_compaction_insert_segno);
-						vacstmt->appendonly_compaction_insert_segno = NIL;
-						dropPhase = false;
-						getnextrelation = false;
-					}
-				}
-				else
-				{
-					/* Either we are in cleanup or in compaction phase */
-					if (!vacstmt->appendonly_compaction_vacuum_cleanup)
-					{
-						/* This block is only relevant for compaction */
-						if (!vacuumStatement_AssignAppendOnlyCompactionInfo(vacstmt,
-									onerel, compactedSegmentFileList,
-									insertedSegmentFileList, &getnextrelation))
-						{
-							MemoryContextSwitchTo(oldctx);
-							/* Nothing left to do for this relation */
-							relation_close(onerel, NoLock);
-							PopActiveSnapshot();
-							CommitTransactionCommand();
-							/* don't dispatch this iteration */
-							continue;
-						}
+			/* Perform the DROP phase */
+			RegisterSegnoForCompactionDrop(relid, compactNowList);
 
-						compactedSegmentFileList =
-							list_union_int(compactedSegmentFileList,
-								vacstmt->appendonly_compaction_segno);
-						insertedSegmentFileList =
-							list_union_int(insertedSegmentFileList,
-								vacstmt->appendonly_compaction_insert_segno);
+			vacuum_rel_ao_phase(onerel, relid, vacstmt, lmode, for_wraparound,
+								NIL,	/* insert segno */
+								compactNowList,
+								AOVAC_DROP);
+			onerel = NULL;
 
-						dropPhase = !getnextrelation;
-					}
-				}
-				MemoryContextSwitchTo(oldctx);
-
-				/*
-				 * If VACUUM FULL and in cleanup phase, perform two-step for
-				 * aux relations.
-				 */
-				if (vacstmt->full &&
-					vacstmt->appendonly_compaction_vacuum_cleanup)
-				{
-					if (truncatePhase)
-					{
-						truncatePhase = false;
-						vacstmt->heap_truncate = true;
-					}
-					else
-					{
-						truncatePhase = true;
-						getnextrelation = false;
-					}
-				}
-			}
+			if (!gp_appendonly_compaction)
+				break;
 		}
 
 		/*
-		 * Reset the global array if this step is not for heap truncate.
-		 * We use this array only when trancating.
+		 * 4. Cleanup phase.
+		 *
+		 * This vacuums all the auxiliary tables, like TOAST, AO segment tables etc.
+		 *
+		 * We can skip this, if we didn't compact anything. XXX: Really? Shouldn't we
+		 * still process the aux tables?
 		 */
-		if (!vacstmt->heap_truncate)
-			VacFullInitialStatsSize = 0;
-
-		/*
-		 * If we are in the dispatch mode, dispatch this modified
-		 * vacuum statement to QEs, and wait for them to finish.
-		 */
-		if (Gp_role == GP_ROLE_DISPATCH)
+		if (list_length(compactedSegmentFileList) > 0)
 		{
-			int 		i, nindexes;
-			bool 		has_bitmap = false;
-			Relation   *i_rel = NULL;
-
-			stats_context.updated_stats = NIL;
-
-			vac_open_indexes(onerel, AccessShareLock, &nindexes, &i_rel);
-			if (i_rel != NULL)
-			{
-				for (i = 0; i < nindexes; i++)
-				{
-					if (RelationIsBitmapIndex(i_rel[i]))
-					{
-						has_bitmap = true;
-						break;
-					}
-				}
-			}
-			vac_close_indexes(nindexes, i_rel, AccessShareLock);
-
-			/*
-			 * We have to acquire a ShareLock for the relation which has bitmap
-			 * indexes, since reindex is used later. Otherwise, concurrent
-			 * vacuum and inserts may cause deadlock. MPP-5960
-			 */
-			if (has_bitmap)
-				LockRelation(onerel, ShareLock);
-
-			dispatchVacuum(vacstmt, &stats_context);
+			/* Provide the list of all compacted segment numbers with it */
+			vacuum_rel_ao_phase(onerel, relid, vacstmt, lmode, for_wraparound,
+								insertedSegmentFileList,
+								compactedSegmentFileList,
+								AOVAC_CLEANUP);
+			onerel = NULL;
 		}
-
-		if (vacstmt->full)
-			lmode = AccessExclusiveLock;
-		else if (RelationIsAoRows(onerel) || RelationIsAoCols(onerel))
-			lmode = AccessShareLock;
-		else
-			lmode = ShareUpdateExclusiveLock;
-
-		if (relationRound == 0)
-		{
-			onerelid = onerel->rd_lockInfo.lockRelId;
-
-			/*
-			 * Get a session-level lock too. This will protect our
-			 * access to the relation across multiple transactions, so
-			 * that we can vacuum the relation's TOAST table (if any)
-			 * secure in the knowledge that no one is deleting the
-			 * parent relation.
-			 *
-			 * NOTE: this cannot block, even if someone else is
-			 * waiting for access, because the lock manager knows that
-			 * both lock requests are from the same process.
-			 */
-			LockRelationIdForSession(&onerelid, lmode);
-		}
-		vacuum_rel(onerel, vacstmt, lmode, stats_context.updated_stats,
-				   for_wraparound);
-
-		if (Gp_role == GP_ROLE_DISPATCH)
-		{
-			list_free_deep(stats_context.updated_stats);
-			stats_context.updated_stats = NIL;
-
-			/*
-			 * Update ao master tupcount the hard way after the compaction and
-			 * after the drop.
-			 */
-			if (vacstmt->appendonly_compaction_segno)
-			{
-				Assert(RelationIsAoRows(onerel) || RelationIsAoCols(onerel));
-
-				if (vacuumStatement_IsInAppendOnlyCompactionPhase(vacstmt) &&
-						!vacuumStatement_IsInAppendOnlyPseudoCompactionPhase(vacstmt))
-				{
-					/* In the compact phase, we need to update the information of the segment file we inserted into */
-					UpdateMasterAosegTotalsFromSegments(onerel, SnapshotNow, vacstmt->appendonly_compaction_insert_segno, 0);
-				}
-				else if (vacuumStatement_IsInAppendOnlyDropPhase(vacstmt))
-				{
-					/* In the drop phase, we need to update the information of the compacted segment file(s) */
-					UpdateMasterAosegTotalsFromSegments(onerel, SnapshotNow, vacstmt->appendonly_compaction_segno, 0);
-				}
-			}
-
-			/*
-			 * We need some transaction to update the catalog.  We could do
-			 * it on the outer vacuumStatement, but it is useful to track
-			 * relation by relation.
-			 */
-			if (relationRound == 0 && !vacuumStatement_IsTemporary(onerel))
-			{
-				char *vsubtype = ""; /* NOFULL */
-
-				if (IsAutoVacuumWorkerProcess())
-					vsubtype = "AUTO";
-				else
-				{
-					if (vacstmt->full &&
-						(0 == vacstmt->freeze_min_age))
-						vsubtype = "FULL FREEZE";
-					else if (vacstmt->full)
-						vsubtype = "FULL";
-					else if (0 == vacstmt->freeze_min_age)
-						vsubtype = "FREEZE";
-				}
-				MetaTrackUpdObject(RelationRelationId,
-								   relid,
-								   GetUserId(),
-								   "VACUUM",
-								   vsubtype);
-			}
-		}
-
-		/*
-		 * Close source relation now, but keep lock so that no one
-		 * deletes it before we commit.  (If someone did, they'd
-		 * fail to clean up the entries we made in pg_statistic.
-		 * Also, releasing the lock before commit would expose us
-		 * to concurrent-update failures in update_attstats.)
-		 */
-		relation_close(onerel, NoLock);
-
-
-		if (list_length(relations) > 1)
-		{
-			pfree(vacstmt->relation->schemaname);
-			pfree(vacstmt->relation->relname);
-			pfree(vacstmt->relation);
-			vacstmt->relation = NULL;
-		}
-		vacstmt->appendonly_compaction_vacuum_prepare = false;
-
-		PopActiveSnapshot();
-
-		/*
-		 * Transaction commit is always executed on QD.
-		 */
-		if (Gp_role != GP_ROLE_EXECUTE)
-			CommitTransactionCommand();
-
-		if (relationRound == 0)
-		{
-			SIMPLE_FAULT_INJECTOR(VacuumRelationEndOfFirstRound);
-		}
-
-		relationRound++;
 	}
 
 	if (lmode != NoLock)
@@ -1408,25 +970,51 @@ vacuumStatement_Relation(VacuumStmt *vacstmt, Oid relid,
 		UnlockRelationIdForSession(&onerelid, lmode);
 	}
 
-	if (compactedSegmentFileList)
+	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		list_free(compactedSegmentFileList);
-		compactedSegmentFileList = NIL;
+		/*
+		 * We need some transaction to update the catalog.  We could do
+		 * it on the outer vacuumStatement, but it is useful to track
+		 * relation by relation.
+		 */
+		//if (!istemp) // FIXME
+		{
+			char *vsubtype = ""; /* NOFULL */
+			bool		start_xact = false;
+
+			if (!onerel)
+			{
+				StartTransactionCommand();
+				start_xact = true;
+			}
+
+			if (IsAutoVacuumWorkerProcess())
+				vsubtype = "AUTO";
+			else
+			{
+				if ((vacstmt->options & VACOPT_FULL) &&
+					(0 == vacstmt->freeze_min_age))
+					vsubtype = "FULL FREEZE";
+				else if ((vacstmt->options & VACOPT_FULL))
+					vsubtype = "FULL";
+				else if (0 == vacstmt->freeze_min_age)
+					vsubtype = "FREEZE";
+			}
+			MetaTrackUpdObject(RelationRelationId,
+							   relid,
+							   GetUserId(),
+							   "VACUUM",
+							   vsubtype);
+			if (start_xact)
+				CommitTransactionCommand();
+		}
 	}
-	if (insertedSegmentFileList)
+
+	if (onerel)
 	{
-		list_free(insertedSegmentFileList);
-		insertedSegmentFileList = NIL;
-	}
-	if (vacstmt->appendonly_compaction_segno)
-	{
-		list_free(vacstmt->appendonly_compaction_segno);
-		vacstmt->appendonly_compaction_segno = NIL;
-	}
-	if (vacstmt->appendonly_compaction_insert_segno)
-	{
-		list_free(vacstmt->appendonly_compaction_insert_segno);
-		vacstmt->appendonly_compaction_insert_segno = NIL;
+		relation_close(onerel, NoLock);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
 	}
 }
 
@@ -1435,12 +1023,19 @@ vacuumStatement_Relation(VacuumStmt *vacstmt, Oid relid,
  *
  * The list is built in vac_context so that it will survive across our
  * per-relation transactions.
+ *
+ * 'stmttype' is either VACOPT_VACUUM or VACOPT_ANALYZE, to indicate
+ * whether we should fetch the list for VACUUM or ANALYZE. It's
+ * passed as a separate argument, so that the caller can build
+ * separate lists for a combined "VACUUM ANALYZE".
  */
 static List *
-get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
+get_rel_oids(Oid relid, VacuumStmt *vacstmt, int stmttype)
 {
 	List	   *oid_list = NIL;
 	MemoryContext oldcontext;
+
+	Assert(stmttype == VACOPT_VACUUM || stmttype == VACOPT_ANALYZE);
 
 	/* OID supplied by VACUUM's caller? */
 	if (OidIsValid(relid))
@@ -1451,13 +1046,22 @@ get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
 	}
 	else if (vacstmt->relation)
 	{
-		if (strcmp(stmttype, "VACUUM") == 0)
+		if (stmttype == VACOPT_VACUUM)
 		{
 			/* Process a specific relation */
 			Oid			relid;
 			List	   *prels = NIL;
 
-			relid = RangeVarGetRelid(vacstmt->relation, false);
+			/*
+			 * Since we don't take a lock here, the relation might be gone, or the
+			 * RangeVar might no longer refer to the OID we look up here.  In the
+			 * former case, VACUUM will do nothing; in the latter case, it will
+			 * process the OID we looked up here, rather than the new one. Neither
+			 * is ideal, but there's little practical alternative, since we're
+			 * going to commit this transaction and begin a new one between now
+			 * and then.
+			 */
+			relid = RangeVarGetRelid(vacstmt->relation, NoLock, false);
 
 			if (rel_is_partitioned(relid))
 			{
@@ -1470,7 +1074,7 @@ get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
 			else if (rel_is_child_partition(relid))
 			{
 				/* get my children */
-				prels = find_all_inheritors(relid);
+				prels = find_all_inheritors(relid, NoLock, NULL);
 			}
 
 			/* Make a relation list entry for this relation */
@@ -1487,10 +1091,10 @@ get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
 			 */
 			Oid relationOid = InvalidOid;
 
-			relationOid = RangeVarGetRelid(vacstmt->relation, false);
+			relationOid = RangeVarGetRelid(vacstmt->relation, NoLock, false);
 			PartStatus ps = rel_part_status(relationOid);
 
-			if (ps != PART_STATUS_ROOT && vacstmt->rootonly)
+			if (ps != PART_STATUS_ROOT && (vacstmt->options & VACOPT_ROOTONLY))
 			{
 				ereport(WARNING,
 						(errmsg("skipping \"%s\" --- cannot analyze a non-root partition using ANALYZE ROOTPARTITION",
@@ -1501,7 +1105,7 @@ get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
 				PartitionNode *pn = get_parts(relationOid, 0 /*level*/ ,
 											  0 /*parent*/, false /* inctemplate */, true /*includesubparts*/);
 				Assert(pn);
-				if (!vacstmt->rootonly)
+				if (!(vacstmt->options & VACOPT_ROOTONLY))
 				{
 					oid_list = all_leaf_partition_relids(pn); /* all leaves */
 
@@ -1510,7 +1114,52 @@ get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
 						oid_list = list_concat(oid_list, all_interior_partition_relids(pn)); /* interior partitions */
 					}
 				}
-				oid_list = lappend_oid(oid_list, relationOid); /* root partition */
+				if (optimizer_analyze_root_partition || (vacstmt->options & VACOPT_ROOTONLY))
+					oid_list = lappend_oid(oid_list, relationOid); /* root partition */
+			}
+			else if (ps == PART_STATUS_LEAF)
+			{
+				Oid root_rel_oid = rel_partition_get_master(relationOid);
+				oid_list = list_make1_oid(relationOid);
+
+				List *va_root_attnums = NIL;
+				if (vacstmt->va_cols != NIL)
+				{
+					ListCell *lc;
+					int i;
+					foreach(lc, vacstmt->va_cols)
+					{
+						char	   *col = strVal(lfirst(lc));
+
+						i = get_attnum(root_rel_oid, col);
+						if (i == InvalidAttrNumber)
+							ereport(ERROR,
+									(errcode(ERRCODE_UNDEFINED_COLUMN),
+									 errmsg("column \"%s\" of relation \"%s\" does not exist",
+											col, get_rel_name(root_rel_oid))));
+						va_root_attnums = lappend_int(va_root_attnums, i);
+					}
+				}
+				else
+				{
+					Relation onerel = RelationIdGetRelation(root_rel_oid);
+					int attr_cnt = onerel->rd_att->natts;
+					for (int i = 1; i <= attr_cnt; i++)
+					{
+						Form_pg_attribute attr = onerel->rd_att->attrs[i-1];
+						if (attr->attisdropped)
+							continue;
+						va_root_attnums = lappend_int(va_root_attnums, i);
+					}
+					RelationClose(onerel);
+				}
+				if (optimizer_analyze_root_partition || (vacstmt->options & VACOPT_ROOTONLY))
+				{
+					int		elevel = ((vacstmt->options & VACOPT_VERBOSE) ? LOG : DEBUG2);
+
+					if (leaf_parts_analyzed(root_rel_oid, relationOid, va_root_attnums, elevel))
+						oid_list = lappend_oid(oid_list, root_rel_oid);
+				}
 			}
 			else if (ps == PART_STATUS_INTERIOR) /* analyze an interior partition directly */
 			{
@@ -1518,7 +1167,7 @@ get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
 				 * to work with the root partition only. To gather stats on mid-level partitions
 				 * (for Orca's use), the user should run ANALYZE or ANALYZE ROOTPARTITION on the
 				 * root level with optimizer_analyze_midlevel_partition GUC set to ON.
-				 * Planner uses the stats on leaf partitions, so its unnecesary to collect stats on
+				 * Planner uses the stats on leaf partitions, so it's unnecessary to collect stats on
 				 * midlevel partitions.
 				 */
 				ereport(WARNING,
@@ -1535,21 +1184,19 @@ get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
 	}
 	else
 	{
-		/* Process all plain relations listed in pg_class */
+		/*
+		 * Process all plain relations and materialized views listed in
+		 * pg_class
+		 */
 		Relation	pgclass;
 		HeapScanDesc scan;
 		HeapTuple	tuple;
-		ScanKeyData key;
 		Oid candidateOid;
-
-		ScanKeyInit(&key,
-					Anum_pg_class_relkind,
-					BTEqualStrategyNumber, F_CHAREQ,
-					CharGetDatum(RELKIND_RELATION));
+		List	   *rootParts = NIL;
 
 		pgclass = heap_open(RelationRelationId, AccessShareLock);
 
-		scan = heap_beginscan(pgclass, SnapshotNow, 1, &key);
+		scan = heap_beginscan_catalog(pgclass, 0, NULL);
 
 		while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 		{
@@ -1561,27 +1208,19 @@ get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
 			 *   - Foreign tables
 			 *   - etc.
 			 */
-			if (classForm->relkind == RELKIND_RELATION && (
-					classForm->relstorage == RELSTORAGE_EXTERNAL ||
-					classForm->relstorage == RELSTORAGE_FOREIGN  ||
-					classForm->relstorage == RELSTORAGE_VIRTUAL))
+			if (classForm->relkind != RELKIND_RELATION &&
+				classForm->relkind != RELKIND_MATVIEW)
 				continue;
-
-			/* Skip persistent tables for Vacuum full. Vacuum full could turn
-			 * out dangerous as it has potential to move tuples around causing
-			 * the TIDs for tuples to change, which violates its reference from
-			 * gp_relation_node. One scenario where this can happen is zero-page
-			 * due to failure after page extension but before page initialization.
-			 */
-			if (vacstmt->full &&
-				GpPersistent_IsPersistentRelation(HeapTupleGetOid(tuple)))
+			if (classForm->relstorage == RELSTORAGE_EXTERNAL ||
+				classForm->relstorage == RELSTORAGE_FOREIGN  ||
+				classForm->relstorage == RELSTORAGE_VIRTUAL)
 				continue;
 
 			/* Make a relation list entry for this guy */
 			candidateOid = HeapTupleGetOid(tuple);
 
 			/* Skip non root partition tables if ANALYZE ROOTPARTITION ALL is executed */
-			if (vacstmt->rootonly && !rel_is_partitioned(candidateOid))
+			if ((vacstmt->options & VACOPT_ROOTONLY) && !rel_is_partitioned(candidateOid))
 			{
 				continue;
 			}
@@ -1593,10 +1232,30 @@ get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
 				continue;
 			}
 
+			// Likewise, skip root partition, if disabled.
+			if (!optimizer_analyze_root_partition && (vacstmt->options & VACOPT_ROOTONLY) == 0 && ps == PART_STATUS_ROOT)
+			{
+				continue;
+			}
+
 			oldcontext = MemoryContextSwitchTo(vac_context);
-			oid_list = lappend_oid(oid_list, candidateOid);
+			if (ps == PART_STATUS_ROOT)
+				rootParts = lappend_oid(rootParts, candidateOid);
+			else
+				oid_list = lappend_oid(oid_list, candidateOid);
 			MemoryContextSwitchTo(oldcontext);
 		}
+
+		/*
+		 * Schedule the root partitions to be analyzed after all the leaves.
+		 * A root partition can often be analyzed by combining the HLL
+		 * counters from all the leaves, which is much cheaper than scanning
+		 * the whole partitioned table, but that only works if the leaves
+		 * have already been analyzed.
+		 */
+		oldcontext = MemoryContextSwitchTo(vac_context);
+		oid_list = list_concat(oid_list, rootParts);
+		MemoryContextSwitchTo(oldcontext);
 
 		heap_endscan(scan);
 		heap_close(pgclass, AccessShareLock);
@@ -1607,26 +1266,55 @@ get_rel_oids(Oid relid, VacuumStmt *vacstmt, const char *stmttype)
 
 /*
  * vacuum_set_xid_limits() -- compute oldest-Xmin and freeze cutoff points
+ *
+ * The output parameters are:
+ * - oldestXmin is the cutoff value used to distinguish whether tuples are
+ *	 DEAD or RECENTLY_DEAD (see HeapTupleSatisfiesVacuum).
+ * - freezeLimit is the Xid below which all Xids are replaced by
+ *	 FrozenTransactionId during vacuum.
+ * - xidFullScanLimit (computed from table_freeze_age parameter)
+ *	 represents a minimum Xid value; a table whose relfrozenxid is older than
+ *	 this will have a full-table vacuum applied to it, to freeze tuples across
+ *	 the whole table.  Vacuuming a table younger than this value can use a
+ *	 partial scan.
+ * - multiXactCutoff is the value below which all MultiXactIds are removed from
+ *	 Xmax.
+ * - mxactFullScanLimit is a value against which a table's relminmxid value is
+ *	 compared to produce a full-table vacuum, as with xidFullScanLimit.
+ *
+ * xidFullScanLimit and mxactFullScanLimit can be passed as NULL if caller is
+ * not interested.
  */
 void
-vacuum_set_xid_limits(int freeze_min_age, bool sharedRel,
+vacuum_set_xid_limits(Relation rel,
+					  int freeze_min_age,
+					  int freeze_table_age,
+					  int multixact_freeze_min_age,
+					  int multixact_freeze_table_age,
 					  TransactionId *oldestXmin,
-					  TransactionId *freezeLimit)
+					  TransactionId *freezeLimit,
+					  TransactionId *xidFullScanLimit,
+					  MultiXactId *multiXactCutoff,
+					  MultiXactId *mxactFullScanLimit)
 {
 	int			freezemin;
+	int			mxid_freezemin;
+	int			effective_multixact_freeze_max_age;
 	TransactionId limit;
 	TransactionId safeLimit;
+	MultiXactId mxactLimit;
+	MultiXactId safeMxactLimit;
 
 	/*
-	 * We can always ignore processes running lazy vacuum.	This is because we
+	 * We can always ignore processes running lazy vacuum.  This is because we
 	 * use these values only for deciding which tuples we must keep in the
-	 * tables.	Since lazy vacuum doesn't write its XID anywhere, it's safe to
-	 * ignore it.  In theory it could be problematic to ignore lazy vacuums on
+	 * tables.  Since lazy vacuum doesn't write its XID anywhere, it's safe to
+	 * ignore it.  In theory it could be problematic to ignore lazy vacuums in
 	 * a full vacuum, but keep in mind that only one vacuum process can be
 	 * working on a particular table at any time, and that each vacuum is
 	 * always an independent transaction.
 	 */
-	*oldestXmin = GetOldestXmin(sharedRel, true);
+	*oldestXmin = GetOldestXmin(rel, true);
 
 	Assert(TransactionIdIsNormal(*oldestXmin));
 
@@ -1667,20 +1355,118 @@ vacuum_set_xid_limits(int freeze_min_age, bool sharedRel,
 	}
 
 	*freezeLimit = limit;
-}
 
+	/*
+	 * Compute the multixact age for which freezing is urgent.  This is
+	 * normally autovacuum_multixact_freeze_max_age, but may be less if we
+	 * are short of multixact member space.
+	 */
+	effective_multixact_freeze_max_age = MultiXactMemberFreezeThreshold();
+
+	/*
+	 * Determine the minimum multixact freeze age to use: as specified by
+	 * caller, or vacuum_multixact_freeze_min_age, but in any case not more
+	 * than half effective_multixact_freeze_max_age, so that autovacuums to
+	 * prevent MultiXact wraparound won't occur too frequently.
+	 */
+	mxid_freezemin = multixact_freeze_min_age;
+	if (mxid_freezemin < 0)
+		mxid_freezemin = vacuum_multixact_freeze_min_age;
+	mxid_freezemin = Min(mxid_freezemin,
+						 effective_multixact_freeze_max_age / 2);
+	Assert(mxid_freezemin >= 0);
+
+	/* compute the cutoff multi, being careful to generate a valid value */
+	mxactLimit = GetOldestMultiXactId() - mxid_freezemin;
+	if (mxactLimit < FirstMultiXactId)
+		mxactLimit = FirstMultiXactId;
+
+	safeMxactLimit =
+		ReadNextMultiXactId() - effective_multixact_freeze_max_age;
+	if (safeMxactLimit < FirstMultiXactId)
+		safeMxactLimit = FirstMultiXactId;
+
+	if (MultiXactIdPrecedes(mxactLimit, safeMxactLimit))
+	{
+		ereport(WARNING,
+				(errmsg("oldest multixact is far in the past"),
+				 errhint("Close open transactions with multixacts soon to avoid wraparound problems.")));
+		mxactLimit = safeMxactLimit;
+	}
+
+	*multiXactCutoff = mxactLimit;
+
+	if (xidFullScanLimit != NULL)
+	{
+		int			freezetable;
+
+		Assert(mxactFullScanLimit != NULL);
+
+		/*
+		 * Determine the table freeze age to use: as specified by the caller,
+		 * or vacuum_freeze_table_age, but in any case not more than
+		 * autovacuum_freeze_max_age * 0.95, so that if you have e.g nightly
+		 * VACUUM schedule, the nightly VACUUM gets a chance to freeze tuples
+		 * before anti-wraparound autovacuum is launched.
+		 */
+		freezetable = freeze_table_age;
+		if (freezetable < 0)
+			freezetable = vacuum_freeze_table_age;
+		freezetable = Min(freezetable, autovacuum_freeze_max_age * 0.95);
+		Assert(freezetable >= 0);
+
+		/*
+		 * Compute XID limit causing a full-table vacuum, being careful not to
+		 * generate a "permanent" XID.
+		 */
+		limit = ReadNewTransactionId() - freezetable;
+		if (!TransactionIdIsNormal(limit))
+			limit = FirstNormalTransactionId;
+
+		*xidFullScanLimit = limit;
+
+		/*
+		 * Similar to the above, determine the table freeze age to use for
+		 * multixacts: as specified by the caller, or
+		 * vacuum_multixact_freeze_table_age, but in any case not more than
+		 * autovacuum_multixact_freeze_table_age * 0.95, so that if you have
+		 * e.g. nightly VACUUM schedule, the nightly VACUUM gets a chance to
+		 * freeze multixacts before anti-wraparound autovacuum is launched.
+		 */
+		freezetable = multixact_freeze_table_age;
+		if (freezetable < 0)
+			freezetable = vacuum_multixact_freeze_table_age;
+		freezetable = Min(freezetable,
+						  effective_multixact_freeze_max_age * 0.95);
+		Assert(freezetable >= 0);
+
+		/*
+		 * Compute MultiXact limit causing a full-table vacuum, being careful
+		 * to generate a valid MultiXact value.
+		 */
+		mxactLimit = ReadNextMultiXactId() - freezetable;
+		if (mxactLimit < FirstMultiXactId)
+			mxactLimit = FirstMultiXactId;
+
+		*mxactFullScanLimit = mxactLimit;
+	}
+	else
+	{
+		Assert(mxactFullScanLimit == NULL);
+	}
+}
 
 /*
  * vac_estimate_reltuples() -- estimate the new value for pg_class.reltuples
  *
  *		If we scanned the whole relation then we should just use the count of
- *		live tuples seen; but if we did not, we should not trust the count
- *		unreservedly, especially not in VACUUM, which may have scanned a quite
- *		nonrandom subset of the table.  When we have only partial information,
- *		we take the old value of pg_class.reltuples as a measurement of the
+ *		live tuples seen; but if we did not, we should not blindly extrapolate
+ *		from that number, since VACUUM may have scanned a quite nonrandom
+ *		subset of the table.  When we have only partial information, we take
+ *		the old value of pg_class.reltuples as a measurement of the
  *		tuple density in the unscanned pages.
  *
- *		This routine is shared by VACUUM and ANALYZE.
+ *		The is_analyze argument is historical.
  */
 double
 vac_estimate_reltuples(Relation relation, bool is_analyze,
@@ -1688,12 +1474,11 @@ vac_estimate_reltuples(Relation relation, bool is_analyze,
 					   BlockNumber scanned_pages,
 					   double scanned_tuples)
 {
-	BlockNumber	old_rel_pages = relation->rd_rel->relpages;
+	BlockNumber old_rel_pages = relation->rd_rel->relpages;
 	double		old_rel_tuples = relation->rd_rel->reltuples;
 	double		old_density;
-	double		new_density;
-	double		multiplier;
-	double		updated_density;
+	double		unscanned_pages;
+	double		total_tuples;
 
 	/* If we did scan the whole table, just use the count as-is */
 	if (scanned_pages >= total_pages)
@@ -1718,65 +1503,58 @@ vac_estimate_reltuples(Relation relation, bool is_analyze,
 	/*
 	 * Okay, we've covered the corner cases.  The normal calculation is to
 	 * convert the old measurement to a density (tuples per page), then
-	 * update the density using an exponential-moving-average approach,
-	 * and finally compute reltuples as updated_density * total_pages.
-	 *
-	 * For ANALYZE, the moving average multiplier is just the fraction of
-	 * the table's pages we scanned.  This is equivalent to assuming
-	 * that the tuple density in the unscanned pages didn't change.  Of
-	 * course, it probably did, if the new density measurement is different.
-	 * But over repeated cycles, the value of reltuples will converge towards
-	 * the correct value, if repeated measurements show the same new density.
-	 *
-	 * For VACUUM, the situation is a bit different: we have looked at a
-	 * nonrandom sample of pages, but we know for certain that the pages we
-	 * didn't look at are precisely the ones that haven't changed lately.
-	 * Thus, there is a reasonable argument for doing exactly the same thing
-	 * as for the ANALYZE case, that is use the old density measurement as
-	 * the value for the unscanned pages.
-	 *
-	 * This logic could probably use further refinement.
+	 * estimate the number of tuples in the unscanned pages using that figure,
+	 * and finally add on the number of tuples in the scanned pages.
 	 */
 	old_density = old_rel_tuples / old_rel_pages;
-	new_density = scanned_tuples / scanned_pages;
-	multiplier = (double) scanned_pages / (double) total_pages;
-	updated_density = old_density + (new_density - old_density) * multiplier;
-	return floor(updated_density * total_pages + 0.5);
+	unscanned_pages = (double) total_pages - (double) scanned_pages;
+	total_tuples = old_density * unscanned_pages + scanned_tuples;
+	return floor(total_tuples + 0.5);
 }
 
 
-void
-vac_update_relstats_from_list(Relation rel,
-							  BlockNumber num_pages, double num_tuples,
-							  bool hasindex, TransactionId frozenxid,
-							  List *updated_stats)
+/*
+ * Update relpages/reltuples of all the relations in the list.
+ */
+static void
+vac_update_relstats_from_list(List *updated_stats)
 {
-	/*
-	 * If this is QD, use the stats collected in updated_stats instead of
-	 * the one provided through 'num_pages' and 'num_tuples'.  It doesn't
-	 * seem worth doing so for system tables, though (it'd better say
-	 * "non-distributed" tables than system relations here, but for now
-	 * it's effectively the same.)
-	 */
-	if (Gp_role == GP_ROLE_DISPATCH && !IsSystemRelation(rel))
-	{
-		ListCell *lc;
-		num_pages = 0;
-		num_tuples = 0.0;
-		foreach (lc, updated_stats)
-		{
-			VPgClassStats *stats = (VPgClassStats *) lfirst(lc);
-			if (stats->relid == RelationGetRelid(rel))
-			{
-				num_pages += stats->rel_pages;
-				num_tuples += stats->rel_tuples;
-				break;
-			}
-		}
-	}
+	ListCell *lc;
 
-	vac_update_relstats(rel, num_pages, num_tuples,
-						hasindex, frozenxid);
+	/*
+	 * This function is only called in the context of the QD, so let's be
+	 * explicit about that given the assumptions taken.
+	 */
+	Assert(Gp_role == GP_ROLE_DISPATCH);
+
+	foreach (lc, updated_stats)
+	{
+		VPgClassStats *stats = (VPgClassStats *) lfirst(lc);
+		Relation	rel;
+
+		rel = relation_open(stats->relid, AccessShareLock);
+
+		if (GpPolicyIsReplicated(rel->rd_cdbpolicy))
+		{
+			stats->rel_pages = stats->rel_pages / rel->rd_cdbpolicy->numsegments;
+			stats->rel_tuples = stats->rel_tuples / rel->rd_cdbpolicy->numsegments;
+			stats->relallvisible = stats->relallvisible / rel->rd_cdbpolicy->numsegments;
+		}
+
+		/*
+		 * Pass 'false' for isvacuum, so that the stats are
+		 * actually updated.
+		 */
+		vac_update_relstats(rel,
+							stats->rel_pages, stats->rel_tuples,
+							stats->relallvisible,
+							rel->rd_rel->relhasindex,
+							InvalidTransactionId,
+							InvalidMultiXactId,
+							false,
+							false /* isvacuum */);
+		relation_close(rel, AccessShareLock);
+	}
 }
 
 /*
@@ -1789,25 +1567,41 @@ vac_update_relstats_from_list(Relation rel,
  *
  *		We violate transaction semantics here by overwriting the rel's
  *		existing pg_class tuple with the new values.  This is reasonably
- *		safe since the new values are correct whether or not this transaction
- *		commits.  The reason for this is that if we updated these tuples in
- *		the usual way, vacuuming pg_class itself wouldn't work very well ---
- *		by the time we got done with a vacuum cycle, most of the tuples in
- *		pg_class would've been obsoleted.  Of course, this only works for
- *		fixed-size never-null columns, but these are.
+ *		safe as long as we're sure that the new values are correct whether or
+ *		not this transaction commits.  The reason for doing this is that if
+ *		we updated these tuples in the usual way, vacuuming pg_class itself
+ *		wouldn't work very well --- by the time we got done with a vacuum
+ *		cycle, most of the tuples in pg_class would've been obsoleted.  Of
+ *		course, this only works for fixed-size not-null columns, but these are.
  *
- *		Note another assumption: that two VACUUMs/ANALYZEs on a table can't
- *		run in parallel, nor can VACUUM/ANALYZE run in parallel with a
- *		schema alteration such as adding an index, rule, or trigger.  Otherwise
- *		our updates of relhasindex etc might overwrite uncommitted updates.
+ *		Another reason for doing it this way is that when we are in a lazy
+ *		VACUUM and have PROC_IN_VACUUM set, we mustn't do any regular updates.
+ *		Somebody vacuuming pg_class might think they could delete a tuple
+ *		marked with xmin = our xid.
  *
- *		This routine is shared by full VACUUM, lazy VACUUM, and stand-alone
- *		ANALYZE.
+ *		In addition to fundamentally nontransactional statistics such as
+ *		relpages and relallvisible, we try to maintain certain lazily-updated
+ *		DDL flags such as relhasindex, by clearing them if no longer correct.
+ *		It's safe to do this in VACUUM, which can't run in parallel with
+ *		CREATE INDEX/RULE/TRIGGER and can't be part of a transaction block.
+ *		However, it's *not* safe to do it in an ANALYZE that's within an
+ *		outer transaction, because for example the current transaction might
+ *		have dropped the last index; then we'd think relhasindex should be
+ *		cleared, but if the transaction later rolls back this would be wrong.
+ *		So we refrain from updating the DDL flags if we're inside an outer
+ *		transaction.  This is OK since postponing the flag maintenance is
+ *		always allowable.
+ *
+ *		This routine is shared by VACUUM and ANALYZE.
  */
 void
 vac_update_relstats(Relation relation,
 					BlockNumber num_pages, double num_tuples,
-					bool hasindex, TransactionId frozenxid)
+					BlockNumber num_all_visible_pages,
+					bool hasindex, TransactionId frozenxid,
+					MultiXactId minmulti,
+					bool in_outer_xact,
+					bool isvacuum)
 {
 	Oid			relid = RelationGetRelid(relation);
 	Relation	rd;
@@ -1818,24 +1612,45 @@ vac_update_relstats(Relation relation,
 	Assert(relid != InvalidOid);
 
 	/*
-	 * CDB: send the number of tuples and the number of pages in pg_class located
-	 * at QEs through the dispatcher.
+	 * In GPDB, all the data is stored in the segments, and the
+	 * relpages/reltuples in the master reflect the sum of the values in
+	 * all the segments. In VACUUM, don't overwrite relpages/reltuples with
+	 * the values we counted in the QD node itself. We will dispatch the
+	 * VACUUM to the segments after processing the QD node, and we will
+	 * update relpages/reltuples then.
+	 *
+	 * Update stats for system tables normally, though (it'd better say
+	 * "non-distributed" tables than system relations here, but for now
+	 * it's effectively the same.)
 	 */
-	if (Gp_role == GP_ROLE_EXECUTE)
+	if (!IsSystemRelation(relation) && isvacuum)
 	{
-		/* cdbanalyze_get_relstats(rel, &num_pages, &num_tuples);*/
-		StringInfoData buf;
-		VPgClassStats stats;
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			num_pages = relation->rd_rel->relpages;
+			num_tuples = relation->rd_rel->reltuples;
+			num_all_visible_pages = relation->rd_rel->relallvisible;
+		}
+		else if (Gp_role == GP_ROLE_EXECUTE)
+		{
+			/*
+			 * CDB: Build a special message, to send the number of tuples
+			 * and the number of pages in pg_class located at QEs through
+			 * the dispatcher.
+			 */
+			StringInfoData buf;
+			VPgClassStats stats;
 
-		pq_beginmessage(&buf, 'y');
-		pq_sendstring(&buf, "VACUUM");
-		stats.relid = relid;
-		stats.rel_pages = num_pages;
-		stats.rel_tuples = num_tuples;
-		stats.empty_end_pages = 0;
-		pq_sendint(&buf, sizeof(VPgClassStats), sizeof(int));
-		pq_sendbytes(&buf, (char *) &stats, sizeof(VPgClassStats));
-		pq_endmessage(&buf);
+			pq_beginmessage(&buf, 'y');
+			pq_sendstring(&buf, "VACUUM");
+			stats.relid = RelationGetRelid(relation);
+			stats.rel_pages = num_pages;
+			stats.rel_tuples = num_tuples;
+			stats.relallvisible = num_all_visible_pages;
+			pq_sendint(&buf, sizeof(VPgClassStats), sizeof(int));
+			pq_sendbytes(&buf, (char *) &stats, sizeof(VPgClassStats));
+			pq_endmessage(&buf);
+		}
 	}
 
 	/*
@@ -1846,6 +1661,27 @@ vac_update_relstats(Relation relation,
 	 */
 	if (num_pages < 1.0)
 	{
+		/*
+		 * When running in utility mode in the QD node, we get the number of
+		 * tuples of an AO table from the pg_aoseg table, but we don't know
+		 * the file size, so that's always 0. Ignore the tuple count we got,
+		 * and set reltuples to 0 instead, to avoid storing a confusing
+		 * combination, and to avoid hitting the Assert below (which we
+		 * inherited from upstream).
+		 *
+		 * It's perhaps not such a great idea to overwrite perfectly good
+		 * relpages/reltuples estimates in utility mode, but that's what we
+		 * do for heap tables, too, because we don't have even a tuple count
+		 * for them. At least this is consistent.
+		 */
+		if (num_tuples >= 1.0)
+		{
+			Assert(Gp_role == GP_ROLE_UTILITY);
+			Assert(!IsSystemRelation(relation));
+			Assert(RelationIsAppendOptimized(relation));
+			num_tuples = 0;
+		}
+
 		Assert(num_tuples < 1.0);
 		num_pages = 1.0;
 	}
@@ -1856,30 +1692,34 @@ vac_update_relstats(Relation relation,
 	rd = heap_open(RelationRelationId, RowExclusiveLock);
 
 	/* Fetch a copy of the tuple to scribble on */
-	ctup = SearchSysCacheCopy(RELOID,
-							  ObjectIdGetDatum(relid),
-							  0, 0, 0);
+	ctup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(ctup))
 		elog(ERROR, "pg_class entry for relid %u vanished during vacuuming",
 			 relid);
 	pgcform = (Form_pg_class) GETSTRUCT(ctup);
 
-	/* Apply required updates, if any, to copied tuple */
+	/* Apply statistical updates, if any, to copied tuple */
+
+	/* GPDB-specific not allow change relpages and reltuples when vacuum in utility mode on QD
+	 * Because there's a chance that we overwrite perfectly good stats with zeros
+	 */
+
+	bool ifUpdate = ! (IS_QUERY_DISPATCHER() && Gp_role == GP_ROLE_UTILITY);
 
 	dirty = false;
-	if (pgcform->relpages != (int32) num_pages)
+	if (pgcform->relpages != (int32) num_pages && ifUpdate)
 	{
 		pgcform->relpages = (int32) num_pages;
 		dirty = true;
 	}
-	if (pgcform->reltuples != (float4) num_tuples)
+	if (pgcform->reltuples != (float4) num_tuples && ifUpdate)
 	{
 		pgcform->reltuples = (float4) num_tuples;
 		dirty = true;
 	}
-	if (pgcform->relhasindex != hasindex)
+	if (pgcform->relallvisible != (int32) num_all_visible_pages)
 	{
-		pgcform->relhasindex = hasindex;
+		pgcform->relallvisible = (int32) num_all_visible_pages;
 		dirty = true;
 	}
 
@@ -1887,38 +1727,79 @@ vac_update_relstats(Relation relation,
 		 relid, pgcform->relpages, pgcform->reltuples);
 	/*
 	 * If we have discovered that there are no indexes, then there's no
-	 * primary key either.	This could be done more thoroughly...
+	 * primary key either.  This could be done more thoroughly...
 	 */
-	if (!hasindex)
+	if (pgcform->relhaspkey && !hasindex)
 	{
-		if (pgcform->relhaspkey)
+		pgcform->relhaspkey = false;
+		dirty = true;
+	}
+
+	if (!in_outer_xact)
+	{
+		/*
+		 * If we didn't find any indexes, reset relhasindex.
+		 */
+		if (pgcform->relhasindex && !hasindex)
+		{
+			pgcform->relhasindex = false;
+			dirty = true;
+		}
+
+		/*
+		 * If we have discovered that there are no indexes, then there's no
+		 * primary key either.  This could be done more thoroughly...
+		 */
+		if (pgcform->relhaspkey && !hasindex)
 		{
 			pgcform->relhaspkey = false;
 			dirty = true;
 		}
-	}
 
-	/* We also clear relhasrules and relhastriggers if needed */
-	if (pgcform->relhasrules && relation->rd_rules == NULL)
-	{
-		pgcform->relhasrules = false;
-		dirty = true;
-	}
-	if (pgcform->relhastriggers && relation->trigdesc == NULL)
-	{
-		pgcform->relhastriggers = false;
-		dirty = true;
+		/* We also clear relhasrules and relhastriggers if needed */
+		if (pgcform->relhasrules && relation->rd_rules == NULL)
+		{
+			pgcform->relhasrules = false;
+			dirty = true;
+		}
+		if (pgcform->relhastriggers && relation->trigdesc == NULL)
+		{
+			pgcform->relhastriggers = false;
+			dirty = true;
+		}
 	}
 
 	/*
-	 * relfrozenxid should never go backward.  Caller can pass
-	 * InvalidTransactionId if it has no new data.
+	 * Update relfrozenxid, unless caller passed InvalidTransactionId
+	 * indicating it has no new data.
+	 *
+	 * Ordinarily, we don't let relfrozenxid go backwards: if things are
+	 * working correctly, the only way the new frozenxid could be older would
+	 * be if a previous VACUUM was done with a tighter freeze_min_age, in
+	 * which case we don't want to forget the work it already did.  However,
+	 * if the stored relfrozenxid is "in the future", then it must be corrupt
+	 * and it seems best to overwrite it with the cutoff we used this time.
+	 * This should match vac_update_datfrozenxid() concerning what we consider
+	 * to be "in the future".
 	 */
 	if (TransactionIdIsNormal(frozenxid) &&
 		TransactionIdIsValid(pgcform->relfrozenxid) &&
-		TransactionIdPrecedes(pgcform->relfrozenxid, frozenxid))
+		pgcform->relfrozenxid != frozenxid &&
+		(TransactionIdPrecedes(pgcform->relfrozenxid, frozenxid) ||
+		 TransactionIdPrecedes(ReadNewTransactionId(),
+							   pgcform->relfrozenxid)))
 	{
 		pgcform->relfrozenxid = frozenxid;
+		dirty = true;
+	}
+
+	/* Similarly for relminmxid */
+	if (MultiXactIdIsValid(minmulti) &&
+		pgcform->relminmxid != minmulti &&
+		(MultiXactIdPrecedes(pgcform->relminmxid, minmulti) ||
+		 MultiXactIdPrecedes(ReadNextMultiXactId(), pgcform->relminmxid)))
+	{
+		pgcform->relminmxid = minmulti;
 		dirty = true;
 	}
 
@@ -1934,16 +1815,19 @@ vac_update_relstats(Relation relation,
  *	vac_update_datfrozenxid() -- update pg_database.datfrozenxid for our DB
  *
  *		Update pg_database's datfrozenxid entry for our database to be the
- *		minimum of the pg_class.relfrozenxid values.  If we are able to
- *		advance pg_database.datfrozenxid, also try to truncate pg_clog.
+ *		minimum of the pg_class.relfrozenxid values.
+ *
+ *		Similarly, update our datminmxid to be the minimum of the
+ *		pg_class.relminmxid values.
+ *
+ *		If we are able to advance either pg_database value, also try to
+ *		truncate pg_clog and pg_multixact.
  *
  *		We violate transaction semantics here by overwriting the database's
- *		existing pg_database tuple with the new value.	This is reasonably
- *		safe since the new value is correct whether or not this transaction
+ *		existing pg_database tuple with the new values.  This is reasonably
+ *		safe since the new values are correct whether or not this transaction
  *		commits.  As with vac_update_relstats, this avoids leaving dead tuples
  *		behind after a VACUUM.
- *
- *		This routine is shared by full and lazy VACUUM.
  */
 void
 vac_update_datfrozenxid(void)
@@ -1954,15 +1838,39 @@ vac_update_datfrozenxid(void)
 	SysScanDesc scan;
 	HeapTuple	classTup;
 	TransactionId newFrozenXid;
+	MultiXactId newMinMulti;
+	TransactionId lastSaneFrozenXid;
+	MultiXactId lastSaneMinMulti;
+	bool		bogus = false;
 	bool		dirty = false;
 
 	/*
 	 * Initialize the "min" calculation with GetOldestXmin, which is a
 	 * reasonable approximation to the minimum relfrozenxid for not-yet-
 	 * committed pg_class entries for new tables; see AddNewRelationTuple().
-	 * Se we cannot produce a wrong minimum by starting with this.
+	 * So we cannot produce a wrong minimum by starting with this.
+	 *
+	 * GPDB: Use GetLocalOldestXmin here, rather than GetOldestXmin. We don't
+	 * want to include effects of distributed transactions in this. If a
+	 * database's datfrozenxid is past the oldest XID as determined by
+	 * distributed transactions, we will nevertheless never encounter such
+	 * XIDs on disk.
 	 */
-	newFrozenXid = GetOldestXmin(true, true);
+	newFrozenXid = GetLocalOldestXmin(NULL, true);
+
+	/*
+	 * Similarly, initialize the MultiXact "min" with the value that would be
+	 * used on pg_class for new tables.  See AddNewRelationTuple().
+	 */
+	newMinMulti = GetOldestMultiXactId();
+
+	/*
+	 * Identify the latest relfrozenxid and relminmxid values that we could
+	 * validly see during the scan.  These are conservative values, but it's
+	 * not really worth trying to be more exact.
+	 */
+	lastSaneFrozenXid = ReadNewTransactionId();
+	lastSaneMinMulti = ReadNextMultiXactId();
 
 	/*
 	 * We must seqscan pg_class to find the minimum Xid, because there is no
@@ -1971,68 +1879,124 @@ vac_update_datfrozenxid(void)
 	relation = heap_open(RelationRelationId, AccessShareLock);
 
 	scan = systable_beginscan(relation, InvalidOid, false,
-							  SnapshotNow, 0, NULL);
+							  NULL, 0, NULL);
 
 	while ((classTup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(classTup);
 
-		if (!should_have_valid_relfrozenxid(HeapTupleGetOid(classTup),
-											classForm->relkind,
-											classForm->relstorage))
-		{
-			Assert(!TransactionIdIsValid(classForm->relfrozenxid));
+#if 0
+		/*
+		 * Only consider relations able to hold unfrozen XIDs (anything else
+		 * should have InvalidTransactionId in relfrozenxid anyway.)
+		 */
+		if (classForm->relkind != RELKIND_RELATION &&
+			classForm->relkind != RELKIND_MATVIEW &&
+			classForm->relkind != RELKIND_TOASTVALUE)
 			continue;
-		}
+#endif
+
+		/* GPDB_94_MERGE_FIXME: We have had this check here, instead of the above
+		 * check that upstream has. I would be more comfortable if we would list
+		 * the relkinds here explicitly, like in upstream..
+		 */
+		if (!TransactionIdIsValid(classForm->relfrozenxid))
+			continue;
 
 		Assert(TransactionIdIsNormal(classForm->relfrozenxid));
+		Assert(MultiXactIdIsValid(classForm->relminmxid));
+		/*
+		 * Don't know partition parent or not here but passing false is perfect
+		 * for assertion, as valid relfrozenxid means it shouldn't be parent.
+		 */
+		Assert(should_have_valid_relfrozenxid(classForm->relkind,
+											  classForm->relstorage, false));
+
+		/*
+		 * If things are working properly, no relation should have a
+		 * relfrozenxid or relminmxid that is "in the future".  However, such
+		 * cases have been known to arise due to bugs in pg_upgrade.  If we
+		 * see any entries that are "in the future", chicken out and don't do
+		 * anything.  This ensures we won't truncate clog before those
+		 * relations have been scanned and cleaned up.
+		 */
+		if (TransactionIdPrecedes(lastSaneFrozenXid, classForm->relfrozenxid) ||
+			MultiXactIdPrecedes(lastSaneMinMulti, classForm->relminmxid))
+		{
+			bogus = true;
+			break;
+		}
 
 		if (TransactionIdPrecedes(classForm->relfrozenxid, newFrozenXid))
 			newFrozenXid = classForm->relfrozenxid;
+
+		if (MultiXactIdPrecedes(classForm->relminmxid, newMinMulti))
+			newMinMulti = classForm->relminmxid;
 	}
 
 	/* we're done with pg_class */
 	systable_endscan(scan);
 	heap_close(relation, AccessShareLock);
 
+	/* chicken out if bogus data found */
+	if (bogus)
+		return;
+
 	Assert(TransactionIdIsNormal(newFrozenXid));
+	Assert(MultiXactIdIsValid(newMinMulti));
 
 	/* Now fetch the pg_database tuple we need to update. */
 	relation = heap_open(DatabaseRelationId, RowExclusiveLock);
 
 	/* Fetch a copy of the tuple to scribble on */
-	tuple = SearchSysCacheCopy(DATABASEOID,
-							   ObjectIdGetDatum(MyDatabaseId),
-							   0, 0, 0);
+	tuple = SearchSysCacheCopy1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "could not find tuple for database %u", MyDatabaseId);
 	dbform = (Form_pg_database) GETSTRUCT(tuple);
 
 	/*
-	 * Don't allow datfrozenxid to go backward (probably can't happen anyway);
-	 * and detect the common case where it doesn't go forward either.
+	 * As in vac_update_relstats(), we ordinarily don't want to let
+	 * datfrozenxid go backward; but if it's "in the future" then it must be
+	 * corrupt and it seems best to overwrite it.
 	 */
-	if (TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid))
+	if (dbform->datfrozenxid != newFrozenXid &&
+		(TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid) ||
+		 TransactionIdPrecedes(lastSaneFrozenXid, dbform->datfrozenxid)))
 	{
 		dbform->datfrozenxid = newFrozenXid;
 		dirty = true;
 	}
+	else
+		newFrozenXid = dbform->datfrozenxid;
+
+	/* Ditto for datminmxid */
+	if (dbform->datminmxid != newMinMulti &&
+		(MultiXactIdPrecedes(dbform->datminmxid, newMinMulti) ||
+		 MultiXactIdPrecedes(lastSaneMinMulti, dbform->datminmxid)))
+	{
+		dbform->datminmxid = newMinMulti;
+		dirty = true;
+	}
+	else
+		newMinMulti = dbform->datminmxid;
 
 	if (dirty)
+	{
 		heap_inplace_update(relation, tuple);
+		SIMPLE_FAULT_INJECTOR("vacuum_update_dat_frozen_xid");
+	}
 
 	heap_freetuple(tuple);
 	heap_close(relation, RowExclusiveLock);
 
 	/*
-	 * If we were able to advance datfrozenxid, mark the flat-file copy of
-	 * pg_database for update at commit, and see if we can truncate pg_clog.
+	 * If we were able to advance datfrozenxid or datminmxid, see if we can
+	 * truncate pg_clog and/or pg_multixact.  Also do it if the shared
+	 * XID-wrap-limit info is stale, since this action will update that too.
 	 */
-	if (dirty)
-	{
-		database_file_update_needed();
-		vac_truncate_clog(newFrozenXid);
-	}
+	if (dirty || ForceTransactionIdLimitUpdate())
+		vac_truncate_clog(newFrozenXid, newMinMulti,
+						  lastSaneFrozenXid, lastSaneMinMulti);
 }
 
 
@@ -2042,29 +2006,44 @@ vac_update_datfrozenxid(void)
  *		Scan pg_database to determine the system-wide oldest datfrozenxid,
  *		and use it to truncate the transaction commit log (pg_clog).
  *		Also update the XID wrap limit info maintained by varsup.c.
+ *		Likewise for datminmxid.
  *
- *		The passed XID is simply the one I just wrote into my pg_database
- *		entry.	It's used to initialize the "min" calculation.
+ *		The passed frozenXID and minMulti are the updated values for my own
+ *		pg_database entry. They're used to initialize the "min" calculations.
+ *		The caller also passes the "last sane" XID and MXID, since it has
+ *		those at hand already.
  *
- *		This routine is shared by full and lazy VACUUM.  Note that it's
- *		only invoked when we've managed to change our DB's datfrozenxid
- *		entry.
+ *		This routine is only invoked when we've managed to change our
+ *		DB's datfrozenxid/datminmxid values, or we found that the shared
+ *		XID-wrap-limit info is stale.
  */
 static void
-vac_truncate_clog(TransactionId frozenXID)
+vac_truncate_clog(TransactionId frozenXID,
+				  MultiXactId minMulti,
+				  TransactionId lastSaneFrozenXid,
+				  MultiXactId lastSaneMinMulti)
 {
-	TransactionId myXID = GetCurrentTransactionId();
+	TransactionId nextXID = ReadNewTransactionId();
 	Relation	relation;
 	HeapScanDesc scan;
 	HeapTuple	tuple;
-	NameData	oldest_datname;
+	Oid			oldestxid_datoid;
+	Oid			minmulti_datoid;
+	bool		bogus = false;
 	bool		frozenAlreadyWrapped = false;
 
-	/* init oldest_datname to sync with my frozenXID */
-	namestrcpy(&oldest_datname, get_database_name(MyDatabaseId));
+	/* init oldest datoids to sync with my frozenXID/minMulti values */
+	oldestxid_datoid = MyDatabaseId;
+	minmulti_datoid = MyDatabaseId;
 
 	/*
-	 * Scan pg_database to compute the minimum datfrozenxid
+	 * Scan pg_database to compute the minimum datfrozenxid/datminmxid
+	 *
+	 * Since vac_update_datfrozenxid updates datfrozenxid/datminmxid in-place,
+	 * the values could change while we look at them.  Fetch each one just
+	 * once to ensure sane behavior of the comparison logic.  (Here, as in
+	 * many other places, we assume that fetching or updating an XID in shared
+	 * storage is atomic.)
 	 *
 	 * Note: we need not worry about a race condition with new entries being
 	 * inserted by CREATE DATABASE.  Any such entry will have a copy of some
@@ -2077,27 +2056,42 @@ vac_truncate_clog(TransactionId frozenXID)
 	 */
 	relation = heap_open(DatabaseRelationId, AccessShareLock);
 
-	scan = heap_beginscan(relation, SnapshotNow, 0, NULL);
+	scan = heap_beginscan_catalog(relation, 0, NULL);
 
 	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
-		Form_pg_database dbform = (Form_pg_database) GETSTRUCT(tuple);
+		volatile FormData_pg_database *dbform = (Form_pg_database) GETSTRUCT(tuple);
+		TransactionId datfrozenxid = dbform->datfrozenxid;
+		TransactionId datminmxid = dbform->datminmxid;
 
-		Assert(TransactionIdIsNormal(dbform->datfrozenxid));
+		Assert(TransactionIdIsNormal(datfrozenxid));
+		Assert(MultiXactIdIsValid(datminmxid));
 
 		/*
-		 * MPP-20053: Skip databases that cannot be connected to in computing
-		 * the oldest database.
+		 * If things are working properly, no database should have a
+		 * datfrozenxid or datminmxid that is "in the future".  However, such
+		 * cases have been known to arise due to bugs in pg_upgrade.  If we
+		 * see any entries that are "in the future", chicken out and don't do
+		 * anything.  This ensures we won't truncate clog before those
+		 * databases have been scanned and cleaned up.  (We will issue the
+		 * "already wrapped" warning if appropriate, though.)
 		 */
-		if (dbform->datallowconn)
+		if (TransactionIdPrecedes(lastSaneFrozenXid, datfrozenxid) ||
+			MultiXactIdPrecedes(lastSaneMinMulti, datminmxid))
+			bogus = true;
+
+		if (TransactionIdPrecedes(nextXID, datfrozenxid))
+			frozenAlreadyWrapped = true;
+		else if (TransactionIdPrecedes(datfrozenxid, frozenXID))
 		{
-			if (TransactionIdPrecedes(myXID, dbform->datfrozenxid))
-				frozenAlreadyWrapped = true;
-			else if (TransactionIdPrecedes(dbform->datfrozenxid, frozenXID))
-			{
-				frozenXID = dbform->datfrozenxid;
-				namecpy(&oldest_datname, &dbform->datname);
-			}
+			frozenXID = datfrozenxid;
+			oldestxid_datoid = HeapTupleGetOid(tuple);
+		}
+
+		if (MultiXactIdPrecedes(datminmxid, minMulti))
+		{
+			minMulti = datminmxid;
+			minmulti_datoid = HeapTupleGetOid(tuple);
 		}
 	}
 
@@ -2119,87 +2113,301 @@ vac_truncate_clog(TransactionId frozenXID)
 		return;
 	}
 
-	/* Truncate CLOG to the oldest frozenxid */
-	TruncateCLOG(frozenXID);
-	DistributedLog_Truncate(frozenXID);
+	/* chicken out if data is bogus in any other way */
+	if (bogus)
+		return;
 
 	/*
-	 * Update the wrap limit for GetNewTransactionId.  Note: this function
-	 * will also signal the postmaster for an(other) autovac cycle if needed.
+	 * Truncate CLOG to the oldest computed value.  Note we don't truncate
+	 * multixacts; that will be done by the next checkpoint.
 	 */
-	SetTransactionIdLimit(frozenXID, &oldest_datname);
+	TruncateCLOG(frozenXID);
+
+	/*
+	 * Update the wrap limit for GetNewTransactionId and creation of new
+	 * MultiXactIds.  Note: these functions will also signal the postmaster
+	 * for an(other) autovac cycle if needed.   XXX should we avoid possibly
+	 * signalling twice?
+	 */
+	SetTransactionIdLimit(frozenXID, oldestxid_datoid);
+	SetMultiXactIdLimit(minMulti, minmulti_datoid);
 }
 
+static void
+vacuum_rel_ao_phase(Relation onerel, Oid relid, VacuumStmt *vacstmt, LOCKMODE lmode,
+					bool for_wraparound,
+					List *compaction_insert_segno,
+					List *compaction_segno,
+					AOVacuumPhase phase)
+{
+	vacstmt->appendonly_compaction_insert_segno = compaction_insert_segno;
+	vacstmt->appendonly_compaction_segno = compaction_segno;
+	vacstmt->appendonly_phase = phase;
 
-/****************************************************************************
- *																			*
- *			Code common to both flavors of VACUUM							*
- *																			*
- ****************************************************************************
- */
+	vacuum_rel(onerel, relid, vacstmt, lmode, for_wraparound);
+}
 
 
 /*
  *	vacuum_rel() -- vacuum one heap relation
  *
  *		Doing one heap at a time incurs extra overhead, since we need to
- *		check that the heap exists again just before we vacuum it.	The
+ *		check that the heap exists again just before we vacuum it.  The
  *		reason that we do this is so that vacuuming can be spread across
  *		many small transactions.  Otherwise, two-phase locking would require
  *		us to lock the entire database during one pass of the vacuum cleaner.
+ *
+ * GPDB: On entry, we should already hold a session-level lock on the table.
+ * If 'onerel' is valid, then we should also hold an appropriate regular lock on
+ * the table, and have a transaction open.
+ * On exit, the 'onerel' will be closed, and the transaction is closed.
  */
-static void
-vacuum_rel(Relation onerel, VacuumStmt *vacstmt, LOCKMODE lmode, List *updated_stats,
+static bool
+vacuum_rel(Relation onerel, Oid relid, VacuumStmt *vacstmt, LOCKMODE lmode,
 		   bool for_wraparound)
 {
 	Oid			toast_relid;
 	Oid			aoseg_relid = InvalidOid;
 	Oid         aoblkdir_relid = InvalidOid;
 	Oid         aovisimap_relid = InvalidOid;
+	RangeVar	*toast_rangevar = NULL;
+	RangeVar	*aoseg_rangevar = NULL;
+	RangeVar	*aoblkdir_rangevar = NULL;
+	RangeVar	*aovisimap_rangevar = NULL;
+	bool		is_heap;
 	Oid			save_userid;
 	int			save_sec_context;
 	int			save_nestlevel;
-	bool		heldoff;
+	MemoryContext oldcontext;
 
-	/*
-	 * Check for user-requested abort.	Note we want this to be inside a
-	 * transaction, so xact.c doesn't issue useless WARNING.
-	 */
-	CHECK_FOR_INTERRUPTS();
+	if (!onerel)
+	{
+		/*
+		 * For each iteration we start/commit our own transactions,
+		 * so that we can release resources such as locks and memories,
+		 * and we can also safely perform non-transactional work
+		 * along with transactional work.
+		 */
+		StartTransactionCommand();
+
+		/*
+		 * Functions in indexes may want a snapshot set. Also, setting
+		 * a snapshot ensures that RecentGlobalXmin is kept truly recent.
+		 */
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		if (!(vacstmt->options & VACOPT_FULL))
+		{
+			/*
+			 * PostgreSQL does this:
+			 * During a lazy VACUUM we can set the PROC_IN_VACUUM flag, which lets other
+			 * concurrent VACUUMs know that they can ignore this one while
+			 * determining their OldestXmin.  (The reason we don't set it during a
+			 * full VACUUM is exactly that we may have to run user- defined
+			 * functions for functional indexes, and we want to make sure that if
+			 * they use the snapshot set above, any tuples it requires can't get
+			 * removed from other tables.  An index function that depends on the
+			 * contents of other tables is arguably broken, but we won't break it
+			 * here by violating transaction semantics.)
+			 *
+			 * GPDB doesn't use PROC_IN_VACUUM, as lazy vacuum for bitmap
+			 * indexed tables performs reindex causing updates to pg_class
+			 * tuples for index entries.
+			 *
+			 * We also set the VACUUM_FOR_WRAPAROUND flag, which is passed down
+			 * by autovacuum; it's used to avoid cancelling a vacuum that was
+			 * invoked in an emergency.
+			 *
+			 * Note: this flag remains set until CommitTransaction or
+			 * AbortTransaction.  We don't want to clear it until we reset
+			 * MyProc->xid/xmin, else OldestXmin might appear to go backwards,
+			 * which is probably Not Good.
+			 */
+			LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+#if 0 /* Upstream code not applicable to GPDB */
+			MyProc->vacuumFlags |= PROC_IN_VACUUM;
+#endif
+			if (for_wraparound)
+				MyPgXact->vacuumFlags |= PROC_VACUUM_FOR_WRAPAROUND;
+			LWLockRelease(ProcArrayLock);
+		}
+
+		/*
+		 * Check for user-requested abort.  Note we want this to be inside a
+		 * transaction, so xact.c doesn't issue useless WARNING.
+		 */
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Open the relation and get the appropriate lock on it.
+		 *
+		 * There's a race condition here: the rel may have gone away since the
+		 * last time we saw it.  If so, we don't need to vacuum it.
+		 *
+		 * If we've been asked not to wait for the relation lock, acquire it first
+		 * in non-blocking mode, before calling try_relation_open().
+		 */
+		if (!(vacstmt->options & VACOPT_NOWAIT))
+			onerel = try_relation_open(relid, lmode, false /* nowait */);
+		else if (ConditionalLockRelationOid(relid, lmode))
+			onerel = try_relation_open(relid, NoLock, false /* nowait */);
+		else
+		{
+			onerel = NULL;
+			if (IsAutoVacuumWorkerProcess() && Log_autovacuum_min_duration >= 0)
+				ereport(LOG,
+						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+						 errmsg("skipping vacuum of \"%s\" --- lock not available",
+								vacstmt->relation->relname)));
+		}
+
+		if (!onerel)
+		{
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			return false;
+		}
+	}
 
 	/*
 	 * Remember the relation's TOAST and AO segments relations for later
 	 */
 	toast_relid = onerel->rd_rel->reltoastrelid;
-	if (RelationIsAoRows(onerel) || RelationIsAoCols(onerel))
+	is_heap = RelationIsHeap(onerel);
+	oldcontext = MemoryContextSwitchTo(vac_context);
+	toast_rangevar = makeRangeVar(get_namespace_name(get_rel_namespace(toast_relid)),
+								  get_rel_name(toast_relid),
+								  -1);
+	MemoryContextSwitchTo(oldcontext);
+
+
+	if (!is_heap)
 	{
-		GetAppendOnlyEntryAuxOids(RelationGetRelid(onerel), SnapshotNow,
+		Assert(RelationIsAppendOptimized(onerel));
+		GetAppendOnlyEntryAuxOids(RelationGetRelid(onerel), NULL,
 								  &aoseg_relid,
 								  &aoblkdir_relid, NULL,
 								  &aovisimap_relid, NULL);
+		oldcontext = MemoryContextSwitchTo(vac_context);
+		aoseg_rangevar = makeRangeVar(get_namespace_name(get_rel_namespace(aoseg_relid)),
+									  get_rel_name(aoseg_relid),
+									  -1);
+		aoblkdir_rangevar = makeRangeVar(get_namespace_name(get_rel_namespace(aoblkdir_relid)),
+										 get_rel_name(aoblkdir_relid),
+										 -1);
+		aovisimap_rangevar = makeRangeVar(get_namespace_name(get_rel_namespace(aovisimap_relid)),
+										  get_rel_name(aovisimap_relid),
+										  -1);
+		MemoryContextSwitchTo(oldcontext);
 		vacstmt->appendonly_relation_empty =
 				AppendOnlyCompaction_IsRelationEmpty(onerel);
 	}
-
 
 	/*
 	 * Switch to the table owner's userid, so that any index functions are run
 	 * as that user.  Also lock down security-restricted operations and
 	 * arrange to make GUC variable changes local to this command.
-	 * (This is unnecessary, but harmless, for lazy VACUUM.)
 	 */
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
 	SetUserIdAndSecContext(onerel->rd_rel->relowner,
 						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
 	save_nestlevel = NewGUCNestLevel();
 
+
+	/*
+	 * If we are in the dispatch mode, dispatch this modified
+	 * vacuum statement to QEs, and wait for them to finish.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		int 		i, nindexes;
+		bool 		has_bitmap = false;
+		Relation   *i_rel = NULL;
+
+		vac_open_indexes(onerel, AccessShareLock, &nindexes, &i_rel);
+		if (i_rel != NULL)
+		{
+			for (i = 0; i < nindexes; i++)
+			{
+				if (RelationIsBitmapIndex(i_rel[i]))
+				{
+					has_bitmap = true;
+					break;
+				}
+			}
+		}
+		vac_close_indexes(nindexes, i_rel, AccessShareLock);
+
+		/*
+		 * We have to acquire a ShareLock for the relation which has bitmap
+		 * indexes, since reindex is used later. Otherwise, concurrent
+		 * vacuum and inserts may cause deadlock. MPP-5960
+		 */
+		if (has_bitmap)
+			LockRelation(onerel, ShareLock);
+	}
+
 	/*
 	 * Do the actual work --- either FULL or "lazy" vacuum
+	 *
+	 * Append-only relations don't support, nor need, a FULL vacuum, so perform
+	 * a lazy vacuum instead, even if FULL was requested. Note that we have
+	 * already locked the table, and if FULL was requested, we got an
+	 * AccessExclusiveLock. Therefore, FULL isn't exactly the same as non-FULL
+	 * on AO tables.
 	 */
-	if (vacstmt->full)
-		heldoff = full_vacuum_rel(onerel, vacstmt, updated_stats);
+	if (is_heap && (vacstmt->options & VACOPT_FULL))
+	{
+		Oid			relid = RelationGetRelid(onerel);
+
+		/* close relation before vacuuming, but hold lock until commit */
+		relation_close(onerel, NoLock);
+		onerel = NULL;
+
+		/* VACUUM FULL is now a variant of CLUSTER; see cluster.c */
+		cluster_rel(relid, InvalidOid, false,
+					(vacstmt->options & VACOPT_VERBOSE) != 0,
+					true /* printError */);
+
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			VacuumStatsContext stats_context;
+
+			stats_context.updated_stats = NIL;
+			/*
+			 * Revert back to original userid before dispatching vacuum to QEs.
+			 * Dispatcher includes CurrentUserId in the serialized dispatch
+			 * command (see buildGpQueryString()).  QEs assume this userid
+			 * before starting to execute the dispatched command.  If the
+			 * original userid has superuser privileges and owner of the table
+			 * being vacuumed does not, and if the command is dispatched with
+			 * owner's userid, it may lead to spurious permission denied error
+			 * on QE even when a super user is running the vacuum.
+			 */
+			SetUserIdAndSecContext(
+								   save_userid,
+								   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+			dispatchVacuum(vacstmt, &stats_context);
+
+			vac_update_relstats_from_list(stats_context.updated_stats);
+		}
+	}
 	else
-		heldoff = lazy_vacuum_rel(onerel, vacstmt, vac_strategy, updated_stats);
+	{
+		lazy_vacuum_rel(onerel, vacstmt, vac_strategy);
+
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			VacuumStatsContext stats_context;
+
+			stats_context.updated_stats = NIL;
+			SetUserIdAndSecContext(
+								   save_userid,
+								   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+			dispatchVacuum(vacstmt, &stats_context);
+			vac_update_relstats_from_list(stats_context.updated_stats);
+		}
+	}
 
 	/* Roll back any GUC changes executed by index functions */
 	AtEOXact_GUC(false, save_nestlevel);
@@ -2208,38 +2416,73 @@ vacuum_rel(Relation onerel, VacuumStmt *vacstmt, LOCKMODE lmode, List *updated_s
 	SetUserIdAndSecContext(save_userid, save_sec_context);
 
 	/*
-	 * Complete the transaction and free all temporary memory used.
-	 * NOT in GPDB, though! The caller still needs to have the relation open.
+	 * Update ao master tupcount the hard way after the compaction and
+	 * after the drop.
 	 */
-#if 0
-	if (vacstmt->full)
-		PopActiveSnapshot();
-	CommitTransactionCommand();
-#endif
+	if (Gp_role == GP_ROLE_DISPATCH && vacstmt->appendonly_compaction_segno &&
+		RelationIsAppendOptimized(onerel))
+	{
+		Snapshot	appendOnlyMetaDataSnapshot = RegisterSnapshot(GetCatalogSnapshot(InvalidOid));
 
-	/* now we can allow interrupts again, if disabled */
-	if (heldoff)
-		RESUME_INTERRUPTS();
+		if (vacstmt->appendonly_phase == AOVAC_COMPACT)
+		{
+			/* In the compact phase, we need to update the information of the segment file we inserted into */
+			if (list_length(vacstmt->appendonly_compaction_insert_segno) == 1 &&
+				linitial_int(vacstmt->appendonly_compaction_insert_segno) == APPENDONLY_COMPACTION_SEGNO_INVALID)
+			{
+				/* this was a "pseudo" compaction phase. */
+			}
+			else
+				UpdateMasterAosegTotalsFromSegments(onerel, appendOnlyMetaDataSnapshot, vacstmt->appendonly_compaction_insert_segno, 0);
+		}
+		else if (vacstmt->appendonly_phase == AOVAC_DROP)
+		{
+			/* In the drop phase, we need to update the information of the compacted segment file(s) */
+			UpdateMasterAosegTotalsFromSegments(onerel, appendOnlyMetaDataSnapshot, vacstmt->appendonly_compaction_segno, 0);
+		}
+
+		UnregisterSnapshot(appendOnlyMetaDataSnapshot);
+	}
+
+	/* all done with this class, but hold lock until commit */
+	if (onerel)
+		relation_close(onerel, NoLock);
+
+	/*
+	 * Complete the transaction and free all temporary memory used.
+	 */
+	PopActiveSnapshot();
+	/*
+	 * Transaction commit is always executed on QD.
+	 */
+	if (Gp_role != GP_ROLE_EXECUTE)
+		CommitTransactionCommand();
 
 	/*
 	 * If the relation has a secondary toast rel, vacuum that too while we
 	 * still hold the session lock on the master table.  We do this in
 	 * cleanup phase when it's AO table or in prepare phase if it's an
 	 * empty AO table.
+	 *
+	 * A VacuumStmt object for secondary toast relation is constructed and
+	 * dispatched separately by the QD, when vacuuming the master relation.  A
+	 * backend executing dispatched VacuumStmt (GP_ROLE_EXECUTE), therefore,
+	 * should not execute this block of code.
 	 */
-	if ((RelationIsHeap(onerel) && toast_relid != InvalidOid) ||
-		(!RelationIsHeap(onerel) && (
-				vacstmt->appendonly_compaction_vacuum_cleanup ||
-				vacstmt->appendonly_relation_empty)))
+	if (Gp_role != GP_ROLE_EXECUTE && (is_heap ||
+		(!is_heap && (vacstmt->appendonly_phase == AOVAC_CLEANUP ||
+					  vacstmt->appendonly_relation_empty))))
 	{
-		Relation toast_rel = open_relation_and_check_permission(vacstmt, toast_relid,
-																RELKIND_TOASTVALUE, false);
-		if (toast_rel != NULL)
+		if (toast_relid != InvalidOid && toast_rangevar != NULL)
 		{
-			vacuum_rel(toast_rel, vacstmt, lmode, updated_stats, for_wraparound);
+			VacuumStmt *vacstmt_toast = makeNode(VacuumStmt);
+			vacstmt_toast->options = vacstmt->options;
+			vacstmt_toast->freeze_min_age = vacstmt->freeze_min_age;
+			vacstmt_toast->freeze_table_age = vacstmt->freeze_table_age;
+			vacstmt_toast->skip_twophase = vacstmt->skip_twophase;
 
-			/* all done with this class, but hold lock until commit */
-			relation_close(toast_rel, NoLock);
+			vacstmt_toast->relation = toast_rangevar;
+			vacuum_rel(NULL, toast_relid, vacstmt_toast, lmode, for_wraparound);
 		}
 	}
 
@@ -2252,52 +2495,49 @@ vacuum_rel(Relation onerel, VacuumStmt *vacstmt, LOCKMODE lmode, List *updated_s
 	 * the user saying that transaction is already in progress. Hence we want
 	 * to vacuum the auxliary relations only in cleanup phase or if we are in
 	 * the prepare phase and the AO/CO table is empty.
+	 *
+	 * We alter the vacuum statement here since the AO auxiliary tables
+	 * vacuuming will be dispatched to the primaries.
+	 *
+	 * Similar to toast, a VacuumStmt object for each AO auxiliary relation is
+	 * constructed and dispatched separately by the QD, when vacuuming the
+	 * base AO relation.  A backend executing dispatched VacuumStmt
+	 * (GP_ROLE_EXECUTE), therefore, should not execute this block of code.
 	 */
-	if (vacstmt->appendonly_compaction_vacuum_cleanup ||
-		(vacstmt->appendonly_relation_empty && vacstmt->appendonly_compaction_vacuum_prepare))
+	if (Gp_role != GP_ROLE_EXECUTE &&
+		(vacstmt->appendonly_phase == AOVAC_CLEANUP ||
+		 (vacstmt->appendonly_relation_empty &&
+		  vacstmt->appendonly_phase == AOVAC_PREPARE)))
 	{
-		/* do the same for an AO segments table, if any */
-		if (aoseg_relid != InvalidOid)
-		{
-			Relation aoseg_rel = open_relation_and_check_permission(vacstmt, aoseg_relid,
-																	RELKIND_AOSEGMENTS, false);
-			if (aoseg_rel != NULL)
-			{
-				vacuum_rel(aoseg_rel, vacstmt, lmode, updated_stats, for_wraparound);
+		VacuumStmt *vacstmt_ao_aux = makeNode(VacuumStmt);
+		vacstmt_ao_aux->options = vacstmt->options;
+		vacstmt_ao_aux->freeze_min_age = vacstmt->freeze_min_age;
+		vacstmt_ao_aux->freeze_table_age = vacstmt->freeze_table_age;
 
-				/* all done with this class, but hold lock until commit */
-				relation_close(aoseg_rel, NoLock);
-			}
+		/* do the same for an AO segments table, if any */
+		if (aoseg_relid != InvalidOid && aoseg_rangevar != NULL)
+		{
+			vacstmt_ao_aux->relation = aoseg_rangevar;
+			vacuum_rel(NULL, aoseg_relid, vacstmt_ao_aux, lmode, for_wraparound);
 		}
 
 		/* do the same for an AO block directory table, if any */
-		if (aoblkdir_relid != InvalidOid)
+		if (aoblkdir_relid != InvalidOid && aoblkdir_rangevar != NULL)
 		{
-			Relation aoblkdir_rel = open_relation_and_check_permission(vacstmt, aoblkdir_relid,
-																	   RELKIND_AOBLOCKDIR, false);
-			if (aoblkdir_rel != NULL)
-			{
-				vacuum_rel(aoblkdir_rel, vacstmt, lmode, updated_stats, for_wraparound);
-
-				/* all done with this class, but hold lock until commit */
-				relation_close(aoblkdir_rel, NoLock);
-			}
+			vacstmt_ao_aux->relation = aoblkdir_rangevar;
+			vacuum_rel(NULL, aoblkdir_relid, vacstmt_ao_aux, lmode, for_wraparound);
 		}
 
 		/* do the same for an AO visimap, if any */
-		if (aovisimap_relid != InvalidOid)
+		if (aovisimap_relid != InvalidOid && aovisimap_rangevar != NULL)
 		{
-			Relation aovisimap_rel = open_relation_and_check_permission(vacstmt, aovisimap_relid,
-																	   RELKIND_AOVISIMAP, false);
-			if (aovisimap_rel != NULL)
-			{
-				vacuum_rel(aovisimap_rel, vacstmt, lmode, updated_stats, for_wraparound);
-
-				/* all done with this class, but hold lock until commit */
-				relation_close(aovisimap_rel, NoLock);
-			}
+			vacstmt_ao_aux->relation = aovisimap_rangevar;
+			vacuum_rel(NULL, aovisimap_relid, vacstmt_ao_aux, lmode, for_wraparound);
 		}
 	}
+
+	/* Report that we really did it. */
+	return true;
 }
 
 
@@ -2308,30 +2548,6 @@ vacuum_rel(Relation onerel, VacuumStmt *vacstmt, LOCKMODE lmode, List *updated_s
  ****************************************************************************
  */
 
-/*
- * Remember the relation stats that will be used in the next truncate phase.
- */
-static void
-save_vacstats(Oid relid, BlockNumber rel_pages, double rel_tuples, BlockNumber empty_end_pages)
-{
-	VPgClassStats *stats;
-
-	if (VacFullInitialStatsSize >= MaxVacFullInitialStatsSize)
-		elog(ERROR, "out of stats slot");
-
-	stats = &VacFullInitialStats[VacFullInitialStatsSize++];
-
-	stats->relid = relid;
-	stats->rel_pages = rel_pages;
-	stats->rel_tuples = rel_tuples;
-	stats->empty_end_pages = empty_end_pages;
-
-	/* Should not happen */
-	if (stats->rel_pages < stats->empty_end_pages)
-		elog(ERROR, "rel_pages %u < empty_end_pages %u",
-					stats->rel_pages, stats->empty_end_pages);
-}
-
 static bool vacuum_appendonly_index_should_vacuum(Relation aoRelation,
 		VacuumStmt *vacstmt,
 		AppendOnlyIndexVacuumState *vacuumIndexState, double *rel_tuple_count)
@@ -2339,7 +2555,7 @@ static bool vacuum_appendonly_index_should_vacuum(Relation aoRelation,
 	int64 hidden_tupcount;
 	FileSegTotals *totals;
 
-	Assert(RelationIsAoRows(aoRelation) || RelationIsAoCols(aoRelation));
+	Assert(RelationIsAppendOptimized(aoRelation));
 
 	if(Gp_role == GP_ROLE_DISPATCH)
 	{
@@ -2352,12 +2568,12 @@ static bool vacuum_appendonly_index_should_vacuum(Relation aoRelation,
 
 	if(RelationIsAoRows(aoRelation))
 	{
-		totals = GetSegFilesTotals(aoRelation, SnapshotNow);
+		totals = GetSegFilesTotals(aoRelation, vacuumIndexState->appendOnlyMetaDataSnapshot);
 	}
 	else
 	{
 		Assert(RelationIsAoCols(aoRelation));
-		totals = GetAOCSSSegFilesTotals(aoRelation, SnapshotNow);
+		totals = GetAOCSSSegFilesTotals(aoRelation, vacuumIndexState->appendOnlyMetaDataSnapshot);
 	}
 	hidden_tupcount = AppendOnlyVisimap_GetRelationHiddenTupleCount(&vacuumIndexState->visiMap);
 
@@ -2369,7 +2585,7 @@ static bool vacuum_appendonly_index_should_vacuum(Relation aoRelation,
 
 	pfree(totals);
 
-	if(hidden_tupcount > 0 || vacstmt->full)
+	if(hidden_tupcount > 0 || (vacstmt->options & VACOPT_FULL))
 	{
 		return true;
 	}
@@ -2387,9 +2603,7 @@ static bool vacuum_appendonly_index_should_vacuum(Relation aoRelation,
  * It returns the number of indexes on the relation.
  */
 int
-vacuum_appendonly_indexes(Relation aoRelation,
-		VacuumStmt *vacstmt,
-		List* updated_stats)
+vacuum_appendonly_indexes(Relation aoRelation, VacuumStmt *vacstmt)
 {
 	int reindex_count = 1;
 	int i;
@@ -2399,7 +2613,7 @@ vacuum_appendonly_indexes(Relation aoRelation,
 	FileSegInfo **segmentFileInfo = NULL; /* Might be a casted AOCSFileSegInfo */
 	int totalSegfiles;
 
-	Assert(RelationIsAoRows(aoRelation) || RelationIsAoCols(aoRelation));
+	Assert(RelationIsAppendOptimized(aoRelation));
 	Assert(vacstmt);
 
 	memset(&vacuumIndexState, 0, sizeof(vacuumIndexState));
@@ -2409,19 +2623,25 @@ vacuum_appendonly_indexes(Relation aoRelation,
 			RelationGetRelationName(aoRelation));
 
 	/* Now open all indexes of the relation */
-	if (vacstmt->full)
+	if ((vacstmt->options & VACOPT_FULL))
 		vac_open_indexes(aoRelation, AccessExclusiveLock, &nindexes, &Irel);
 	else
 		vac_open_indexes(aoRelation, RowExclusiveLock, &nindexes, &Irel);
 
+	vacuumIndexState.appendOnlyMetaDataSnapshot = GetActiveSnapshot();
+
 	if (RelationIsAoRows(aoRelation))
 	{
-		segmentFileInfo = GetAllFileSegInfo(aoRelation, SnapshotNow, &totalSegfiles);
+		segmentFileInfo = GetAllFileSegInfo(aoRelation,
+											vacuumIndexState.appendOnlyMetaDataSnapshot,
+											&totalSegfiles);
 	}
 	else
 	{
 		Assert(RelationIsAoCols(aoRelation));
-		segmentFileInfo = (FileSegInfo **)GetAllAOCSFileSegInfo(aoRelation, SnapshotNow, &totalSegfiles);
+		segmentFileInfo = (FileSegInfo **) GetAllAOCSFileSegInfo(aoRelation,
+																vacuumIndexState.appendOnlyMetaDataSnapshot,
+																&totalSegfiles);
 	}
 
 	AppendOnlyVisimap_Init(
@@ -2429,10 +2649,10 @@ vacuum_appendonly_indexes(Relation aoRelation,
 			aoRelation->rd_appendonly->visimaprelid,
 			aoRelation->rd_appendonly->visimapidxid,
 			AccessShareLock,
-			SnapshotNow);
+			vacuumIndexState.appendOnlyMetaDataSnapshot);
 
 	AppendOnlyBlockDirectory_Init_forSearch(&vacuumIndexState.blockDirectory,
-			SnapshotNow,
+			vacuumIndexState.appendOnlyMetaDataSnapshot,
 			segmentFileInfo,
 			totalSegfiles,
 			aoRelation,
@@ -2444,6 +2664,14 @@ vacuum_appendonly_indexes(Relation aoRelation,
 	if (Irel != NULL)
 	{
 		double rel_tuple_count = 0.0;
+		int			elevel;
+
+		/* just scan indexes to update statistic */
+		if (vacstmt->options & VACOPT_VERBOSE)
+			elevel = INFO;
+		else
+			elevel = DEBUG2;
+
 		if (vacuum_appendonly_index_should_vacuum(aoRelation, vacstmt,
 					&vacuumIndexState, &rel_tuple_count))
 		{
@@ -2451,16 +2679,16 @@ vacuum_appendonly_indexes(Relation aoRelation,
 
 			for (i = 0; i < nindexes; i++)
 			{
-				vacuum_appendonly_index(Irel[i], &vacuumIndexState, updated_stats,
-						rel_tuple_count, vacstmt->full);
+				vacuum_appendonly_index(Irel[i], &vacuumIndexState,
+										rel_tuple_count,
+										elevel);
 			}
 			reindex_count++;
 		}
 		else
 		{
-			/* just scan indexes to update statistic */
 			for (i = 0; i < nindexes; i++)
-				scan_index(Irel[i], rel_tuple_count, updated_stats, vacstmt->full, true);
+				scan_index(Irel[i], rel_tuple_count, true, elevel);
 		}
 	}
 
@@ -2484,2318 +2712,28 @@ vacuum_appendonly_indexes(Relation aoRelation,
 	return nindexes;
 }
 
+
+/* GPDB_91_MERGE_FIXME: 'amindexnulls' is gone. Do we need this function anymore? */
+#if 0
 /*
- * vacuum_heap_rel()
- *
- * This is the workhorse of full_vacuum_rel for heap tables.  This is called
- * twice per relation per command.  In the first call, we scan the relation
- * first to identify dead tuples and find free spaces, then clean up indexes
- * and move tuples from end pages to head pages if available.  In the second,
- * vacstmt->truncate is true, and we scan the heap again to verify the empty
- * end pages are still empty, and truncate if so.  In the second transaction,
- * we don't check the number of tuple integrity with indexes.
+ * Is an index partial (ie, could it contain fewer tuples than the heap?)
  */
 static bool
-vacuum_heap_rel(Relation onerel, VacuumStmt *vacstmt,
-		VRelStats *vacrelstats, List *updated_stats)
+vac_is_partial_index(Relation indrel)
 {
-	VacPageListData vacuum_pages;		/* List of pages to vacuum and/or
-										 * clean indexes */
-	VacPageListData fraged_pages =		/* List of pages with space enough for */
-		{								/* re-using */
-		0, /* empty_end_pages */
-		0, /* num_pages */
-		0, /* num_allocated_pages */
-		NULL /* pageesc */
-		};
-
-	Relation   *Irel;
-	int			nindexes;
-	int			i;
-	bool		heldoff = false;
-	int			reindex_count = 1;
-	bool		check_stats;
-	bool		save_disable_tuple_hints;
-
-	Assert(RelationIsHeap(onerel));
-
 	/*
-	 * scan the heap
-	 *
-	 * repair_frag() assumes that scan_heap() has set all hint bits on the
-	 * tuples, so temporarily turn off 'gp_disable_tuple_hints', i.e. allow
-	 * hint bits to be set, if we're running in FULL mode.
+	 * If the index's AM doesn't support nulls, it's partial for our purposes
 	 */
-	vacuum_pages.num_pages = fraged_pages.num_pages = 0;
+	if (!indrel->rd_am->amindexnulls)
+		return true;
 
-	save_disable_tuple_hints = gp_disable_tuple_hints;
-	PG_TRY();
-	{
-		if (vacstmt->full)
-			gp_disable_tuple_hints = false;
+	/* Otherwise, look to see if there's a partial-index predicate */
+	if (!heap_attisnull(indrel->rd_indextuple, Anum_pg_index_indpred))
+		return true;
 
-		if (vacstmt->heap_truncate)
-			scan_heap_for_truncate(vacrelstats, onerel, &vacuum_pages);
-		else
-			scan_heap(vacrelstats, onerel, &vacuum_pages, &fraged_pages);
-
-		gp_disable_tuple_hints = save_disable_tuple_hints;
-	}
-	PG_CATCH();
-	{
-		gp_disable_tuple_hints = save_disable_tuple_hints;
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	/* Now open all indexes of the relation */
-	vac_open_indexes(onerel, AccessExclusiveLock, &nindexes, &Irel);
-	if (nindexes > 0)
-		vacrelstats->hasindex = true;
-
-	/*
-	 * Since the truncate transaction doesn't read all pages, it may not be
-	 * the exact number of tuples.  vacuum_index should not check the
-	 * stat consistency.
-	 */
-	check_stats = !vacstmt->heap_truncate;
-	/* Clean/scan index relation(s) */
-	if (Irel != NULL)
-	{
-		if (vacuum_pages.num_pages > 0)
-		{
-			for (i = 0; i < nindexes; i++)
-			{
-				vacuum_index(&vacuum_pages, Irel[i],
-							 vacrelstats->rel_indexed_tuples, 0, updated_stats,
-							 check_stats);
-			}
-			reindex_count++;
-		}
-		else if (check_stats)
-		{
-			/* just scan indexes to update statistic */
-			for (i = 0; i < nindexes; i++)
-				scan_index(Irel[i], vacrelstats->rel_indexed_tuples, updated_stats, true,
-						   check_stats);
-		}
-	}
-
-	/*
-	 * For heap tables FULL vacuum we perform truncate-only transaction as
-	 * the second step, after moving tuples across pages if any.  By
-	 * separating transactions, we don't loose transactional changes
-	 * by non-transactional truncate operation.  Note scan_heap still
-	 * performs some xlog operation in non-empty pages, which is ok with
-	 * this truncate operation in the same transaction.
-	 */
-	if (vacstmt->heap_truncate)
-	{
-		Assert(vacrelstats->rel_pages >= vacuum_pages.empty_end_pages);
-
-		SIMPLE_FAULT_INJECTOR(VacuumFullBeforeTruncate);
-
-		if (vacuum_pages.empty_end_pages > 0)
-		{
-			BlockNumber relblocks;
-
-			relblocks = vacrelstats->rel_pages - vacuum_pages.empty_end_pages;
-			RelationTruncate(onerel, relblocks, true);
-			vacrelstats->rel_pages = relblocks;
-		}
-		vac_close_indexes(nindexes, Irel, NoLock);
-
-		SIMPLE_FAULT_INJECTOR(VacuumFullAfterTruncate);
-	}
-	else
-	{
-		if (fraged_pages.num_pages > 0)
-		{
-			/* Try to shrink heap */
-			heldoff = repair_frag(vacrelstats, onerel, &vacuum_pages, &fraged_pages,
-								  nindexes, Irel, updated_stats, reindex_count);
-			vac_close_indexes(nindexes, Irel, NoLock);
-		}
-		else
-		{
-			vac_close_indexes(nindexes, Irel, NoLock);
-			if (vacuum_pages.num_pages > 0)
-			{
-				/* Clean pages from vacuum_pages list */
-				vacuum_heap(vacrelstats, onerel, &vacuum_pages);
-			}
-		}
-
-		/*
-		 * Store the relation stats in global array, so that we can
-		 * resume the truncate work later.
-		 */
-		save_vacstats(RelationGetRelid(onerel), vacrelstats->rel_pages,
-					  vacrelstats->rel_tuples, vacuum_pages.empty_end_pages);
-		/* update thefree space map with final free space info, and vacuum it */
-		vac_update_fsm(onerel, &fraged_pages, vacrelstats->rel_pages);
-		FreeSpaceMapVacuum(onerel);
-	}
-
-	return heldoff;
+	return false;
 }
-
-/*
- *	full_vacuum_rel() -- perform FULL VACUUM for one heap relation
- *
- *		This routine vacuums a single heap, cleans out its indexes, and
- *		updates its num_pages and num_tuples statistics.
- *
- *		At entry, we have already established a transaction and opened
- *		and locked the relation.
- *
- *		The return value indicates whether this function has held off
- *		interrupts -- caller must RESUME_INTERRUPTS() after commit if true.
- */
-static bool
-full_vacuum_rel(Relation onerel, VacuumStmt *vacstmt, List *updated_stats)
-{
-	VRelStats* vacrelstats;
-	bool		heldoff = false;
-	bool update_relstats = true;
-
-	vacuum_set_xid_limits(vacstmt->freeze_min_age, onerel->rd_rel->relisshared,
-						  &OldestXmin, &FreezeLimit);
-
-	/*
-	 * Flush any previous async-commit transactions.  This does not guarantee
-	 * that we will be able to set hint bits for tuples they inserted, but it
-	 * improves the probability, especially in simple sequential-commands
-	 * cases.  See scan_heap() and repair_frag() for more about this.
-	 */
-	XLogAsyncCommitFlush();
-
-	/*
-	 * Set up statistics-gathering machinery.
-	 */
-	vacrelstats = (VRelStats *) palloc(sizeof(VRelStats));
-	vacrelstats->rel_pages = 0;
-	vacrelstats->rel_tuples = 0;
-	vacrelstats->hasindex = false;
-
-	if(RelationIsAoRows(onerel) || RelationIsAoCols(onerel))
-	{
-		if(vacuumStatement_IsInAppendOnlyPreparePhase(vacstmt))
-		{
-			elogif(Debug_appendonly_print_compaction, LOG,
-					"Vacuum full prepare phase %s", RelationGetRelationName(onerel));
-
-			vacuum_appendonly_indexes(onerel, vacstmt, updated_stats);
-			if (RelationIsAoRows(onerel))
-				AppendOnlyTruncateToEOF(onerel);
-			else
-				AOCSTruncateToEOF(onerel);
-			update_relstats = false;
-		}
-		else if(!vacummStatement_IsInAppendOnlyCleanupPhase(vacstmt))
-		{
-			vacuum_appendonly_rel(onerel, vacstmt);
-			update_relstats = false;
-		}
-		else
-		{
-			elogif(Debug_appendonly_print_compaction, LOG,
-					"Vacuum full cleanup phase %s", RelationGetRelationName(onerel));
-			vacuum_appendonly_fill_stats(onerel, GetActiveSnapshot(),
-										 &vacrelstats->rel_pages,
-										 &vacrelstats->rel_tuples,
-										 &vacrelstats->hasindex);
-			/* Reset the remaining VRelStats values */
-			vacrelstats->min_tlen = 0;
-			vacrelstats->max_tlen = 0;
-			vacrelstats->num_vtlinks = 0;
-			vacrelstats->vtlinks = NULL;
-		}
-	}
-	else
-	{
-		/* For heap. */
-		heldoff = vacuum_heap_rel(onerel, vacstmt, vacrelstats, updated_stats);
-	}
-
-	/* Do not run update the relstats if the vacuuming has been skipped */
-	if (update_relstats)
-	{
-		/* update statistics in pg_class */
-		vac_update_relstats_from_list(onerel, vacrelstats->rel_pages,
-						vacrelstats->rel_tuples, vacrelstats->hasindex,
-						FreezeLimit, updated_stats);
-
-		/* report results to the stats collector, too */
-		pgstat_report_vacuum(RelationGetRelid(onerel), onerel->rd_rel->relisshared,
-						 vacstmt->analyze, vacrelstats->rel_tuples);
-	}
-
-	pfree(vacrelstats);
-
-	return heldoff;
-}
-
-/*
- * This is a small version of scan_heap, performed in the second transaction of
- * heap vacuum full.  We assume we did the first transaction and kept some of
- * the stats information already, so start from the last known truncate point,
- * and rescan to the end to see if they are still empty.  Note someone might
- * have already modified these pages before we come back from QD, in case of
- * catalog table, because concurrent DDL can go in QE even if QD is holding
- * an exclusive lock on the catalog table, and QE just releases locks between
- * separate transactions.
- *
- * We don't touch other pages than the ones that are potentially truncated.
- * Note index may also have such tuples that are inserted after the first
- * transaction, and it'd not be easy to clean them up all.  Here we just
- * focus on truncate.  We skip checking stats in scan_index or vacuum_index,
- * as our reltuples may not be exactly correct.
- */
-static void
-scan_heap_for_truncate(VRelStats *vacrelstats, Relation onerel,
-					   VacPageList vacuum_pages)
-{
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
-	BlockNumber nblocks, blkno;
-	char	   *relname;
-	VacPage		vacpage;
-	BlockNumber empty_end_pages;
-	double		num_tuples;
-	bool		do_shrinking = true;
-	int			i;
-	VPgClassStats *prev_stats = NULL;
-
-	relname = RelationGetRelationName(onerel);
-
-	empty_end_pages = 0;
-	num_tuples = 0;
-
-	nblocks = RelationGetNumberOfBlocks(onerel);
-
-	vacpage = (VacPage) palloc(sizeof(VacPageData) + MaxOffsetNumber * sizeof(OffsetNumber));
-
-	/* Fetch gp_persistent_relation_node information for XLOG. */
-	RelationFetchGpRelationNodeForXLog(onerel);
-
-	/* Retrieve the relation stats info from the previous transaction. */
-	for (i = 0; i < VacFullInitialStatsSize; i++)
-	{
-		VPgClassStats *stats = &VacFullInitialStats[i];
-		if (stats->relid == RelationGetRelid(onerel))
-		{
-			prev_stats = stats;
-			break;
-		}
-	}
-	if (prev_stats == NULL)
-		elog(ERROR, "could not find previous vacuum infomation for %s", relname);
-
-	Assert(prev_stats->rel_pages >= prev_stats->empty_end_pages);
-	blkno = prev_stats->rel_pages - prev_stats->empty_end_pages;
-	for (; blkno < nblocks; blkno++)
-	{
-		Buffer		buf;
-		Page		page;
-		OffsetNumber offnum, maxoff;
-		VacPage		vacpagecopy;
-		bool		notup = true;
-
-		vacuum_delay_point();
-
-		// -------- MirroredLock ----------
-		MIRROREDLOCK_BUFMGR_LOCK;
-
-		buf = ReadBufferExtended(onerel, MAIN_FORKNUM, blkno, RBM_NORMAL,
-								 vac_strategy);
-		page = BufferGetPage(buf);
-
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
-		vacpage->blkno = blkno;
-		vacpage->offsets_used = 0;
-		vacpage->offsets_free = 0;
-
-		/*
-		 * If the page is empty, just remember it and delete index pointers
-		 * later if there are any tuples pointing to this page.
-		 */
-		if (PageIsNew(page) || PageIsEmpty(page))
-		{
-			empty_end_pages++;
-			vacpagecopy = copy_vac_page(vacpage);
-			vpage_insert(vacuum_pages, vacpagecopy);
-			UnlockReleaseBuffer(buf);
-
-			MIRROREDLOCK_BUFMGR_UNLOCK;
-			// -------- MirroredLock ----------
-
-			continue;
-		}
-
-		maxoff = PageGetMaxOffsetNumber(page);
-		for (offnum = FirstOffsetNumber;
-			 offnum <= maxoff;
-			 offnum = OffsetNumberNext(offnum))
-		{
-			ItemId		itemid = PageGetItemId(page, offnum);
-			HeapTupleData	tuple;
-			bool			tupgone = false;
-
-			if (!ItemIdIsUsed(itemid))
-				continue;
-
-			if (ItemIdIsDead(itemid))
-				continue;
-
-			tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
-			tuple.t_len = ItemIdGetLength(itemid);
-			ItemPointerSet(&(tuple.t_self), blkno, offnum);
-
-			switch (HeapTupleSatisfiesVacuum(onerel, tuple.t_data, OldestXmin, buf))
-			{
-				case HEAPTUPLE_DEAD:
-					tupgone = true;
-					break;
-				case HEAPTUPLE_LIVE:
-				case HEAPTUPLE_RECENTLY_DEAD:
-					break;
-				case HEAPTUPLE_INSERT_IN_PROGRESS:
-					ereport(LOG,
-							(errmsg("relation \"%s\" TID %u/%u: InsertTransactionInProgress %u --- can't shrink relation",
-									relname, blkno, offnum, HeapTupleHeaderGetXmin(tuple.t_data))));
-					do_shrinking = false;
-					break;
-				case HEAPTUPLE_DELETE_IN_PROGRESS:
-					ereport(LOG,
-							(errmsg("relation \"%s\" TID %u/%u: DeleteTransactionInProgress %u --- can't shrink relation",
-									relname, blkno, offnum, HeapTupleHeaderGetXmax(tuple.t_data))));
-					do_shrinking = false;
-					break;
-
-				default:
-					elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
-					break;
-			}
-
-			if (!tupgone)
-			{
-				num_tuples += 1;
-				notup = false;
-			}
-		}
-
-		if (notup)
-		{
-			empty_end_pages++;
-			vacpagecopy = copy_vac_page(vacpage);
-			vpage_insert(vacuum_pages, vacpagecopy);
-		}
-		else
-		{
-			/*
-			 * If we are seeing live tuples in those pages that should have
-			 * been truncated in the previous transaction, someone already
-			 * modified them.  In that case it's safer to not truncate
-			 * at all.
-			 */
-			do_shrinking = false;
-			empty_end_pages = 0;
-		}
-
-		UnlockReleaseBuffer(buf);
-
-		MIRROREDLOCK_BUFMGR_UNLOCK;
-		// -------- MirroredLock ----------
-	}
-
-	pfree(vacpage);
-
-	vacrelstats->rel_tuples = prev_stats->rel_tuples + num_tuples;
-	vacrelstats->rel_pages = nblocks;
-	if (!do_shrinking)
-	{
-		int		i;
-
-		vacuum_pages->empty_end_pages = 0;
-		for (i = 0; i < vacuum_pages->num_pages; i++)
-			pfree(vacuum_pages->pagedesc[i]);
-		vacuum_pages->num_pages = 0;
-	}
-	else
-	{
-		vacuum_pages->empty_end_pages = empty_end_pages;
-	}
-}
-
-
-/*
- *	scan_heap() -- scan an open heap relation
- *
- *		This routine sets commit status bits, constructs vacuum_pages (list
- *		of pages we need to compact free space on and/or clean indexes of
- *		deleted tuples), constructs fraged_pages (list of pages with free
- *		space that tuples could be moved into), and calculates statistics
- *		on the number of live tuples in the heap.
- */
-static void
-scan_heap(VRelStats *vacrelstats, Relation onerel,
-		  VacPageList vacuum_pages, VacPageList fraged_pages)
-{
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
-	BlockNumber nblocks,
-				blkno;
-	char	   *relname;
-	VacPage		vacpage;
-	BlockNumber empty_pages,
-				empty_end_pages;
-	double		num_tuples,
-				num_indexed_tuples,
-				tups_vacuumed,
-				nkeep,
-				nunused;
-	double		free_space,
-				usable_free_space;
-	Size		min_tlen = MaxHeapTupleSize;
-	Size		max_tlen = 0;
-	bool		do_shrinking = true;
-	VTupleLink	vtlinks = (VTupleLink) palloc(100 * sizeof(VTupleLinkData));
-	int			num_vtlinks = 0;
-	int			free_vtlinks = 100;
-	PGRUsage	ru0;
-
-	pg_rusage_init(&ru0);
-
-	relname = RelationGetRelationName(onerel);
-	ereport(elevel,
-			(errmsg("vacuuming \"%s.%s\"",
-					get_namespace_name(RelationGetNamespace(onerel)),
-					relname)));
-
-	empty_pages = empty_end_pages = 0;
-	num_tuples = num_indexed_tuples = tups_vacuumed = nkeep = nunused = 0;
-	free_space = 0;
-
-	nblocks = RelationGetNumberOfBlocks(onerel);
-
-	/*
-	 * We initially create each VacPage item in a maximal-sized workspace,
-	 * then copy the workspace into a just-large-enough copy.
-	 */
-	vacpage = (VacPage) palloc(sizeof(VacPageData) + MaxOffsetNumber * sizeof(OffsetNumber));
-
-	/* Fetch gp_persistent_relation_node information for XLOG. */
-	RelationFetchGpRelationNodeForXLog(onerel);
-
-	for (blkno = 0; blkno < nblocks; blkno++)
-	{
-		Page		page,
-					tempPage = NULL;
-		bool		do_reap,
-					do_frag;
-		Buffer		buf;
-		OffsetNumber offnum,
-					maxoff;
-		bool		notup;
-		OffsetNumber frozen[MaxOffsetNumber];
-		int			nfrozen;
-
-		vacuum_delay_point();
-
-		// -------- MirroredLock ----------
-		MIRROREDLOCK_BUFMGR_LOCK;
-
-		buf = ReadBufferExtended(onerel, MAIN_FORKNUM, blkno, RBM_NORMAL,
-								 vac_strategy);
-		page = BufferGetPage(buf);
-
-		/*
-		 * Since we are holding exclusive lock on the relation, no other
-		 * backend can be accessing the page; however it is possible that the
-		 * background writer will try to write the page if it's already marked
-		 * dirty.  To ensure that invalid data doesn't get written to disk, we
-		 * must take exclusive buffer lock wherever we potentially modify
-		 * pages.  In fact, we insist on cleanup lock so that we can safely
-		 * call heap_page_prune().	(This might be overkill, since the
-		 * bgwriter pays no attention to individual tuples, but on the other
-		 * hand it's unlikely that the bgwriter has this particular page
-		 * pinned at this instant.	So violating the coding rule would buy us
-		 * little anyway.)
-		 */
-		LockBufferForCleanup(buf);
-
-		vacpage->blkno = blkno;
-		vacpage->offsets_used = 0;
-		vacpage->offsets_free = 0;
-
-		if (PageIsNew(page))
-		{
-			VacPage		vacpagecopy;
-
-			ereport(WARNING,
-			   (errmsg("relation \"%s\" page %u is uninitialized --- fixing",
-					   relname, blkno)));
-			PageInit(page, BufferGetPageSize(buf), 0);
-			MarkBufferDirty(buf);
-			vacpage->free = PageGetFreeSpaceWithFillFactor(onerel, page);
-			free_space += vacpage->free;
-			empty_pages++;
-			empty_end_pages++;
-			vacpagecopy = copy_vac_page(vacpage);
-			vpage_insert(vacuum_pages, vacpagecopy);
-			vpage_insert(fraged_pages, vacpagecopy);
-			UnlockReleaseBuffer(buf);
-
-			MIRROREDLOCK_BUFMGR_UNLOCK;
-			// -------- MirroredLock ----------
-
-			continue;
-		}
-
-		if (PageIsEmpty(page))
-		{
-			VacPage		vacpagecopy;
-
-			vacpage->free = PageGetFreeSpaceWithFillFactor(onerel, page);
-			free_space += vacpage->free;
-			empty_pages++;
-			empty_end_pages++;
-			vacpagecopy = copy_vac_page(vacpage);
-			vpage_insert(vacuum_pages, vacpagecopy);
-			vpage_insert(fraged_pages, vacpagecopy);
-			UnlockReleaseBuffer(buf);
-
-			MIRROREDLOCK_BUFMGR_UNLOCK;
-			// -------- MirroredLock ----------
-
-			continue;
-		}
-
-		/*
-		 * Prune all HOT-update chains in this page.
-		 *
-		 * We use the redirect_move option so that redirecting line pointers
-		 * get collapsed out; this allows us to not worry about them below.
-		 *
-		 * We count tuples removed by the pruning step as removed by VACUUM.
-		 */
-		tups_vacuumed += heap_page_prune(onerel, buf, OldestXmin,
-										 true, false);
-
-		/*
-		 * Now scan the page to collect vacuumable items and check for tuples
-		 * requiring freezing.
-		 */
-		nfrozen = 0;
-		notup = true;
-		maxoff = PageGetMaxOffsetNumber(page);
-		for (offnum = FirstOffsetNumber;
-			 offnum <= maxoff;
-			 offnum = OffsetNumberNext(offnum))
-		{
-			ItemId		itemid = PageGetItemId(page, offnum);
-			bool		tupgone = false;
-			HeapTupleData tuple;
-
-			/*
-			 * Collect un-used items too - it's possible to have indexes
-			 * pointing here after crash.  (That's an ancient comment and is
-			 * likely obsolete with WAL, but we might as well continue to
-			 * check for such problems.)
-			 */
-			if (!ItemIdIsUsed(itemid))
-			{
-				vacpage->offsets[vacpage->offsets_free++] = offnum;
-				nunused += 1;
-				continue;
-			}
-
-			/*
-			 * DEAD item pointers are to be vacuumed normally; but we don't
-			 * count them in tups_vacuumed, else we'd be double-counting (at
-			 * least in the common case where heap_page_prune() just freed up
-			 * a non-HOT tuple).
-			 */
-			if (ItemIdIsDead(itemid))
-			{
-				vacpage->offsets[vacpage->offsets_free++] = offnum;
-				continue;
-			}
-
-			/* Shouldn't have any redirected items anymore */
-			if (!ItemIdIsNormal(itemid))
-				elog(ERROR, "relation \"%s\" TID %u/%u: unexpected redirect item",
-					 relname, blkno, offnum);
-
-			tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
-			tuple.t_len = ItemIdGetLength(itemid);
-			ItemPointerSet(&(tuple.t_self), blkno, offnum);
-
-			switch (HeapTupleSatisfiesVacuum(onerel, tuple.t_data, OldestXmin, buf))
-			{
-				case HEAPTUPLE_LIVE:
-					/* Tuple is good --- but let's do some validity checks */
-					if (onerel->rd_rel->relhasoids &&
-						!OidIsValid(HeapTupleGetOid(&tuple)))
-						elog(WARNING, "relation \"%s\" TID %u/%u: OID is invalid",
-							 relname, blkno, offnum);
-
-					/*
-					 * The shrinkage phase of VACUUM FULL requires that all
-					 * live tuples have XMIN_COMMITTED set --- see comments in
-					 * repair_frag()'s walk-along-page loop.  Use of async
-					 * commit may prevent HeapTupleSatisfiesVacuum from
-					 * setting the bit for a recently committed tuple.	Rather
-					 * than trying to handle this corner case, we just give up
-					 * and don't shrink.
-					 */
-					if (do_shrinking &&
-						!(tuple.t_data->t_infomask & HEAP_XMIN_COMMITTED))
-					{
-						ereport(LOG,
-								(errmsg("relation \"%s\" TID %u/%u: XMIN_COMMITTED not set for transaction %u --- cannot shrink relation",
-										relname, blkno, offnum,
-									 HeapTupleHeaderGetXmin(tuple.t_data))));
-						do_shrinking = false;
-					}
-					break;
-				case HEAPTUPLE_DEAD:
-
-					/*
-					 * Ordinarily, DEAD tuples would have been removed by
-					 * heap_page_prune(), but it's possible that the tuple
-					 * state changed since heap_page_prune() looked.  In
-					 * particular an INSERT_IN_PROGRESS tuple could have
-					 * changed to DEAD if the inserter aborted.  So this
-					 * cannot be considered an error condition, though it does
-					 * suggest that someone released a lock early.
-					 *
-					 * If the tuple is HOT-updated then it must only be
-					 * removed by a prune operation; so we keep it as if it
-					 * were RECENTLY_DEAD, and abandon shrinking. (XXX is it
-					 * worth trying to make the shrinking code smart enough to
-					 * handle this?  It's an unusual corner case.)
-					 *
-					 * DEAD heap-only tuples can safely be removed if they
-					 * aren't themselves HOT-updated, although this is a bit
-					 * inefficient since we'll uselessly try to remove index
-					 * entries for them.
-					 */
-					if (HeapTupleIsHotUpdated(&tuple))
-					{
-						nkeep += 1;
-						if (do_shrinking)
-							ereport(LOG,
-									(errmsg("relation \"%s\" TID %u/%u: dead HOT-updated tuple --- cannot shrink relation",
-											relname, blkno, offnum)));
-						do_shrinking = false;
-					}
-					else
-					{
-						tupgone = true; /* we can delete the tuple */
-
-						/*
-						 * We need not require XMIN_COMMITTED or
-						 * XMAX_COMMITTED to be set, since we will remove the
-						 * tuple without any further examination of its hint
-						 * bits.
-						 */
-					}
-					break;
-				case HEAPTUPLE_RECENTLY_DEAD:
-
-					/*
-					 * If tuple is recently deleted then we must not remove it
-					 * from relation.
-					 */
-					nkeep += 1;
-
-					/*
-					 * As with the LIVE case, shrinkage requires
-					 * XMIN_COMMITTED to be set.
-					 */
-					if (do_shrinking &&
-						!(tuple.t_data->t_infomask & HEAP_XMIN_COMMITTED))
-					{
-						ereport(LOG,
-								(errmsg("relation \"%s\" TID %u/%u: XMIN_COMMITTED not set for transaction %u --- cannot shrink relation",
-										relname, blkno, offnum,
-									 HeapTupleHeaderGetXmin(tuple.t_data))));
-						do_shrinking = false;
-					}
-
-					/*
-					 * If we do shrinking and this tuple is updated one then
-					 * remember it to construct updated tuple dependencies.
-					 */
-					if (do_shrinking &&
-						!(ItemPointerEquals(&(tuple.t_self),
-											&(tuple.t_data->t_ctid))))
-					{
-						if (free_vtlinks == 0)
-						{
-							free_vtlinks = 1000;
-							vtlinks = (VTupleLink) repalloc(vtlinks,
-											   (free_vtlinks + num_vtlinks) *
-													 sizeof(VTupleLinkData));
-						}
-						vtlinks[num_vtlinks].new_tid = tuple.t_data->t_ctid;
-						vtlinks[num_vtlinks].this_tid = tuple.t_self;
-						free_vtlinks--;
-						num_vtlinks++;
-					}
-					break;
-				case HEAPTUPLE_INSERT_IN_PROGRESS:
-
-					/*
-					 * This should not happen, since we hold exclusive lock on
-					 * the relation; shouldn't we raise an error?  (Actually,
-					 * it can happen in system catalogs, since we tend to
-					 * release write lock before commit there.)  As above, we
-					 * can't apply repair_frag() if the tuple state is
-					 * uncertain.
-					 */
-					if (do_shrinking)
-						ereport(LOG,
-								(errmsg("relation \"%s\" TID %u/%u: InsertTransactionInProgress %u --- cannot shrink relation",
-										relname, blkno, offnum,
-									 HeapTupleHeaderGetXmin(tuple.t_data))));
-					do_shrinking = false;
-					break;
-				case HEAPTUPLE_DELETE_IN_PROGRESS:
-
-					/*
-					 * This should not happen, since we hold exclusive lock on
-					 * the relation; shouldn't we raise an error?  (Actually,
-					 * it can happen in system catalogs, since we tend to
-					 * release write lock before commit there.)  As above, we
-					 * can't apply repair_frag() if the tuple state is
-					 * uncertain.
-					 */
-					if (do_shrinking)
-						ereport(LOG,
-								(errmsg("relation \"%s\" TID %u/%u: DeleteTransactionInProgress %u --- cannot shrink relation",
-										relname, blkno, offnum,
-									 HeapTupleHeaderGetXmax(tuple.t_data))));
-					do_shrinking = false;
-					break;
-				default:
-					elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
-					break;
-			}
-
-			if (tupgone)
-			{
-				ItemId		lpp;
-
-				/*
-				 * Here we are building a temporary copy of the page with dead
-				 * tuples removed.	Below we will apply
-				 * PageRepairFragmentation to the copy, so that we can
-				 * determine how much space will be available after removal of
-				 * dead tuples.  But note we are NOT changing the real page
-				 * yet...
-				 */
-				if (tempPage == NULL)
-				{
-					Size		pageSize;
-
-					pageSize = PageGetPageSize(page);
-					tempPage = (Page) palloc(pageSize);
-					memcpy(tempPage, page, pageSize);
-				}
-
-				/* mark it unused on the temp page */
-				lpp = PageGetItemId(tempPage, offnum);
-				ItemIdSetUnused(lpp);
-
-				vacpage->offsets[vacpage->offsets_free++] = offnum;
-				tups_vacuumed += 1;
-			}
-			else
-			{
-				num_tuples += 1;
-				if (!HeapTupleIsHeapOnly(&tuple))
-					num_indexed_tuples += 1;
-				notup = false;
-				if (tuple.t_len < min_tlen)
-					min_tlen = tuple.t_len;
-				if (tuple.t_len > max_tlen)
-					max_tlen = tuple.t_len;
-
-				/*
-				 * Each non-removable tuple must be checked to see if it needs
-				 * freezing.
-				 */
-				if (heap_freeze_tuple(tuple.t_data, &FreezeLimit,
-									  InvalidBuffer, false))
-					frozen[nfrozen++] = offnum;
-			}
-		}						/* scan along page */
-
-		if (tempPage != NULL)
-		{
-			/* Some tuples are removable; figure free space after removal */
-			PageRepairFragmentation(tempPage);
-			vacpage->free = PageGetFreeSpaceWithFillFactor(onerel, tempPage);
-			pfree(tempPage);
-			do_reap = true;
-		}
-		else
-		{
-			/* Just use current available space */
-			vacpage->free = PageGetFreeSpaceWithFillFactor(onerel, page);
-			/* Need to reap the page if it has UNUSED or DEAD line pointers */
-			do_reap = (vacpage->offsets_free > 0);
-		}
-
-		free_space += vacpage->free;
-
-		/*
-		 * Add the page to vacuum_pages if it requires reaping, and add it to
-		 * fraged_pages if it has a useful amount of free space.  "Useful"
-		 * means enough for a minimal-sized tuple.  But we don't know that
-		 * accurately near the start of the relation, so add pages
-		 * unconditionally if they have >= BLCKSZ/10 free space.  Also
-		 * forcibly add pages with no live tuples, to avoid confusing the
-		 * empty_end_pages logic.  (In the presence of unreasonably small
-		 * fillfactor, it seems possible that such pages might not pass
-		 * the free-space test, but they had better be in the list anyway.)
-		 */
-		do_frag = (vacpage->free >= min_tlen || vacpage->free >= BLCKSZ / 10 ||
-				   notup);
-
-		if (do_reap || do_frag)
-		{
-			VacPage		vacpagecopy = copy_vac_page(vacpage);
-
-			if (do_reap)
-				vpage_insert(vacuum_pages, vacpagecopy);
-			if (do_frag)
-				vpage_insert(fraged_pages, vacpagecopy);
-		}
-
-		/*
-		 * Include the page in empty_end_pages if it will be empty after
-		 * vacuuming; this is to keep us from using it as a move destination.
-		 * Note that such pages are guaranteed to be in fraged_pages.
-		 */
-		if (notup)
-		{
-			empty_pages++;
-			empty_end_pages++;
-		}
-		else
-			empty_end_pages = 0;
-
-		/*
-		 * If we froze any tuples, mark the buffer dirty, and write a WAL
-		 * record recording the changes.  We must log the changes to be
-		 * crash-safe against future truncation of CLOG.
-		 */
-		if (nfrozen > 0)
-		{
-			MarkBufferDirty(buf);
-			/* no XLOG for temp tables, though */
-			if (!onerel->rd_istemp)
-			{
-				XLogRecPtr	recptr;
-
-				recptr = log_heap_freeze(onerel, buf, FreezeLimit,
-										 frozen, nfrozen);
-				PageSetLSN(page, recptr);
-			}
-		}
-
-		UnlockReleaseBuffer(buf);
-
-		MIRROREDLOCK_BUFMGR_UNLOCK;
-		// -------- MirroredLock ----------
-
-	}
-
-	pfree(vacpage);
-
-	/* save stats in the rel list for use later */
-	vacrelstats->rel_tuples = num_tuples;
-	vacrelstats->rel_indexed_tuples = num_indexed_tuples;
-	vacrelstats->rel_pages = nblocks;
-	if (num_tuples == 0)
-		min_tlen = max_tlen = 0;
-	vacrelstats->min_tlen = min_tlen;
-	vacrelstats->max_tlen = max_tlen;
-
-	vacuum_pages->empty_end_pages = empty_end_pages;
-	fraged_pages->empty_end_pages = empty_end_pages;
-
-	/*
-	 * Clear the fraged_pages list if we found we couldn't shrink. Else,
-	 * remove any "empty" end-pages from the list, and compute usable free
-	 * space = free space in remaining pages.
-	 */
-	if (do_shrinking)
-	{
-		int			i;
-
-		Assert((BlockNumber) fraged_pages->num_pages >= empty_end_pages);
-		fraged_pages->num_pages -= empty_end_pages;
-		usable_free_space = 0;
-		for (i = 0; i < fraged_pages->num_pages; i++)
-			usable_free_space += fraged_pages->pagedesc[i]->free;
-	}
-	else
-	{
-		fraged_pages->num_pages = 0;
-		usable_free_space = 0;
-	}
-
-	/* don't bother to save vtlinks if we will not call repair_frag */
-	if (fraged_pages->num_pages > 0 && num_vtlinks > 0)
-	{
-		qsort((char *) vtlinks, num_vtlinks, sizeof(VTupleLinkData),
-			  vac_cmp_vtlinks);
-		vacrelstats->vtlinks = vtlinks;
-		vacrelstats->num_vtlinks = num_vtlinks;
-	}
-	else
-	{
-		vacrelstats->vtlinks = NULL;
-		vacrelstats->num_vtlinks = 0;
-		pfree(vtlinks);
-	}
-
-	ereport(elevel,
-			(errmsg("\"%s\": found %.0f removable, %.0f nonremovable row versions in %u pages",
-					RelationGetRelationName(onerel),
-					tups_vacuumed, num_tuples, nblocks),
-			 errdetail("%.0f dead row versions cannot be removed yet.\n"
-			  "Nonremovable row versions range from %lu to %lu bytes long.\n"
-					   "There were %.0f unused item pointers.\n"
-	   "Total free space (including removable row versions) is %.0f bytes.\n"
-					   "%u pages are or will become empty, including %u at the end of the table.\n"
-	 "%u pages containing %.0f free bytes are potential move destinations.\n"
-					   "%s.",
-					   nkeep,
-					   (unsigned long) min_tlen, (unsigned long) max_tlen,
-					   nunused,
-					   free_space,
-					   empty_pages, empty_end_pages,
-					   fraged_pages->num_pages, usable_free_space,
-					   pg_rusage_show(&ru0))));
-}
-
-
-/*
- *	repair_frag() -- try to repair relation's fragmentation
- *
- *		This routine marks dead tuples as unused and tries re-use dead space
- *		by moving tuples (and inserting indexes if needed). It constructs
- *		Nvacpagelist list of free-ed pages (moved tuples) and clean indexes
- *		for them after committing (in hack-manner - without losing locks
- *		and freeing memory!) current transaction. It truncates relation
- *		if some end-blocks are gone away.
- *
- *		The return value indicates whether this function has held off
- *		interrupts -- caller must RESUME_INTERRUPTS() after commit if true.
- */
-static bool
-repair_frag(VRelStats *vacrelstats, Relation onerel,
-			VacPageList vacuum_pages, VacPageList fraged_pages,
-			int nindexes, Relation *Irel, List *updated_stats,
-			int reindex_count)
-{
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
-	TransactionId myXID = GetCurrentTransactionId();
-	Buffer		dst_buffer = InvalidBuffer;
-	BlockNumber nblocks,
-				blkno;
-	BlockNumber last_move_dest_block = 0,
-				last_vacuum_block;
-	Page		dst_page = NULL;
-	ExecContextData ec;
-	VacPageListData Nvacpagelist = {0, 0, 0, NULL};
-	VacPage		dst_vacpage = NULL,
-				last_vacuum_page,
-				vacpage,
-			   *curpage;
-	int			i;
-	int			num_moved = 0,
-				num_fraged_pages,
-				vacuumed_pages;
-	int			keep_tuples = 0;
-	int			keep_indexed_tuples = 0;
-	PGRUsage	ru0;
-	bool		heldoff = false;
-
-	pg_rusage_init(&ru0);
-
-	// Fetch gp_persistent_relation_node information that will be added to XLOG record.
-	RelationFetchGpRelationNodeForXLog(onerel);
-
-	ExecContext_Init(&ec, onerel);
-
-	Nvacpagelist.num_pages = 0;
-	num_fraged_pages = fraged_pages->num_pages;
-	Assert((BlockNumber) vacuum_pages->num_pages >= vacuum_pages->empty_end_pages);
-	vacuumed_pages = vacuum_pages->num_pages - vacuum_pages->empty_end_pages;
-	if (vacuumed_pages > 0)
-	{
-		/* get last reaped page from vacuum_pages */
-		last_vacuum_page = vacuum_pages->pagedesc[vacuumed_pages - 1];
-		last_vacuum_block = last_vacuum_page->blkno;
-	}
-	else
-	{
-		last_vacuum_page = NULL;
-		last_vacuum_block = InvalidBlockNumber;
-	}
-
-	vacpage = (VacPage) palloc(sizeof(VacPageData) + MaxOffsetNumber * sizeof(OffsetNumber));
-	vacpage->offsets_used = vacpage->offsets_free = 0;
-
-	/*
-	 * Scan pages backwards from the last nonempty page, trying to move tuples
-	 * down to lower pages.  Quit when we reach a page that we have moved any
-	 * tuples onto, or the first page if we haven't moved anything, or when we
-	 * find a page we cannot completely empty (this last condition is handled
-	 * by "break" statements within the loop).
-	 *
-	 * NB: this code depends on the vacuum_pages and fraged_pages lists being
-	 * in order by blkno.
-	 */
-	nblocks = vacrelstats->rel_pages;
-	for (blkno = nblocks - vacuum_pages->empty_end_pages - 1;
-		 blkno > last_move_dest_block;
-		 blkno--)
-	{
-		Buffer		buf;
-		Page		page;
-		OffsetNumber offnum,
-					maxoff;
-		bool		isempty,
-					chain_tuple_moved;
-
-		vacuum_delay_point();
-
-		/*
-		 * Forget fraged_pages pages at or after this one; they're no longer
-		 * useful as move targets, since we only want to move down. Note that
-		 * since we stop the outer loop at last_move_dest_block, pages removed
-		 * here cannot have had anything moved onto them already.
-		 *
-		 * Also note that we don't change the stored fraged_pages list, only
-		 * our local variable num_fraged_pages; so the forgotten pages are
-		 * still available to be loaded into the free space map later.
-		 */
-		while (num_fraged_pages > 0 &&
-			   fraged_pages->pagedesc[num_fraged_pages - 1]->blkno >= blkno)
-		{
-			Assert(fraged_pages->pagedesc[num_fraged_pages - 1]->offsets_used == 0);
-			--num_fraged_pages;
-		}
-
-		/*
-		 * Process this page of relation.
-		 */
-
-		// -------- MirroredLock ----------
-		MIRROREDLOCK_BUFMGR_LOCK;
-
-		buf = ReadBufferExtended(onerel, MAIN_FORKNUM, blkno, RBM_NORMAL,
-								 vac_strategy);
-		page = BufferGetPage(buf);
-
-		vacpage->offsets_free = 0;
-
-		isempty = PageIsEmpty(page);
-
-		/* Is the page in the vacuum_pages list? */
-		if (blkno == last_vacuum_block)
-		{
-			if (last_vacuum_page->offsets_free > 0)
-			{
-				/* there are dead tuples on this page - clean them */
-				Assert(!isempty);
-				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-				vacuum_page(onerel, buf, last_vacuum_page);
-				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			}
-			else
-				Assert(isempty);
-			--vacuumed_pages;
-			if (vacuumed_pages > 0)
-			{
-				/* get prev reaped page from vacuum_pages */
-				last_vacuum_page = vacuum_pages->pagedesc[vacuumed_pages - 1];
-				last_vacuum_block = last_vacuum_page->blkno;
-			}
-			else
-			{
-				last_vacuum_page = NULL;
-				last_vacuum_block = InvalidBlockNumber;
-			}
-			if (isempty)
-			{
-
-				MIRROREDLOCK_BUFMGR_UNLOCK;
-				// -------- MirroredLock ----------
-
-				ReleaseBuffer(buf);
-				continue;
-			}
-		}
-		else
-			Assert(!isempty);
-
-		chain_tuple_moved = false;		/* no one chain-tuple was moved off
-										 * this page, yet */
-		vacpage->blkno = blkno;
-		maxoff = PageGetMaxOffsetNumber(page);
-		for (offnum = FirstOffsetNumber;
-			 offnum <= maxoff;
-			 offnum = OffsetNumberNext(offnum))
-		{
-			Size		tuple_len;
-			HeapTupleData tuple;
-			ItemId		itemid = PageGetItemId(page, offnum);
-
-			if (!ItemIdIsUsed(itemid))
-				continue;
-
-			if (ItemIdIsDead(itemid))
-			{
-				/* just remember it for vacuum_page() */
-				vacpage->offsets[vacpage->offsets_free++] = offnum;
-				continue;
-			}
-
-			/* Shouldn't have any redirected items now */
-			Assert(ItemIdIsNormal(itemid));
-
-			tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
-			tuple_len = tuple.t_len = ItemIdGetLength(itemid);
-			ItemPointerSet(&(tuple.t_self), blkno, offnum);
-
-			/* ---
-			 * VACUUM FULL has an exclusive lock on the relation.  So
-			 * normally no other transaction can have pending INSERTs or
-			 * DELETEs in this relation.  A tuple is either:
-			 *		(a) live (XMIN_COMMITTED)
-			 *		(b) known dead (XMIN_INVALID, or XMAX_COMMITTED and xmax
-			 *			is visible to all active transactions)
-			 *		(c) inserted and deleted (XMIN_COMMITTED+XMAX_COMMITTED)
-			 *			but at least one active transaction does not see the
-			 *			deleting transaction (ie, it's RECENTLY_DEAD)
-			 *		(d) moved by the currently running VACUUM
-			 *		(e) inserted or deleted by a not yet committed transaction,
-			 *			or by a transaction we couldn't set XMIN_COMMITTED for.
-			 * In case (e) we wouldn't be in repair_frag() at all, because
-			 * scan_heap() detects those cases and shuts off shrinking.
-			 * We can't see case (b) here either, because such tuples were
-			 * already removed by vacuum_page().  Cases (a) and (c) are
-			 * normal and will have XMIN_COMMITTED set.  Case (d) is only
-			 * possible if a whole tuple chain has been moved while
-			 * processing this or a higher numbered block.
-			 * ---
-			 */
-
-			/*
-			 * In PostgreSQL, we assume that the first pass of vacuum already
-			 * set the hint bit. However, we cannot rely on that in GPDB,
-			 * because of gp_disable_tuple_hints GUC. If it's ever set, then
-			 * the first pass might've seen that all the hint bits on the page
-			 * were already set, but the backend that set those bits didn't
-			 * mark the buffer as dirty. If the buffer is subsequently evicted
-			 * from the buffer cache, the hint bit updates are lost, and we
-			 * will see them as not set here, even though they were set in the
-			 * first pass.
-			 *
-			 * To fix that, just call HeapTupleSatisfiesVacuum() here to set
-			 * the hint bits again, if not set already.
-			 */
-			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-			(void) HeapTupleSatisfiesVacuum(onerel, tuple.t_data, OldestXmin, buf);
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-
-			if (!(tuple.t_data->t_infomask & HEAP_XMIN_COMMITTED))
-			{
-				if (tuple.t_data->t_infomask & HEAP_MOVED_IN)
-					elog(ERROR, "HEAP_MOVED_IN was not expected");
-				if (!(tuple.t_data->t_infomask & HEAP_MOVED_OFF))
-					elog(ERROR, "HEAP_MOVED_OFF was expected");
-
-				/*
-				 * MOVED_OFF by another VACUUM would have caused the
-				 * visibility check to set XMIN_COMMITTED or XMIN_INVALID.
-				 */
-				if (HeapTupleHeaderGetXvac(tuple.t_data) != myXID)
-					elog(ERROR, "invalid XVAC in tuple header");
-
-				/*
-				 * If this (chain) tuple is moved by me already then I have to
-				 * check is it in vacpage or not - i.e. is it moved while
-				 * cleaning this page or some previous one.
-				 */
-
-				/* Can't we Assert(keep_tuples > 0) here? */
-				if (keep_tuples == 0)
-					continue;
-				if (chain_tuple_moved)
-				{
-					/* some chains were moved while cleaning this page */
-					Assert(vacpage->offsets_free > 0);
-					for (i = 0; i < vacpage->offsets_free; i++)
-					{
-						if (vacpage->offsets[i] == offnum)
-							break;
-					}
-					if (i >= vacpage->offsets_free)		/* not found */
-					{
-						vacpage->offsets[vacpage->offsets_free++] = offnum;
-
-						/*
-						 * If this is not a heap-only tuple, there must be an
-						 * index entry for this item which will be removed in
-						 * the index cleanup. Decrement the
-						 * keep_indexed_tuples count to remember this.
-						 */
-						if (!HeapTupleHeaderIsHeapOnly(tuple.t_data))
-							keep_indexed_tuples--;
-						keep_tuples--;
-					}
-				}
-				else
-				{
-					vacpage->offsets[vacpage->offsets_free++] = offnum;
-
-					/*
-					 * If this is not a heap-only tuple, there must be an
-					 * index entry for this item which will be removed in the
-					 * index cleanup. Decrement the keep_indexed_tuples count
-					 * to remember this.
-					 */
-					if (!HeapTupleHeaderIsHeapOnly(tuple.t_data))
-						keep_indexed_tuples--;
-					keep_tuples--;
-				}
-				continue;
-			}
-
-			/*
-			 * If this tuple is in a chain of tuples created in updates by
-			 * "recent" transactions then we have to move the whole chain of
-			 * tuples to other places, so that we can write new t_ctid links
-			 * that preserve the chain relationship.
-			 *
-			 * This test is complicated.  Read it as "if tuple is a recently
-			 * created updated version, OR if it is an obsoleted version". (In
-			 * the second half of the test, we needn't make any check on XMAX
-			 * --- it must be recently obsoleted, else scan_heap would have
-			 * deemed it removable.)
-			 *
-			 * NOTE: this test is not 100% accurate: it is possible for a
-			 * tuple to be an updated one with recent xmin, and yet not match
-			 * any new_tid entry in the vtlinks list.  Presumably there was
-			 * once a parent tuple with xmax matching the xmin, but it's
-			 * possible that that tuple has been removed --- for example, if
-			 * it had xmin = xmax and wasn't itself an updated version, then
-			 * HeapTupleSatisfiesVacuum would deem it removable as soon as the
-			 * xmin xact completes.
-			 *
-			 * To be on the safe side, we abandon the repair_frag process if
-			 * we cannot find the parent tuple in vtlinks.	This may be overly
-			 * conservative; AFAICS it would be safe to move the chain.
-			 *
-			 * Also, because we distinguish DEAD and RECENTLY_DEAD tuples
-			 * using OldestXmin, which is a rather coarse test, it is quite
-			 * possible to have an update chain in which a tuple we think is
-			 * RECENTLY_DEAD links forward to one that is definitely DEAD.
-			 * In such a case the RECENTLY_DEAD tuple must actually be dead,
-			 * but it seems too complicated to try to make VACUUM remove it.
-			 * We treat each contiguous set of RECENTLY_DEAD tuples as a
-			 * separately movable chain, ignoring any intervening DEAD ones.
-			 */
-			if (((tuple.t_data->t_infomask & HEAP_UPDATED) &&
-				 !TransactionIdPrecedes(HeapTupleHeaderGetXmin(tuple.t_data),
-										OldestXmin)) ||
-				(!(tuple.t_data->t_infomask & (HEAP_XMAX_INVALID |
-											   HEAP_IS_LOCKED)) &&
-				 !(ItemPointerEquals(&(tuple.t_self),
-									 &(tuple.t_data->t_ctid)))))
-			{
-				Buffer		Cbuf = buf;
-				bool		freeCbuf = false;
-				bool		chain_move_failed = false;
-				bool		moved_target = false;
-				ItemPointerData Ctid;
-				HeapTupleData tp = tuple;
-				Size		tlen = tuple_len;
-				VTupleMove	vtmove;
-				int			num_vtmove;
-				int			free_vtmove;
-				VacPage		to_vacpage = NULL;
-				int			to_item = 0;
-				int			ti;
-
-				if (dst_buffer != InvalidBuffer)
-				{
-					ReleaseBuffer(dst_buffer);
-					dst_buffer = InvalidBuffer;
-				}
-
-				/* Quick exit if we have no vtlinks to search in */
-				if (vacrelstats->vtlinks == NULL)
-				{
-					elog(DEBUG2, "parent item in update-chain not found --- cannot continue repair_frag");
-					break;		/* out of walk-along-page loop */
-				}
-
-				/*
-				 * If this tuple is in the begin/middle of the chain then we
-				 * have to move to the end of chain.  As with any t_ctid
-				 * chase, we have to verify that each new tuple is really the
-				 * descendant of the tuple we came from; however, here we need
-				 * even more than the normal amount of paranoia. If t_ctid
-				 * links forward to a tuple determined to be DEAD, then
-				 * depending on where that tuple is, it might already have
-				 * been removed, and perhaps even replaced by a MOVED_IN
-				 * tuple.  We don't want to include any DEAD tuples in the
-				 * chain, so we have to recheck HeapTupleSatisfiesVacuum.
-				 */
-				while (!(tp.t_data->t_infomask & (HEAP_XMAX_INVALID |
-												  HEAP_IS_LOCKED)) &&
-					   !(ItemPointerEquals(&(tp.t_self),
-										   &(tp.t_data->t_ctid))))
-				{
-					ItemPointerData nextTid;
-					TransactionId priorXmax;
-					Buffer		nextBuf;
-					Page		nextPage;
-					OffsetNumber nextOffnum;
-					ItemId		nextItemid;
-					HeapTupleHeader nextTdata;
-					HTSV_Result nextTstatus;
-
-					nextTid = tp.t_data->t_ctid;
-					priorXmax = HeapTupleHeaderGetXmax(tp.t_data);
-					/* assume block# is OK (see heap_fetch comments) */
-					nextBuf = ReadBufferExtended(onerel, MAIN_FORKNUM,
-										 ItemPointerGetBlockNumber(&nextTid),
-										 RBM_NORMAL, vac_strategy);
-					nextPage = BufferGetPage(nextBuf);
-					/* If bogus or unused slot, assume tp is end of chain */
-					nextOffnum = ItemPointerGetOffsetNumber(&nextTid);
-					if (nextOffnum < FirstOffsetNumber ||
-						nextOffnum > PageGetMaxOffsetNumber(nextPage))
-					{
-						ReleaseBuffer(nextBuf);
-						break;
-					}
-					nextItemid = PageGetItemId(nextPage, nextOffnum);
-					if (!ItemIdIsNormal(nextItemid))
-					{
-						ReleaseBuffer(nextBuf);
-						break;
-					}
-					/* if not matching XMIN, assume tp is end of chain */
-					nextTdata = (HeapTupleHeader) PageGetItem(nextPage,
-															  nextItemid);
-					if (!TransactionIdEquals(HeapTupleHeaderGetXmin(nextTdata),
-											 priorXmax))
-					{
-						ReleaseBuffer(nextBuf);
-						break;
-					}
-
-					/*
-					 * Must check for DEAD or MOVED_IN tuple, too.	This could
-					 * potentially update hint bits, so we'd better hold the
-					 * buffer content lock.
-					 */
-					LockBuffer(nextBuf, BUFFER_LOCK_SHARE);
-					nextTstatus = HeapTupleSatisfiesVacuum(onerel,
-														   nextTdata,
-														   OldestXmin,
-														   nextBuf);
-					if (nextTstatus == HEAPTUPLE_DEAD ||
-						nextTstatus == HEAPTUPLE_INSERT_IN_PROGRESS)
-					{
-						UnlockReleaseBuffer(nextBuf);
-						break;
-					}
-					LockBuffer(nextBuf, BUFFER_LOCK_UNLOCK);
-					/* if it's MOVED_OFF we shoulda moved this one with it */
-					if (nextTstatus == HEAPTUPLE_DELETE_IN_PROGRESS)
-						elog(ERROR, "updated tuple is already HEAP_MOVED_OFF");
-					/* OK, switch our attention to the next tuple in chain */
-					tp.t_data = nextTdata;
-					tp.t_self = nextTid;
-					tlen = tp.t_len = ItemIdGetLength(nextItemid);
-					if (freeCbuf)
-						ReleaseBuffer(Cbuf);
-					Cbuf = nextBuf;
-					freeCbuf = true;
-				}
-
-				/* Set up workspace for planning the chain move */
-				vtmove = (VTupleMove) palloc(100 * sizeof(VTupleMoveData));
-				num_vtmove = 0;
-				free_vtmove = 100;
-
-				/*
-				 * Now, walk backwards up the chain (towards older tuples) and
-				 * check if all items in chain can be moved.  We record all
-				 * the moves that need to be made in the vtmove array.
-				 */
-				for (;;)
-				{
-					Buffer		Pbuf;
-					Page		Ppage;
-					ItemId		Pitemid;
-					HeapTupleHeader PTdata;
-					VTupleLinkData vtld,
-							   *vtlp;
-
-					/* Identify a target page to move this tuple to */
-					if (to_vacpage == NULL ||
-						!enough_space(to_vacpage, tlen))
-					{
-						for (i = 0; i < num_fraged_pages; i++)
-						{
-							if (enough_space(fraged_pages->pagedesc[i], tlen))
-								break;
-						}
-
-						if (i == num_fraged_pages)
-						{
-							/* can't move item anywhere */
-							chain_move_failed = true;
-							break;		/* out of check-all-items loop */
-						}
-						to_item = i;
-						to_vacpage = fraged_pages->pagedesc[to_item];
-					}
-					to_vacpage->free -= MAXALIGN(tlen);
-					if (to_vacpage->offsets_used >= to_vacpage->offsets_free)
-						to_vacpage->free -= sizeof(ItemIdData);
-					(to_vacpage->offsets_used)++;
-
-					/* Add an entry to vtmove list */
-					if (free_vtmove == 0)
-					{
-						free_vtmove = 1000;
-						vtmove = (VTupleMove)
-							repalloc(vtmove,
-									 (free_vtmove + num_vtmove) *
-									 sizeof(VTupleMoveData));
-					}
-					vtmove[num_vtmove].tid = tp.t_self;
-					vtmove[num_vtmove].vacpage = to_vacpage;
-					if (to_vacpage->offsets_used == 1)
-						vtmove[num_vtmove].cleanVpd = true;
-					else
-						vtmove[num_vtmove].cleanVpd = false;
-					free_vtmove--;
-					num_vtmove++;
-
-					/* Remember if we reached the original target tuple */
-					if (ItemPointerGetBlockNumber(&tp.t_self) == blkno &&
-						ItemPointerGetOffsetNumber(&tp.t_self) == offnum)
-						moved_target = true;
-
-					/* Done if at beginning of chain */
-					if (!(tp.t_data->t_infomask & HEAP_UPDATED) ||
-					 TransactionIdPrecedes(HeapTupleHeaderGetXmin(tp.t_data),
-										   OldestXmin))
-						break;	/* out of check-all-items loop */
-
-					/* Move to tuple with prior row version */
-					vtld.new_tid = tp.t_self;
-					vtlp = (VTupleLink)
-						vac_bsearch((void *) &vtld,
-									(void *) (vacrelstats->vtlinks),
-									vacrelstats->num_vtlinks,
-									sizeof(VTupleLinkData),
-									vac_cmp_vtlinks);
-					if (vtlp == NULL)
-					{
-						/* see discussion above */
-						elog(DEBUG2, "parent item in update-chain not found --- cannot continue repair_frag");
-						chain_move_failed = true;
-						break;	/* out of check-all-items loop */
-					}
-					tp.t_self = vtlp->this_tid;
-					Pbuf = ReadBufferExtended(onerel, MAIN_FORKNUM,
-									 ItemPointerGetBlockNumber(&(tp.t_self)),
-									 RBM_NORMAL, vac_strategy);
-					Ppage = BufferGetPage(Pbuf);
-					Pitemid = PageGetItemId(Ppage,
-								   ItemPointerGetOffsetNumber(&(tp.t_self)));
-					/* this can't happen since we saw tuple earlier: */
-					if (!ItemIdIsNormal(Pitemid))
-						elog(ERROR, "parent itemid marked as unused");
-					PTdata = (HeapTupleHeader) PageGetItem(Ppage, Pitemid);
-
-					/* ctid should not have changed since we saved it */
-					Assert(ItemPointerEquals(&(vtld.new_tid),
-											 &(PTdata->t_ctid)));
-
-					/*
-					 * Read above about cases when !ItemIdIsUsed(nextItemid)
-					 * (child item is removed)... Due to the fact that at the
-					 * moment we don't remove unuseful part of update-chain,
-					 * it's possible to get non-matching parent row here. Like
-					 * as in the case which caused this problem, we stop
-					 * shrinking here. I could try to find real parent row but
-					 * want not to do it because of real solution will be
-					 * implemented anyway, later, and we are too close to 6.5
-					 * release. - vadim 06/11/99
-					 */
-					if ((PTdata->t_infomask & HEAP_XMAX_IS_MULTI) ||
-						!(TransactionIdEquals(HeapTupleHeaderGetXmax(PTdata),
-										 HeapTupleHeaderGetXmin(tp.t_data))))
-					{
-						ReleaseBuffer(Pbuf);
-						elog(DEBUG2, "too old parent tuple found --- cannot continue repair_frag");
-						chain_move_failed = true;
-						break;	/* out of check-all-items loop */
-					}
-					tp.t_data = PTdata;
-					tlen = tp.t_len = ItemIdGetLength(Pitemid);
-					if (freeCbuf)
-						ReleaseBuffer(Cbuf);
-					Cbuf = Pbuf;
-					freeCbuf = true;
-				}				/* end of check-all-items loop */
-
-				if (freeCbuf)
-					ReleaseBuffer(Cbuf);
-				freeCbuf = false;
-
-				/* Double-check that we will move the current target tuple */
-				if (!moved_target && !chain_move_failed)
-				{
-					elog(DEBUG2, "failed to chain back to target --- cannot continue repair_frag");
-					chain_move_failed = true;
-				}
-
-				if (chain_move_failed)
-				{
-					/*
-					 * Undo changes to offsets_used state.	We don't bother
-					 * cleaning up the amount-free state, since we're not
-					 * going to do any further tuple motion.
-					 */
-					for (i = 0; i < num_vtmove; i++)
-					{
-						Assert(vtmove[i].vacpage->offsets_used > 0);
-						(vtmove[i].vacpage->offsets_used)--;
-					}
-					pfree(vtmove);
-					break;		/* out of walk-along-page loop */
-				}
-
-				/*
-				 * Okay, move the whole tuple chain in reverse order.
-				 *
-				 * Ctid tracks the new location of the previously-moved tuple.
-				 */
-				ItemPointerSetInvalid(&Ctid);
-				for (ti = 0; ti < num_vtmove; ti++)
-				{
-					VacPage		destvacpage = vtmove[ti].vacpage;
-					Page		Cpage;
-					ItemId		Citemid;
-
-					/* Get page to move from */
-					tuple.t_self = vtmove[ti].tid;
-					Cbuf = ReadBufferExtended(onerel, MAIN_FORKNUM,
-								  ItemPointerGetBlockNumber(&(tuple.t_self)),
-								  RBM_NORMAL, vac_strategy);
-
-					/* Get page to move to */
-					dst_buffer = ReadBufferExtended(onerel, MAIN_FORKNUM,
-													destvacpage->blkno,
-													RBM_NORMAL, vac_strategy);
-
-					LockBuffer(dst_buffer, BUFFER_LOCK_EXCLUSIVE);
-					if (dst_buffer != Cbuf)
-						LockBuffer(Cbuf, BUFFER_LOCK_EXCLUSIVE);
-
-					dst_page = BufferGetPage(dst_buffer);
-					Cpage = BufferGetPage(Cbuf);
-
-					Citemid = PageGetItemId(Cpage,
-								ItemPointerGetOffsetNumber(&(tuple.t_self)));
-					tuple.t_data = (HeapTupleHeader) PageGetItem(Cpage, Citemid);
-					tuple_len = tuple.t_len = ItemIdGetLength(Citemid);
-
-					move_chain_tuple(onerel, Cbuf, Cpage, &tuple,
-									 dst_buffer, dst_page, destvacpage,
-									 &ec, &Ctid, vtmove[ti].cleanVpd);
-
-					/*
-					 * If the tuple we are moving is a heap-only tuple, this
-					 * move will generate an additional index entry, so
-					 * increment the rel_indexed_tuples count.
-					 */
-					if (HeapTupleHeaderIsHeapOnly(tuple.t_data))
-						vacrelstats->rel_indexed_tuples++;
-
-					num_moved++;
-					if (destvacpage->blkno > last_move_dest_block)
-						last_move_dest_block = destvacpage->blkno;
-
-					/*
-					 * Remember that we moved tuple from the current page
-					 * (corresponding index tuple will be cleaned).
-					 */
-					if (Cbuf == buf)
-						vacpage->offsets[vacpage->offsets_free++] =
-							ItemPointerGetOffsetNumber(&(tuple.t_self));
-					else
-					{
-						/*
-						 * When we move tuple chains, we may need to move
-						 * tuples from a block that we haven't yet scanned in
-						 * the outer walk-along-the-relation loop. Note that
-						 * we can't be moving a tuple from a block that we
-						 * have already scanned because if such a tuple
-						 * exists, then we must have moved the chain along
-						 * with that tuple when we scanned that block. IOW the
-						 * test of (Cbuf != buf) guarantees that the tuple we
-						 * are looking at right now is in a block which is yet
-						 * to be scanned.
-						 *
-						 * We maintain two counters to correctly count the
-						 * moved-off tuples from blocks that are not yet
-						 * scanned (keep_tuples) and how many of them have
-						 * index pointers (keep_indexed_tuples).  The main
-						 * reason to track the latter is to help verify that
-						 * indexes have the expected number of entries when
-						 * all the dust settles.
-						 */
-						if (!HeapTupleHeaderIsHeapOnly(tuple.t_data))
-							keep_indexed_tuples++;
-						keep_tuples++;
-					}
-
-					ReleaseBuffer(dst_buffer);
-					ReleaseBuffer(Cbuf);
-				}				/* end of move-the-tuple-chain loop */
-
-				dst_buffer = InvalidBuffer;
-				pfree(vtmove);
-				chain_tuple_moved = true;
-
-				/* advance to next tuple in walk-along-page loop */
-				continue;
-			}					/* end of is-tuple-in-chain test */
-
-			/* try to find new page for this tuple */
-			if (dst_buffer == InvalidBuffer ||
-				!enough_space(dst_vacpage, tuple_len))
-			{
-				if (dst_buffer != InvalidBuffer)
-				{
-					ReleaseBuffer(dst_buffer);
-					dst_buffer = InvalidBuffer;
-				}
-				for (i = 0; i < num_fraged_pages; i++)
-				{
-					if (enough_space(fraged_pages->pagedesc[i], tuple_len))
-						break;
-				}
-				if (i == num_fraged_pages)
-					break;		/* can't move item anywhere */
-				dst_vacpage = fraged_pages->pagedesc[i];
-				dst_buffer = ReadBufferExtended(onerel, MAIN_FORKNUM,
-												dst_vacpage->blkno,
-												RBM_NORMAL, vac_strategy);
-				LockBuffer(dst_buffer, BUFFER_LOCK_EXCLUSIVE);
-				dst_page = BufferGetPage(dst_buffer);
-				/* if this page was not used before - clean it */
-				if (!PageIsEmpty(dst_page) && dst_vacpage->offsets_used == 0)
-					vacuum_page(onerel, dst_buffer, dst_vacpage);
-			}
-			else
-				LockBuffer(dst_buffer, BUFFER_LOCK_EXCLUSIVE);
-
-			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
-			move_plain_tuple(onerel, buf, page, &tuple,
-							 dst_buffer, dst_page, dst_vacpage, &ec);
-
-			/*
-			 * If the tuple we are moving is a heap-only tuple, this move will
-			 * generate an additional index entry, so increment the
-			 * rel_indexed_tuples count.
-			 */
-			if (HeapTupleHeaderIsHeapOnly(tuple.t_data))
-				vacrelstats->rel_indexed_tuples++;
-
-			num_moved++;
-			if (dst_vacpage->blkno > last_move_dest_block)
-				last_move_dest_block = dst_vacpage->blkno;
-
-			/*
-			 * Remember that we moved tuple from the current page
-			 * (corresponding index tuple will be cleaned).
-			 */
-			vacpage->offsets[vacpage->offsets_free++] = offnum;
-		}						/* walk along page */
-
-		/*
-		 * If we broke out of the walk-along-page loop early (ie, still have
-		 * offnum <= maxoff), then we failed to move some tuple off this page.
-		 * No point in shrinking any more, so clean up and exit the per-page
-		 * loop.
-		 */
-		if (offnum < maxoff && keep_tuples > 0)
-		{
-			OffsetNumber off;
-
-			/*
-			 * Fix vacpage state for any unvisited tuples remaining on page
-			 */
-			for (off = OffsetNumberNext(offnum);
-				 off <= maxoff;
-				 off = OffsetNumberNext(off))
-			{
-				ItemId		itemid = PageGetItemId(page, off);
-				HeapTupleHeader htup;
-
-				if (!ItemIdIsUsed(itemid))
-					continue;
-				/* Shouldn't be any DEAD or REDIRECT items anymore */
-				Assert(ItemIdIsNormal(itemid));
-
-				htup = (HeapTupleHeader) PageGetItem(page, itemid);
-				if (htup->t_infomask & HEAP_XMIN_COMMITTED)
-					continue;
-
-				/*
-				 * See comments in the walk-along-page loop above about why
-				 * only MOVED_OFF tuples should be found here.
-				 */
-				if (htup->t_infomask & HEAP_MOVED_IN)
-					elog(ERROR, "HEAP_MOVED_IN was not expected");
-				if (!(htup->t_infomask & HEAP_MOVED_OFF))
-					elog(ERROR, "HEAP_MOVED_OFF was expected");
-				if (HeapTupleHeaderGetXvac(htup) != myXID)
-					elog(ERROR, "invalid XVAC in tuple header");
-
-				if (chain_tuple_moved)
-				{
-					/* some chains were moved while cleaning this page */
-					Assert(vacpage->offsets_free > 0);
-					for (i = 0; i < vacpage->offsets_free; i++)
-					{
-						if (vacpage->offsets[i] == off)
-							break;
-					}
-					if (i >= vacpage->offsets_free)		/* not found */
-					{
-						vacpage->offsets[vacpage->offsets_free++] = off;
-						Assert(keep_tuples > 0);
-
-						/*
-						 * If this is not a heap-only tuple, there must be an
-						 * index entry for this item which will be removed in
-						 * the index cleanup. Decrement the
-						 * keep_indexed_tuples count to remember this.
-						 */
-						if (!HeapTupleHeaderIsHeapOnly(htup))
-							keep_indexed_tuples--;
-						keep_tuples--;
-					}
-				}
-				else
-				{
-					vacpage->offsets[vacpage->offsets_free++] = off;
-					Assert(keep_tuples > 0);
-					if (!HeapTupleHeaderIsHeapOnly(htup))
-						keep_indexed_tuples--;
-					keep_tuples--;
-				}
-			}
-		}
-
-		if (vacpage->offsets_free > 0)	/* some tuples were moved */
-		{
-			if (chain_tuple_moved)		/* else - they are ordered */
-			{
-				qsort((char *) (vacpage->offsets), vacpage->offsets_free,
-					  sizeof(OffsetNumber), vac_cmp_offno);
-			}
-			vpage_insert(&Nvacpagelist, copy_vac_page(vacpage));
-		}
-
-		MIRROREDLOCK_BUFMGR_UNLOCK;
-		// -------- MirroredLock ----------
-
-		ReleaseBuffer(buf);
-
-		if (offnum <= maxoff)
-			break;				/* had to quit early, see above note */
-
-	}							/* walk along relation */
-
-	blkno++;					/* new number of blocks */
-
-	if (dst_buffer != InvalidBuffer)
-	{
-		Assert(num_moved > 0);
-		ReleaseBuffer(dst_buffer);
-	}
-
-	/*
-	 * In GPDB, the moving of relation tuples and truncating the relation is
-	 * performed in two separate transactions one after the other so we don't
-	 * need to commit the transaction here unlike the upstream code. The
-	 * transactions are started and ended in vacuumStatement_Relation().
-	 */
-
-	/*
-	 * We are not going to move any more tuples across pages, but we still
-	 * need to apply vacuum_page to compact free space in the remaining pages
-	 * in vacuum_pages list.  Note that some of these pages may also be in the
-	 * fraged_pages list, and may have had tuples moved onto them; if so, we
-	 * already did vacuum_page and needn't do it again.
-	 */
-	for (i = 0, curpage = vacuum_pages->pagedesc;
-		 i < vacuumed_pages;
-		 i++, curpage++)
-	{
-		vacuum_delay_point();
-
-		Assert((*curpage)->blkno < blkno);
-		if ((*curpage)->offsets_used == 0)
-		{
-			Buffer		buf;
-			Page		page;
-
-			/* this page was not used as a move target, so must clean it */
-
-			// -------- MirroredLock ----------
-			MIRROREDLOCK_BUFMGR_LOCK;
-
-			buf = ReadBufferExtended(onerel, MAIN_FORKNUM, (*curpage)->blkno,
-									 RBM_NORMAL, vac_strategy);
-			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-			page = BufferGetPage(buf);
-			if (!PageIsEmpty(page))
-				vacuum_page(onerel, buf, *curpage);
-			UnlockReleaseBuffer(buf);
-
-			MIRROREDLOCK_BUFMGR_UNLOCK;
-			// -------- MirroredLock ----------
-
-		}
-	}
-
-	/*
-	 * It'd be cleaner to make this report at the bottom of this routine, but
-	 * then the rusage would double-count the second pass of index vacuuming.
-	 * So do it here and ignore the relatively small amount of processing that
-	 * occurs below.
-	 */
-	ereport(elevel,
-			(errmsg("\"%s\": moved %u row versions, will truncate %u to %u pages",
-					RelationGetRelationName(onerel),
-					num_moved, nblocks, blkno),
-			 errdetail("%s.",
-					   pg_rusage_show(&ru0))));
-
-	/*
-	 * Reflect the motion of system tuples to catalog cache here.
-	 */
-	CommandCounterIncrement();
-
-	/* clean up */
-	pfree(vacpage);
-	if (vacrelstats->vtlinks != NULL)
-		pfree(vacrelstats->vtlinks);
-
-	ExecContext_Finish(&ec);
-
-	vacuum_pages->empty_end_pages = nblocks - blkno;
-
-	SIMPLE_FAULT_INJECTOR(RepairFragEnd);
-
-	return heldoff;
-}
-
-/*
- *	move_chain_tuple() -- move one tuple that is part of a tuple chain
- *
- *		This routine moves old_tup from old_page to dst_page.
- *		old_page and dst_page might be the same page.
- *		On entry old_buf and dst_buf are locked exclusively, both locks (or
- *		the single lock, if this is a intra-page-move) are released before
- *		exit.
- *
- *		Yes, a routine with ten parameters is ugly, but it's still better
- *		than having these 120 lines of code in repair_frag() which is
- *		already too long and almost unreadable.
- */
-static void
-move_chain_tuple(Relation rel,
-				 Buffer old_buf, Page old_page, HeapTuple old_tup,
-				 Buffer dst_buf, Page dst_page, VacPage dst_vacpage,
-				 ExecContext ec, ItemPointer ctid, bool cleanVpd)
-{
-	TransactionId myXID = GetCurrentTransactionId();
-	HeapTupleData newtup;
-	OffsetNumber newoff;
-	ItemId		newitemid;
-	Size		tuple_len = old_tup->t_len;
-
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
-
-	// Fetch gp_persistent_relation_node information that will be added to XLOG record.
-	RelationFetchGpRelationNodeForXLog(rel);
-
-	/*
-	 * make a modifiable copy of the source tuple.
-	 */
-	heap_copytuple_with_tuple(old_tup, &newtup);
-
-	/*
-	 * register invalidation of source tuple in catcaches.
-	 */
-	CacheInvalidateHeapTuple(rel, old_tup);
-
-	/* NO EREPORT(ERROR) TILL CHANGES ARE LOGGED */
-	START_CRIT_SECTION();
-
-	/*
-	 * mark the source tuple MOVED_OFF.
-	 */
-	old_tup->t_data->t_infomask &= ~(HEAP_XMIN_COMMITTED |
-									 HEAP_XMIN_INVALID |
-									 HEAP_MOVED_IN);
-	old_tup->t_data->t_infomask |= HEAP_MOVED_OFF;
-	HeapTupleHeaderSetXvac(old_tup->t_data, myXID);
-
-	/*
-	 * If this page was not used before - clean it.
-	 *
-	 * NOTE: a nasty bug used to lurk here.  It is possible for the source and
-	 * destination pages to be the same (since this tuple-chain member can be
-	 * on a page lower than the one we're currently processing in the outer
-	 * loop).  If that's true, then after vacuum_page() the source tuple will
-	 * have been moved, and tuple.t_data will be pointing at garbage.
-	 * Therefore we must do everything that uses old_tup->t_data BEFORE this
-	 * step!!
-	 *
-	 * This path is different from the other callers of vacuum_page, because
-	 * we have already incremented the vacpage's offsets_used field to account
-	 * for the tuple(s) we expect to move onto the page. Therefore
-	 * vacuum_page's check for offsets_used == 0 is wrong. But since that's a
-	 * good debugging check for all other callers, we work around it here
-	 * rather than remove it.
-	 */
-	if (!PageIsEmpty(dst_page) && cleanVpd)
-	{
-		int			sv_offsets_used = dst_vacpage->offsets_used;
-
-		dst_vacpage->offsets_used = 0;
-		vacuum_page(rel, dst_buf, dst_vacpage);
-		dst_vacpage->offsets_used = sv_offsets_used;
-	}
-
-	/*
-	 * Update the state of the copied tuple, and store it on the destination
-	 * page.  The copied tuple is never part of a HOT chain.
-	 */
-	newtup.t_data->t_infomask &= ~(HEAP_XMIN_COMMITTED |
-								   HEAP_XMIN_INVALID |
-								   HEAP_MOVED_OFF);
-	newtup.t_data->t_infomask |= HEAP_MOVED_IN;
-	HeapTupleHeaderClearHotUpdated(newtup.t_data);
-	HeapTupleHeaderClearHeapOnly(newtup.t_data);
-	HeapTupleHeaderSetXvac(newtup.t_data, myXID);
-	newoff = PageAddItem(dst_page, (Item) newtup.t_data, tuple_len,
-						 InvalidOffsetNumber, false, true);
-	if (newoff == InvalidOffsetNumber)
-		elog(PANIC, "failed to add item with len = %lu to page %u while moving tuple chain",
-			 (unsigned long) tuple_len, dst_vacpage->blkno);
-	newitemid = PageGetItemId(dst_page, newoff);
-	/* drop temporary copy, and point to the version on the dest page */
-	pfree(newtup.t_data);
-	newtup.t_data = (HeapTupleHeader) PageGetItem(dst_page, newitemid);
-
-	ItemPointerSet(&(newtup.t_self), dst_vacpage->blkno, newoff);
-
-	/*
-	 * Set new tuple's t_ctid pointing to itself if last tuple in chain, and
-	 * to next tuple in chain otherwise.  (Since we move the chain in reverse
-	 * order, this is actually the previously processed tuple.)
-	 */
-	if (!ItemPointerIsValid(ctid))
-		newtup.t_data->t_ctid = newtup.t_self;
-	else
-		newtup.t_data->t_ctid = *ctid;
-	*ctid = newtup.t_self;
-
-	MarkBufferDirty(dst_buf);
-	if (dst_buf != old_buf)
-		MarkBufferDirty(old_buf);
-
-	/* XLOG stuff */
-	if (!rel->rd_istemp)
-	{
-		XLogRecPtr	recptr = log_heap_move(rel, old_buf, old_tup->t_self,
-										   dst_buf, &newtup);
-
-		if (old_buf != dst_buf)
-		{
-			PageSetLSN(old_page, recptr);
-		}
-		PageSetLSN(dst_page, recptr);
-	}
-
-	END_CRIT_SECTION();
-
-	PageClearAllVisible(BufferGetPage(old_buf));
-	if (dst_buf != old_buf)
-		PageClearAllVisible(BufferGetPage(dst_buf));
-
-	LockBuffer(dst_buf, BUFFER_LOCK_UNLOCK);
-	if (dst_buf != old_buf)
-		LockBuffer(old_buf, BUFFER_LOCK_UNLOCK);
-
-	/* Clear the bits in the visibility map. */
-	visibilitymap_clear(rel, BufferGetBlockNumber(old_buf));
-	if (dst_buf != old_buf)
-		visibilitymap_clear(rel, BufferGetBlockNumber(dst_buf));
-
-	/* Create index entries for the moved tuple */
-	if (ec->resultRelInfo->ri_NumIndices > 0)
-	{
-		ExecStoreHeapTuple(&newtup, ec->slot, InvalidBuffer, false);
-		ExecInsertIndexTuples(ec->slot, &(newtup.t_self), ec->estate, true);
-		ResetPerTupleExprContext(ec->estate);
-	}
-}
-
-/*
- *	move_plain_tuple() -- move one tuple that is not part of a chain
- *
- *		This routine moves old_tup from old_page to dst_page.
- *		On entry old_buf and dst_buf are locked exclusively, both locks are
- *		released before exit.
- *
- *		Yes, a routine with eight parameters is ugly, but it's still better
- *		than having these 90 lines of code in repair_frag() which is already
- *		too long and almost unreadable.
- */
-static void
-move_plain_tuple(Relation rel,
-				 Buffer old_buf, Page old_page, HeapTuple old_tup,
-				 Buffer dst_buf, Page dst_page, VacPage dst_vacpage,
-				 ExecContext ec)
-{
-	TransactionId myXID = GetCurrentTransactionId();
-	HeapTupleData newtup;
-	OffsetNumber newoff;
-	ItemId		newitemid;
-	Size		tuple_len = old_tup->t_len;
-
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
-
-	// Fetch gp_persistent_relation_node information that will be added to XLOG record.
-	RelationFetchGpRelationNodeForXLog(rel);
-
-	/* copy tuple */
-	heap_copytuple_with_tuple(old_tup, &newtup);
-
-	/*
-	 * register invalidation of source tuple in catcaches.
-	 *
-	 * (Note: we do not need to register the copied tuple, because we are not
-	 * changing the tuple contents and so there cannot be any need to flush
-	 * negative catcache entries.)
-	 */
-	CacheInvalidateHeapTuple(rel, old_tup);
-
-	/* NO EREPORT(ERROR) TILL CHANGES ARE LOGGED */
-	START_CRIT_SECTION();
-
-	/*
-	 * Mark new tuple as MOVED_IN by me; also mark it not HOT.
-	 */
-	newtup.t_data->t_infomask &= ~(HEAP_XMIN_COMMITTED |
-								   HEAP_XMIN_INVALID |
-								   HEAP_MOVED_OFF);
-	newtup.t_data->t_infomask |= HEAP_MOVED_IN;
-	HeapTupleHeaderClearHotUpdated(newtup.t_data);
-	HeapTupleHeaderClearHeapOnly(newtup.t_data);
-	HeapTupleHeaderSetXvac(newtup.t_data, myXID);
-
-	/* add tuple to the page */
-	newoff = PageAddItem(dst_page, (Item) newtup.t_data, tuple_len,
-						 InvalidOffsetNumber, false, true);
-	if (newoff == InvalidOffsetNumber)
-		elog(PANIC, "failed to add item with len = %lu to page %u (free space %lu, nusd %u, noff %u)",
-			 (unsigned long) tuple_len,
-			 dst_vacpage->blkno, (unsigned long) dst_vacpage->free,
-			 dst_vacpage->offsets_used, dst_vacpage->offsets_free);
-	newitemid = PageGetItemId(dst_page, newoff);
-	pfree(newtup.t_data);
-	newtup.t_data = (HeapTupleHeader) PageGetItem(dst_page, newitemid);
-	ItemPointerSet(&(newtup.t_data->t_ctid), dst_vacpage->blkno, newoff);
-	newtup.t_self = newtup.t_data->t_ctid;
-
-	/*
-	 * Mark old tuple as MOVED_OFF by me.
-	 */
-	old_tup->t_data->t_infomask &= ~(HEAP_XMIN_COMMITTED |
-									 HEAP_XMIN_INVALID |
-									 HEAP_MOVED_IN);
-	old_tup->t_data->t_infomask |= HEAP_MOVED_OFF;
-	HeapTupleHeaderSetXvac(old_tup->t_data, myXID);
-
-	MarkBufferDirty(dst_buf);
-	MarkBufferDirty(old_buf);
-
-	/* XLOG stuff */
-	if (!rel->rd_istemp)
-	{
-		XLogRecPtr	recptr = log_heap_move(rel, old_buf, old_tup->t_self,
-										   dst_buf, &newtup);
-
-		PageSetLSN(old_page, recptr);
-		PageSetLSN(dst_page, recptr);
-	}
-
-	END_CRIT_SECTION();
-
-	/*
-	 * Clear the visible-to-all hint bits on the page, and bits in the
-	 * visibility map. Normally we'd release the locks on the heap pages
-	 * before updating the visibility map, but doesn't really matter here
-	 * because we're holding an AccessExclusiveLock on the relation anyway.
-	 */
-	if (PageIsAllVisible(dst_page))
-	{
-		PageClearAllVisible(dst_page);
-		visibilitymap_clear(rel, BufferGetBlockNumber(dst_buf));
-	}
-	if (PageIsAllVisible(old_page))
-	{
-		PageClearAllVisible(old_page);
-		visibilitymap_clear(rel, BufferGetBlockNumber(old_buf));
-	}
-
-	dst_vacpage->free = PageGetFreeSpaceWithFillFactor(rel, dst_page);
-	LockBuffer(dst_buf, BUFFER_LOCK_UNLOCK);
-	LockBuffer(old_buf, BUFFER_LOCK_UNLOCK);
-
-	dst_vacpage->offsets_used++;
-
-	/* insert index' tuples if needed */
-	if (ec->resultRelInfo->ri_NumIndices > 0)
-	{
-		ExecStoreHeapTuple(&newtup, ec->slot, InvalidBuffer, false);
-		ExecInsertIndexTuples(ec->slot, &(newtup.t_self), ec->estate, true);
-		ResetPerTupleExprContext(ec->estate);
-	}
-}
-
-/*
- *	vacuum_heap() -- free dead tuples
- *
- *		This routine marks dead tuples as unused and truncates relation
- *		if there are "empty" end-blocks.
- */
-static void
-vacuum_heap(VRelStats *vacrelstats, Relation onerel, VacPageList vacuum_pages)
-{
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
-	Buffer		buf;
-	VacPage    *vacpage;
-	int			nblocks;
-	int			i;
-
-	// Fetch gp_persistent_relation_node information that will be added to XLOG record.
-	RelationFetchGpRelationNodeForXLog(onerel);
-
-	nblocks = vacuum_pages->num_pages;
-	nblocks -= vacuum_pages->empty_end_pages;	/* nothing to do with them */
-
-	for (i = 0, vacpage = vacuum_pages->pagedesc; i < nblocks; i++, vacpage++)
-	{
-		vacuum_delay_point();
-
-		if ((*vacpage)->offsets_free > 0)
-		{
-
-			// -------- MirroredLock ----------
-			MIRROREDLOCK_BUFMGR_LOCK;
-
-			buf = ReadBufferExtended(onerel, MAIN_FORKNUM, (*vacpage)->blkno,
-									 RBM_NORMAL, vac_strategy);
-			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-			vacuum_page(onerel, buf, *vacpage);
-			UnlockReleaseBuffer(buf);
-
-			MIRROREDLOCK_BUFMGR_UNLOCK;
-			// -------- MirroredLock ----------
-
-		}
-	}
-}
-
-/*
- *	vacuum_page() -- free dead tuples on a page
- *					 and repair its fragmentation.
- *
- * Caller must hold pin and lock on buffer.
- */
-static void
-vacuum_page(Relation onerel, Buffer buffer, VacPage vacpage)
-{
-	Page		page = BufferGetPage(buffer);
-	int			i;
-
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
-
-	/* There shouldn't be any tuples moved onto the page yet! */
-	Assert(vacpage->offsets_used == 0);
-
-	START_CRIT_SECTION();
-
-	for (i = 0; i < vacpage->offsets_free; i++)
-	{
-		ItemId		itemid = PageGetItemId(page, vacpage->offsets[i]);
-
-		ItemIdSetUnused(itemid);
-	}
-
-	PageRepairFragmentation(page);
-
-	MarkBufferDirty(buffer);
-
-	/* XLOG stuff */
-	if (!onerel->rd_istemp)
-	{
-		XLogRecPtr	recptr;
-
-		recptr = log_heap_clean(onerel, buffer,
-								NULL, 0, NULL, 0,
-								vacpage->offsets, vacpage->offsets_free,
-								false);
-		PageSetLSN(page, recptr);
-	}
-
-	END_CRIT_SECTION();
-}
+#endif
 
 /*
  *	scan_index() -- scan one index relation to update pg_class statistics.
@@ -4803,7 +2741,7 @@ vacuum_page(Relation onerel, Buffer buffer, VacPage vacpage)
  * We use this when we have no deletions to do.
  */
 static void
-scan_index(Relation indrel, double num_tuples, List *updated_stats, bool isfull, bool check_stats)
+scan_index(Relation indrel, double num_tuples, bool check_stats, int elevel)
 {
 	IndexBulkDeleteResult *stats;
 	IndexVacuumInfo ivinfo;
@@ -4812,7 +2750,8 @@ scan_index(Relation indrel, double num_tuples, List *updated_stats, bool isfull,
 	pg_rusage_init(&ru0);
 
 	ivinfo.index = indrel;
-	ivinfo.vacuum_full = isfull;
+	ivinfo.analyze_only = false;
+	ivinfo.estimated_count = false;
 	ivinfo.message_level = elevel;
 	ivinfo.num_heap_tuples = num_tuples;
 	ivinfo.strategy = vac_strategy;
@@ -4822,10 +2761,19 @@ scan_index(Relation indrel, double num_tuples, List *updated_stats, bool isfull,
 	if (!stats)
 		return;
 
-	/* now update statistics in pg_class */
-	vac_update_relstats_from_list(indrel,
-						stats->num_pages, stats->num_index_tuples,
-						false, InvalidTransactionId, updated_stats);
+	/*
+	 * Now update statistics in pg_class, but only if the index says the count
+	 * is accurate.
+	 */
+	if (!stats->estimated_count)
+		vac_update_relstats(indrel,
+							stats->num_pages, stats->num_index_tuples,
+							visibilitymap_count(indrel),
+							false,
+							InvalidTransactionId,
+							InvalidMultiXactId,
+							false,
+							true /* isvacuum */);
 
 	ereport(elevel,
 			(errmsg("index \"%s\" now contains %.0f row versions in %u pages",
@@ -4837,11 +2785,15 @@ scan_index(Relation indrel, double num_tuples, List *updated_stats, bool isfull,
 			  stats->pages_deleted, stats->pages_free,
 			  pg_rusage_show(&ru0))));
 
+	/* GPDB_91_MERGE_FIXME: vac_is_partial_index() doesn't work. Do we need this sanity check? */
+#if 0 	
 	/*
 	 * Check for tuple count mismatch.	If the index is partial, then it's OK
 	 * for it to have fewer tuples than the heap; else we got trouble.
 	 */
-	if (check_stats && stats->num_index_tuples != num_tuples)
+	if (check_stats &&
+		!stats->estimated_count &&
+		stats->num_index_tuples != num_tuples)
 	{
 		if (stats->num_index_tuples > num_tuples ||
 			!vac_is_partial_index(indrel))
@@ -4851,6 +2803,7 @@ scan_index(Relation indrel, double num_tuples, List *updated_stats, bool isfull,
 							stats->num_index_tuples, num_tuples),
 					 errhint("Rebuild the index with REINDEX.")));
 	}
+#endif
 
 	pfree(stats);
 }
@@ -4864,10 +2817,9 @@ scan_index(Relation indrel, double num_tuples, List *updated_stats, bool isfull,
  */
 static void
 vacuum_appendonly_index(Relation indexRelation,
-		AppendOnlyIndexVacuumState* vacuumIndexState,
-		List *updated_stats,
-		double rel_tuple_count,
-		bool isfull)
+						AppendOnlyIndexVacuumState *vacuumIndexState,
+						double rel_tuple_count,
+						int elevel)
 {
 	Assert(RelationIsValid(indexRelation));
 	Assert(vacuumIndexState);
@@ -4879,7 +2831,6 @@ vacuum_appendonly_index(Relation indexRelation,
 	pg_rusage_init(&ru0);
 
 	ivinfo.index = indexRelation;
-	ivinfo.vacuum_full = isfull;
 	ivinfo.message_level = elevel;
 	ivinfo.num_heap_tuples = rel_tuple_count;
 	ivinfo.strategy = vac_strategy;
@@ -4894,10 +2845,19 @@ vacuum_appendonly_index(Relation indexRelation,
 	if (!stats)
 		return;
 
-	/* now update statistics in pg_class */
-	vac_update_relstats_from_list(indexRelation,
-						stats->num_pages, stats->num_index_tuples,
-						false, InvalidTransactionId, updated_stats);
+	/*
+	 * Now update statistics in pg_class, but only if the index says the count
+	 * is accurate.
+	 */
+	if (!stats->estimated_count)
+		vac_update_relstats(indexRelation,
+							stats->num_pages, stats->num_index_tuples,
+							visibilitymap_count(indexRelation),
+							false,
+							InvalidTransactionId,
+							InvalidMultiXactId,
+							false,
+							true /* isvacuum */);
 
 	ereport(elevel,
 			(errmsg("index \"%s\" now contains %.0f row versions in %u pages",
@@ -4913,79 +2873,6 @@ vacuum_appendonly_index(Relation indexRelation,
 
 	pfree(stats);
 
-}
-
-/*
- *	vacuum_index() -- vacuum one index relation.
- *
- *		Vpl is the VacPageList of the heap we're currently vacuuming.
- *		It's locked. Indrel is an index relation on the vacuumed heap.
- *
- *		We don't bother to set locks on the index relation here, since
- *		the parent table is exclusive-locked already.
- *
- *		Finally, we arrange to update the index relation's statistics in
- *		pg_class.
- */
-static void
-vacuum_index(VacPageList vacpagelist, Relation indrel,
-			 double num_tuples, int keep_tuples, List *updated_stats,
-			 bool check_stats)
-{
-	IndexBulkDeleteResult *stats;
-	IndexVacuumInfo ivinfo;
-	PGRUsage	ru0;
-
-	pg_rusage_init(&ru0);
-
-	ivinfo.index = indrel;
-	ivinfo.vacuum_full = true;
-	ivinfo.message_level = elevel;
-	ivinfo.num_heap_tuples = num_tuples + keep_tuples;
-	ivinfo.strategy = vac_strategy;
-
-	/* Do bulk deletion */
-	stats = index_bulk_delete(&ivinfo, NULL, tid_reaped, (void *) vacpagelist);
-
-	/* Do post-VACUUM cleanup */
-	stats = index_vacuum_cleanup(&ivinfo, stats);
-
-	if (!stats)
-		return;
-
-	/* now update statistics in pg_class */
-	vac_update_relstats_from_list(indrel,
-						stats->num_pages, stats->num_index_tuples,
-						false, InvalidTransactionId, updated_stats);
-
-	ereport(elevel,
-			(errmsg("index \"%s\" now contains %.0f row versions in %u pages",
-					RelationGetRelationName(indrel),
-					stats->num_index_tuples,
-					stats->num_pages),
-			 errdetail("%.0f index row versions were removed.\n"
-			 "%u index pages have been deleted, %u are currently reusable.\n"
-					   "%s.",
-					   stats->tuples_removed,
-					   stats->pages_deleted, stats->pages_free,
-					   pg_rusage_show(&ru0))));
-
-	/*
-	 * Check for tuple count mismatch.	If the index is partial, then it's OK
-	 * for it to have fewer tuples than the heap; else we got trouble.
-	 */
-	if (check_stats && stats->num_index_tuples != num_tuples + keep_tuples)
-	{
-		if (stats->num_index_tuples > num_tuples + keep_tuples ||
-			!vac_is_partial_index(indrel))
-			ereport(WARNING,
-					(errmsg("index \"%s\" contains %.0f row versions, but table contains %.0f row versions",
-							RelationGetRelationName(indrel),
-						  stats->num_index_tuples, num_tuples + keep_tuples),
-					 errhint("Rebuild the index with REINDEX.")));
-	}
-
-	pfree(stats);
 }
 
 static bool
@@ -5051,228 +2938,8 @@ appendonly_tid_reaped(ItemPointer itemptr, void *state)
 }
 
 /*
- *	tid_reaped() -- is a particular tid reaped?
- *
- *		This has the right signature to be an IndexBulkDeleteCallback.
- *
- *		vacpagelist->VacPage_array is sorted in right order.
- */
-static bool
-tid_reaped(ItemPointer itemptr, void *state)
-{
-	VacPageList vacpagelist = (VacPageList) state;
-	OffsetNumber ioffno;
-	OffsetNumber *voff;
-	VacPage		vp,
-			   *vpp;
-	VacPageData vacpage;
-
-	vacpage.blkno = ItemPointerGetBlockNumber(itemptr);
-	ioffno = ItemPointerGetOffsetNumber(itemptr);
-
-	vp = &vacpage;
-	vpp = (VacPage *) vac_bsearch((void *) &vp,
-								  (void *) (vacpagelist->pagedesc),
-								  vacpagelist->num_pages,
-								  sizeof(VacPage),
-								  vac_cmp_blk);
-
-	if (vpp == NULL)
-		return false;
-
-	/* ok - we are on a partially or fully reaped page */
-	vp = *vpp;
-
-	if (vp->offsets_free == 0)
-	{
-		/* this is EmptyPage, so claim all tuples on it are reaped!!! */
-		return true;
-	}
-
-	voff = (OffsetNumber *) vac_bsearch((void *) &ioffno,
-										(void *) (vp->offsets),
-										vp->offsets_free,
-										sizeof(OffsetNumber),
-										vac_cmp_offno);
-
-	if (voff == NULL)
-		return false;
-
-	/* tid is reaped */
-	return true;
-}
-
-/*
- * Update the Free Space Map with the info we now have about free space in
- * the relation.
- */
-static void
-vac_update_fsm(Relation onerel, VacPageList fraged_pages,
-			   BlockNumber rel_pages)
-{
-	int			nPages = fraged_pages->num_pages;
-	VacPage    *pagedesc = fraged_pages->pagedesc;
-	int			i;
-
-	for (i = 0; i < nPages; i++)
-	{
-		/*
-		 * fraged_pages may contain entries for pages that we later decided to
-		 * truncate from the relation; don't enter them into the free space
-		 * map!
-		 */
-		if (pagedesc[i]->blkno >= rel_pages)
-			break;
-
-		RecordPageWithFreeSpace(onerel, pagedesc[i]->blkno, pagedesc[i]->free);
-	}
-
-}
-
-/* Copy a VacPage structure */
-static VacPage
-copy_vac_page(VacPage vacpage)
-{
-	VacPage		newvacpage;
-
-	/* allocate a VacPageData entry */
-	newvacpage = (VacPage) palloc(sizeof(VacPageData) +
-							   vacpage->offsets_free * sizeof(OffsetNumber));
-
-	/* fill it in */
-	if (vacpage->offsets_free > 0)
-		memcpy(newvacpage->offsets, vacpage->offsets,
-			   vacpage->offsets_free * sizeof(OffsetNumber));
-	newvacpage->blkno = vacpage->blkno;
-	newvacpage->free = vacpage->free;
-	newvacpage->offsets_used = vacpage->offsets_used;
-	newvacpage->offsets_free = vacpage->offsets_free;
-
-	return newvacpage;
-}
-
-/*
- * Add a VacPage pointer to a VacPageList.
- *
- *		As a side effect of the way that scan_heap works,
- *		higher pages come after lower pages in the array
- *		(and highest tid on a page is last).
- */
-static void
-vpage_insert(VacPageList vacpagelist, VacPage vpnew)
-{
-#define PG_NPAGEDESC 1024
-
-	/* allocate a VacPage entry if needed */
-	if (vacpagelist->num_pages == 0)
-	{
-		vacpagelist->pagedesc = (VacPage *) palloc(PG_NPAGEDESC * sizeof(VacPage));
-		vacpagelist->num_allocated_pages = PG_NPAGEDESC;
-	}
-	else if (vacpagelist->num_pages >= vacpagelist->num_allocated_pages)
-	{
-		vacpagelist->num_allocated_pages *= 2;
-		vacpagelist->pagedesc = (VacPage *) repalloc(vacpagelist->pagedesc, vacpagelist->num_allocated_pages * sizeof(VacPage));
-	}
-	vacpagelist->pagedesc[vacpagelist->num_pages] = vpnew;
-	(vacpagelist->num_pages)++;
-}
-
-/*
- * vac_bsearch: just like standard C library routine bsearch(),
- * except that we first test to see whether the target key is outside
- * the range of the table entries.	This case is handled relatively slowly
- * by the normal binary search algorithm (ie, no faster than any other key)
- * but it occurs often enough in VACUUM to be worth optimizing.
- */
-static void *
-vac_bsearch(const void *key, const void *base,
-			size_t nelem, size_t size,
-			int (*compar) (const void *, const void *))
-{
-	int			res;
-	const void *last;
-
-	if (nelem == 0)
-		return NULL;
-	res = compar(key, base);
-	if (res < 0)
-		return NULL;
-	if (res == 0)
-		return (void *) base;
-	if (nelem > 1)
-	{
-		last = (const void *) ((const char *) base + (nelem - 1) * size);
-		res = compar(key, last);
-		if (res > 0)
-			return NULL;
-		if (res == 0)
-			return (void *) last;
-	}
-	if (nelem <= 2)
-		return NULL;			/* already checked 'em all */
-	return bsearch(key, base, nelem, size, compar);
-}
-
-/*
- * Comparator routines for use with qsort() and bsearch().
- */
-static int
-vac_cmp_blk(const void *left, const void *right)
-{
-	BlockNumber lblk,
-				rblk;
-
-	lblk = (*((VacPage *) left))->blkno;
-	rblk = (*((VacPage *) right))->blkno;
-
-	if (lblk < rblk)
-		return -1;
-	if (lblk == rblk)
-		return 0;
-	return 1;
-}
-
-static int
-vac_cmp_offno(const void *left, const void *right)
-{
-	if (*(OffsetNumber *) left < *(OffsetNumber *) right)
-		return -1;
-	if (*(OffsetNumber *) left == *(OffsetNumber *) right)
-		return 0;
-	return 1;
-}
-
-static int
-vac_cmp_vtlinks(const void *left, const void *right)
-{
-	if (((VTupleLink) left)->new_tid.ip_blkid.bi_hi <
-		((VTupleLink) right)->new_tid.ip_blkid.bi_hi)
-		return -1;
-	if (((VTupleLink) left)->new_tid.ip_blkid.bi_hi >
-		((VTupleLink) right)->new_tid.ip_blkid.bi_hi)
-		return 1;
-	/* bi_hi-es are equal */
-	if (((VTupleLink) left)->new_tid.ip_blkid.bi_lo <
-		((VTupleLink) right)->new_tid.ip_blkid.bi_lo)
-		return -1;
-	if (((VTupleLink) left)->new_tid.ip_blkid.bi_lo >
-		((VTupleLink) right)->new_tid.ip_blkid.bi_lo)
-		return 1;
-	/* bi_lo-es are equal */
-	if (((VTupleLink) left)->new_tid.ip_posid <
-		((VTupleLink) right)->new_tid.ip_posid)
-		return -1;
-	if (((VTupleLink) left)->new_tid.ip_posid >
-		((VTupleLink) right)->new_tid.ip_posid)
-		return 1;
-	return 0;
-}
-
-
-/*
  * Open all the vacuumable indexes of the given relation, obtaining the
- * specified kind of lock on each.	Return an array of Relation pointers for
+ * specified kind of lock on each.  Return an array of Relation pointers for
  * the indexes into *Irel, and the number of indexes into *nindexes.
  *
  * We consider an index vacuumable if it is marked insertable (IndexIsReady).
@@ -5322,7 +2989,7 @@ vac_open_indexes(Relation relation, LOCKMODE lockmode,
 }
 
 /*
- * Release the resources acquired by vac_open_indexes.	Optionally release
+ * Release the resources acquired by vac_open_indexes.  Optionally release
  * the locks (say NoLock to keep 'em).
  */
 void
@@ -5338,72 +3005,6 @@ vac_close_indexes(int nindexes, Relation *Irel, LOCKMODE lockmode)
 		index_close(ind, lockmode);
 	}
 	pfree(Irel);
-}
-
-
-/*
- * Is an index partial (ie, could it contain fewer tuples than the heap?)
- */
-bool
-vac_is_partial_index(Relation indrel)
-{
-	/*
-	 * If the index's AM doesn't support nulls, it's partial for our purposes
-	 */
-	if (!indrel->rd_am->amindexnulls)
-		return true;
-
-	/* Otherwise, look to see if there's a partial-index predicate */
-	if (!heap_attisnull(indrel->rd_indextuple, Anum_pg_index_indpred))
-		return true;
-
-	return false;
-}
-
-
-static bool
-enough_space(VacPage vacpage, Size len)
-{
-	len = MAXALIGN(len);
-
-	if (len > vacpage->free)
-		return false;
-
-	/* if there are free itemid(s) and len <= free_space... */
-	if (vacpage->offsets_used < vacpage->offsets_free)
-		return true;
-
-	/* noff_used >= noff_free and so we'll have to allocate new itemid */
-	if (len + sizeof(ItemIdData) <= vacpage->free)
-		return true;
-
-	return false;
-}
-
-static Size
-PageGetFreeSpaceWithFillFactor(Relation relation, Page page)
-{
-	/*
-	 * It is correct to use PageGetExactFreeSpace() here, *not*
-	 * PageGetHeapFreeSpace().  This is because (a) we do our own, exact
-	 * accounting for whether line pointers must be added, and (b) we will
-	 * recycle any LP_DEAD line pointers before starting to add rows to a
-	 * page, but that may not have happened yet at the time this function is
-	 * applied to a page, which means PageGetHeapFreeSpace()'s protection
-	 * against too many line pointers on a page could fire incorrectly.  We do
-	 * not need that protection here: since VACUUM FULL always recycles all
-	 * dead line pointers first, it'd be physically impossible to insert more
-	 * than MaxHeapTuplesPerPage tuples anyway.
-	 */
-	Size		freespace = PageGetExactFreeSpace(page);
-	Size		targetfree;
-
-	targetfree = RelationGetTargetPageFreeSpace(relation,
-												HEAP_DEFAULT_FILLFACTOR);
-	if (freespace > targetfree)
-		return freespace - targetfree;
-	else
-		return 0;
 }
 
 /*
@@ -5448,169 +3049,26 @@ dispatchVacuum(VacuumStmt *vacstmt, VacuumStatsContext *ctx)
 {
 	CdbPgResults cdb_pgresults;
 
+	int flags = DF_CANCEL_ON_ERROR | DF_WITH_SNAPSHOT;
+
 	/* should these be marked volatile ? */
 
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 	Assert(vacstmt);
-	Assert(vacstmt->vacuum);
-	Assert(!vacstmt->analyze);
+	Assert(vacstmt->options & VACOPT_VACUUM);
+	Assert(!(vacstmt->options & VACOPT_ANALYZE));
+
+	if (!vacstmt->skip_twophase)
+		flags |= DF_NEED_TWO_PHASE;
 
 	/* XXX: Some kinds of VACUUM assign a new relfilenode. bitmap indexes maybe? */
-	CdbDispatchUtilityStatement((Node *) vacstmt,
-								DF_CANCEL_ON_ERROR|
-								DF_WITH_SNAPSHOT|
-								DF_NEED_TWO_PHASE,
+	CdbDispatchUtilityStatement((Node *) vacstmt, flags,
 								GetAssignedOidsForDispatch(),
 								&cdb_pgresults);
 
 	vacuum_combine_stats(ctx, &cdb_pgresults);
 
 	cdbdisp_clearCdbPgResults(&cdb_pgresults);
-}
-
-/*
- * open_relation_and_check_permission -- open the relation with an appropriate
- * lock based on the vacuum statement, and check for the permissions on this
- * relation.
- */
-static Relation
-open_relation_and_check_permission(VacuumStmt *vacstmt,
-								   Oid relid,
-								   char expected_relkind,
-								   bool isDropTransaction)
-{
-	Relation onerel;
-	LOCKMODE lmode;
-	bool dontWait = false;
-
-	/*
-	 * If this is a drop transaction and there is another parallel drop transaction
-	 * (on any relation) active. We drop out there. The other drop transaction
-	 * might be on the same relation and that would be upgrade deadlock.
-	 *
-	 * Note: By the time we would have reached try_relation_open the other
-	 * drop transaction might already be completed, but we don't take that
-	 * risk here.
-	 *
-	 * My marking the drop transaction as busy before checking, the worst
-	 * thing that can happen is that both transaction see each other and
-	 * both cancel the drop.
-	 *
-	 * The upgrade deadlock is not applicable to vacuum full because
-	 * it begins with an AccessExclusive lock and doesn't need to
-	 * upgrade it.
-	 */
-
-	if (isDropTransaction && !vacstmt->full)
-	{
-		MyProc->inDropTransaction = true;
-		SIMPLE_FAULT_INJECTOR(VacuumRelationOpenRelationDuringDropPhase);
-		if (HasDropTransaction(false))
-		{
-			elogif(Debug_appendonly_print_compaction, LOG,
-					"Skip drop because of concurrent drop transaction");
-
-			return NULL;
-		}
-	}
-
-	/*
-	 * Determine the type of lock we want --- hard exclusive lock for a FULL
-	 * vacuum, but just ShareUpdateExclusiveLock for concurrent vacuum. Either
-	 * way, we can be sure that no other backend is vacuuming the same table.
-	 * For analyze, we use ShareUpdateExclusiveLock.
-	 */
-	if (isDropTransaction)
-	{
-		lmode = AccessExclusiveLock;
-		dontWait = true;
-	}
-	else if (!vacstmt->vacuum)
-		lmode = ShareUpdateExclusiveLock;
-	else
-		lmode = vacstmt->full ? AccessExclusiveLock : ShareUpdateExclusiveLock;
-
-	/*
-	 * Open the relation and get the appropriate lock on it.
-	 *
-	 * There's a race condition here: the rel may have gone away since the
-	 * last time we saw it.  If so, we don't need to vacuum it.
-	 */
-	onerel = try_relation_open(relid, lmode, dontWait);
-
-	if (!RelationIsValid(onerel))
-		return NULL;
-
-	/*
-	 * Check permissions.
-	 *
-	 * We allow the user to vacuum a table if he is superuser, the table
-	 * owner, or the database owner (but in the latter case, only if it's not
-	 * a shared relation).	pg_class_ownercheck includes the superuser case.
-	 *
-	 * Note we choose to treat permissions failure as a WARNING and keep
-	 * trying to vacuum the rest of the DB --- is this appropriate?
-	 */
-	if (!(pg_class_ownercheck(RelationGetRelid(onerel), GetUserId()) ||
-		  (pg_database_ownercheck(MyDatabaseId, GetUserId()) && !onerel->rd_rel->relisshared)))
-	{
-		if (Gp_role != GP_ROLE_EXECUTE)
-		{
-			if (onerel->rd_rel->relisshared)
-				ereport(WARNING,
-						(errmsg("skipping \"%s\" --- only superuser can vacuum it",
-								RelationGetRelationName(onerel))));
-			else if (onerel->rd_rel->relnamespace == PG_CATALOG_NAMESPACE)
-				ereport(WARNING,
-						(errmsg("skipping \"%s\" --- only superuser or database owner can vacuum it",
-								RelationGetRelationName(onerel))));
-			else
-				ereport(WARNING,
-						(errmsg("skipping \"%s\" --- only table or database owner can vacuum it",
-								RelationGetRelationName(onerel))));
-		}
-		relation_close(onerel, lmode);
-		return NULL;
-	}
-
-	/*
-	 * Check that it's a plain table; we used to do this in get_rel_oids() but
-	 * seems safer to check after we've locked the relation.
-	 */
-	if (onerel->rd_rel->relkind != expected_relkind ||
-		RelationIsExternal(onerel) ||
-		(vacstmt->full && GpPersistent_IsPersistentRelation(RelationGetRelid(onerel))))
-	{
-		ereport(WARNING,
-				(errmsg("skipping \"%s\" --- cannot vacuum indexes, views, external tables, or special system tables",
-						RelationGetRelationName(onerel))));
-		relation_close(onerel, lmode);
-		return NULL;
-	}
-
-	/*
-	 * Silently ignore tables that are temp tables of other backends ---
-	 * trying to vacuum these will lead to great unhappiness, since their
-	 * contents are probably not up-to-date on disk.  (We don't throw a
-	 * warning here; it would just lead to chatter during a database-wide
-	 * VACUUM.)
-	 */
-	if (isOtherTempNamespace(RelationGetNamespace(onerel)))
-	{
-		relation_close(onerel, lmode);
-		return NULL;
-	}
-
-	/*
-	 * We can ANALYZE any table except pg_statistic. See update_attstats
-	 */
-	if (vacstmt->analyze && RelationGetRelid(onerel) == StatisticRelationId)
-	{
-		relation_close(onerel, ShareUpdateExclusiveLock);
-		return NULL;
-	}
-
-	return onerel;
 }
 
 /*
@@ -5654,7 +3112,7 @@ vacuum_combine_stats(VacuumStatsContext *stats_context, CdbPgResults* cdb_pgresu
 		Assert(pgresult->extraslen > sizeof(int));
 
 		/*
-		 * Process the stats for pg_class. We simple compute the maximum
+		 * Process the stats for pg_class. We simply compute the maximum
 		 * number of rel_tuples and rel_pages.
 		 */
 		pgclass_stats = (VPgClassStats *) pgresult->extras;
@@ -5666,6 +3124,7 @@ vacuum_combine_stats(VacuumStatsContext *stats_context, CdbPgResults* cdb_pgresu
 			{
 				tmp_stats->rel_pages += pgclass_stats->rel_pages;
 				tmp_stats->rel_tuples += pgclass_stats->rel_tuples;
+				tmp_stats->relallvisible += pgclass_stats->relallvisible;
 				break;
 			}
 		}

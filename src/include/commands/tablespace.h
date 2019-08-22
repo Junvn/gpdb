@@ -4,10 +4,10 @@
  *		Tablespace management commands (create/drop tablespace).
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/commands/tablespace.h,v 1.19 2008/01/01 19:45:57 momjian Exp $
+ * src/include/commands/tablespace.h
  *
  *-------------------------------------------------------------------------
  */
@@ -34,15 +34,22 @@ typedef struct xl_tblspc_drop_rec
 	char		ts_path[1];		/* VARIABLE LENGTH STRING */
 } xl_tblspc_drop_rec;
 
+typedef struct TableSpaceOpts
+{
+	int32		vl_len_;		/* varlena header (do not touch directly!) */
+	float8		random_page_cost;
+	float8		seq_page_cost;
+} TableSpaceOpts;
 
-extern void CreateTableSpace(CreateTableSpaceStmt *stmt);
+extern Oid	CreateTableSpace(CreateTableSpaceStmt *stmt);
 extern void DropTableSpace(DropTableSpaceStmt *stmt);
-extern void RenameTableSpace(const char *oldname, const char *newname);
-extern void AlterTableSpaceOwner(const char *name, Oid newOwnerId);
+extern Oid	RenameTableSpace(const char *oldname, const char *newname);
+extern Oid	AlterTableSpaceOptions(AlterTableSpaceOptionsStmt *stmt);
 
 extern void TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo);
+extern void UnlinkTablespaceDirectory(Oid tablepace_oid_to_unlink, bool isRedo);
 
-extern Oid	GetDefaultTablespace(bool forTemp);
+extern Oid	GetDefaultTablespace(char relpersistence);
 
 extern void PrepareTempTablespaces(void);
 
@@ -52,8 +59,6 @@ extern char *get_tablespace_name(Oid spc_oid);
 extern bool directory_is_empty(const char *path);
 
 extern void tblspc_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *rptr);
-extern void tblspc_desc(StringInfo buf, XLogRecPtr beginLoc, XLogRecord *record);
-extern void set_short_version(const char *path, DbDirNode *dbDirNode,
-							  bool mirror);
+extern void tblspc_desc(StringInfo buf, XLogRecord *record);
 
 #endif   /* TABLESPACE_H */

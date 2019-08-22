@@ -16,7 +16,6 @@
  */
 
 #include "postgres.h"
-#include <limits.h>
 
 #ifdef HAVE_POLL_H
 #include <poll.h>
@@ -37,7 +36,9 @@
 #include "cdb/cdbvars.h"
 #include "cdb/cdbpq.h"
 #include "miscadmin.h"
-
+#include "commands/sequence.h"
+#include "access/xact.h"
+#include "utils/timestamp.h"
 #define DISPATCH_WAIT_TIMEOUT_MSEC 2000
 
 /*
@@ -80,17 +81,14 @@ typedef struct CdbDispatchCmdAsync
 
 } CdbDispatchCmdAsync;
 
-static int	timeoutCounter = 0;
-
-static void *cdbdisp_makeDispatchParams_async(int maxSlices, char *queryText, int len);
+static void *cdbdisp_makeDispatchParams_async(int maxSlices, int largestGangSize, char *queryText, int len);
 
 static void cdbdisp_checkDispatchResult_async(struct CdbDispatcherState *ds,
 								  DispatchWaitMode waitMode);
 
 static void cdbdisp_dispatchToGang_async(struct CdbDispatcherState *ds,
 							 struct Gang *gp,
-							 int sliceIndex,
-							 CdbDispatchDirectDesc *dispDirect);
+							 int sliceIndex);
 static void	cdbdisp_waitDispatchFinish_async(struct CdbDispatcherState *ds);
 
 static bool	cdbdisp_checkForCancel_async(struct CdbDispatcherState *ds);
@@ -98,7 +96,6 @@ static int cdbdisp_getWaitSocketFd_async(struct CdbDispatcherState *ds);
 
 DispatcherInternalFuncs DispatcherAsyncFuncs =
 {
-	NULL,
 	cdbdisp_checkForCancel_async,
 	cdbdisp_getWaitSocketFd_async,
 	cdbdisp_makeDispatchParams_async,
@@ -278,10 +275,10 @@ cdbdisp_waitDispatchFinish_async(struct CdbDispatcherState *ds)
 static void
 cdbdisp_dispatchToGang_async(struct CdbDispatcherState *ds,
 							 struct Gang *gp,
-							 int sliceIndex,
-							 CdbDispatchDirectDesc *dispDirect)
+							 int sliceIndex)
 {
 	int			i;
+
 	CdbDispatchCmdAsync *pParms = (CdbDispatchCmdAsync *) ds->dispatchParams;
 
 	/*
@@ -291,17 +288,9 @@ cdbdisp_dispatchToGang_async(struct CdbDispatcherState *ds,
 	{
 		CdbDispatchResult *qeResult;
 
-		SegmentDatabaseDescriptor *segdbDesc = &gp->db_descriptors[i];
+		SegmentDatabaseDescriptor *segdbDesc = gp->db_descriptors[i];
 
 		Assert(segdbDesc != NULL);
-
-		if (dispDirect->directed_dispatch)
-		{
-			/* We can direct dispatch to one segment DB only */
-			Assert(dispDirect->count == 1);
-			if (dispDirect->content[0] != segdbDesc->segindex)
-				continue;
-		}
 
 		/*
 		 * Initialize the QE's CdbDispatchResult object.
@@ -309,12 +298,6 @@ cdbdisp_dispatchToGang_async(struct CdbDispatcherState *ds,
 		qeResult = cdbdisp_makeResult(ds->primaryResults, segdbDesc, sliceIndex);
 		if (qeResult == NULL)
 		{
-			/*
-			 * writer_gang could be NULL if this is an extended query.
-			 */
-			if (ds->primaryResults->writer_gang)
-				ds->primaryResults->writer_gang->dispatcherActive = true;
-
 			elog(FATAL, "could not allocate resources for segworker communication");
 		}
 		pParms->dispatchResultPtrArray[pParms->dispatchCount++] = qeResult;
@@ -366,9 +349,9 @@ cdbdisp_checkDispatchResult_async(struct CdbDispatcherState *ds,
  * memory context.
  */
 static void *
-cdbdisp_makeDispatchParams_async(int maxSlices, char *queryText, int len)
+cdbdisp_makeDispatchParams_async(int maxSlices, int largestGangSize, char *queryText, int len)
 {
-	int			maxResults = maxSlices * getgpsegmentCount();
+	int			maxResults = maxSlices * largestGangSize;
 	int			size = 0;
 
 	CdbDispatchCmdAsync *pParms = palloc0(sizeof(CdbDispatchCmdAsync));
@@ -405,6 +388,7 @@ checkDispatchResult(CdbDispatcherState *ds,
 	int			timeout = 0;
 	bool		sentSignal = false;
 	struct pollfd *fds;
+	uint8 ftsVersion = 0;
 
 	db_count = pParms->dispatchCount;
 	fds = (struct pollfd *) palloc(db_count * sizeof(struct pollfd));
@@ -515,6 +499,13 @@ checkDispatchResult(CdbDispatcherState *ds,
 			elog(LOG, "handlePollError poll() failed; errno=%d", sock_errno);
 
 			handlePollError(pParms);
+
+			/*
+			 * Since an error was detected for the segment, request
+			 * FTS to perform a probe before checking the segment
+			 * state.
+			 */
+			FtsNotifyProber();
 			checkSegmentAlive(pParms);
 
 			if (pParms->waitMode != DISPATCH_WAIT_NONE)
@@ -535,10 +526,17 @@ checkDispatchResult(CdbDispatcherState *ds,
 				sentSignal = true;
 			}
 
-			if (timeoutCounter++ > (wait ? 30 : 300))
+			/*
+			 * This code relies on FTS being triggered at regular
+			 * intervals. Iff FTS detects change in configuration
+			 * then check segment state. FTS probe is not triggered
+			 * explicitly in this case because this happens every
+			 * DISPATCH_WAIT_TIMEOUT_MSEC.
+			 */
+			if (ftsVersion == 0 || ftsVersion != getFtsVersion())
 			{
+				ftsVersion = getFtsVersion();
 				checkSegmentAlive(pParms);
-				timeoutCounter = 0;
 			}
 
 			if (!wait)
@@ -580,6 +578,8 @@ dispatchCommand(CdbDispatchResult *dispatchResult,
 				 errmsg("Command could not be dispatch to segment %s: %s",
 						dispatchResult->segdbDesc->whoami, msg ? msg : "unknown error")));
 	}
+
+	forwardQENotices();
 
 	if (DEBUG1 >= log_min_messages)
 	{
@@ -641,6 +641,7 @@ handlePollError(CdbDispatchCmdAsync *pParms)
 			dispatchResult->stillRunning = false;
 		}
 	}
+	forwardQENotices();
 
 	return;
 }
@@ -750,7 +751,6 @@ signalQEs(CdbDispatchCmdAsync *pParms)
 
 		if (!dispatchResult->stillRunning ||
 			dispatchResult->wasCanceled ||
-			waitMode == dispatchResult->sentSignal ||
 			cdbconn_isBadConnection(segdbDesc))
 			continue;
 
@@ -767,18 +767,14 @@ signalQEs(CdbDispatchCmdAsync *pParms)
 
 /*
  * Check if any segment DB down is detected by FTS.
- *
- * Issue a FTS probe every 1 minute.
  */
 static void
 checkSegmentAlive(CdbDispatchCmdAsync *pParms)
 {
 	int			i;
-	bool		forceScan = true;
 
 	/*
-	 * check the connection still valid, set 1 min time interval this may
-	 * affect performance, should turn it off if required.
+	 * check the connection still valid
 	 */
 	for (i = 0; i < pParms->dispatchCount; i++)
 	{
@@ -800,7 +796,7 @@ checkSegmentAlive(CdbDispatchCmdAsync *pParms)
 		ELOG_DISPATCHER_DEBUG("FTS testing connection %d of %d (%s)",
 							  i + 1, pParms->dispatchCount, segdbDesc->whoami);
 
-		if (!FtsTestConnection(segdbDesc->segment_database_info, forceScan))
+		if (FtsIsSegmentDown(segdbDesc->segment_database_info))
 		{
 			char	   *msg = PQerrorMessage(segdbDesc->conn);
 
@@ -816,9 +812,24 @@ checkSegmentAlive(CdbDispatchCmdAsync *pParms)
 			PQfinish(segdbDesc->conn);
 			segdbDesc->conn = NULL;
 		}
-
-		forceScan = false;
 	}
+}
+
+static inline void
+send_sequence_response(PGconn *conn, Oid oid, int64 last, int64 cached, int64 increment, bool overflow, bool error)
+{
+	pqPutMsgStart(SEQ_NEXTVAL_QUERY_RESPONSE, false, conn);
+	pqPutInt(oid, 4, conn);
+	pqPutInt(last >> 32, 4, conn);
+	pqPutInt(last, 4, conn);
+	pqPutInt(cached >> 32, 4, conn);
+	pqPutInt(cached, 4, conn);
+	pqPutInt(increment >> 32, 4, conn);
+	pqPutInt(increment, 4, conn);
+	pqPutc(overflow ? SEQ_NEXTVAL_TRUE : SEQ_NEXTVAL_FALSE, conn);
+	pqPutc(error ? SEQ_NEXTVAL_TRUE : SEQ_NEXTVAL_FALSE, conn);
+	pqPutMsgEnd(conn);
+	pqFlush(conn);
 }
 
 /*
@@ -844,6 +855,7 @@ processResults(CdbDispatchResult *dispatchResult)
 									   segdbDesc->whoami, msg ? msg : "unknown error");
 		return true;
 	}
+	forwardQENotices();
 
 	/*
 	 * If we have received one or more complete messages, process them.
@@ -854,6 +866,8 @@ processResults(CdbDispatchResult *dispatchResult)
 		PGresult   *pRes;
 		ExecStatusType resultStatus;
 		int			resultIndex;
+
+		forwardQENotices();
 
 		/*
 		 * PQisBusy() does some error handling, which can cause the connection
@@ -891,6 +905,9 @@ processResults(CdbDispatchResult *dispatchResult)
 			/* this is normal end of command */
 			return true;
 		}
+
+		if (segdbDesc->conn->wrote_xlog)
+			MarkCurrentTransactionWriteXLogOnExecutor();
 
 		/*
 		 * Attach the PGresult object to the CdbDispatchResult object.
@@ -970,6 +987,54 @@ processResults(CdbDispatchResult *dispatchResult)
 			cdbdisp_seterrcode(errcode, resultIndex, dispatchResult);
 		}
 	}
+
+	forwardQENotices();
+
+	/*
+	 * If there was nextval request then respond back on this libpq connection
+	 * with the next value. Check and process nextval message only if QD has not
+	 * already hit the error. Since QD could have hit the error while processing
+	 * the previous nextval_qd() request itself and since full error handling is
+	 * not complete yet like releasing all the locks, etc.., shouldn't attempt
+	 * to call nextval_qd() again.
+	 */
+	PGnotify *nextval = PQnotifies(segdbDesc->conn);
+	if ((elog_geterrcode() == 0) && nextval &&
+		strcmp(nextval->relname, "nextval") == 0)
+	{
+		int64 last;
+		int64 cached;
+		int64 increment;
+		bool overflow;
+		int dbid;
+		int seq_oid;
+
+		if (sscanf(nextval->extra, "%d:%d", &dbid, &seq_oid) != 2)
+			elog(ERROR, "invalid nextval message");
+
+		if (dbid != MyDatabaseId)
+			elog(ERROR, "nextval message database id:%d doesn't match my database id:%d",
+				 dbid, MyDatabaseId);
+
+		PG_TRY();
+		{
+			nextval_qd(seq_oid, &last, &cached, &increment, &overflow);
+		}
+		PG_CATCH();
+		{
+			send_sequence_response(segdbDesc->conn, seq_oid, last, cached, increment, overflow, true /* error */);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		/*
+		 * respond back on this libpq connection with the next value
+		 */
+		send_sequence_response(segdbDesc->conn, seq_oid, last, cached, increment, overflow, false /* error */);
+	}
+	if (nextval)
+		PQfreemem(nextval);
+
+	forwardQENotices();
 
 	return false;				/* we must keep on monitoring this socket */
 }

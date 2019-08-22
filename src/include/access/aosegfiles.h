@@ -64,31 +64,6 @@ typedef enum FileSegInfoState
 	AOSEG_STATE_AWAITING_DROP = 2
 } FileSegInfoState;
 
-/*
- * pg_aoseg_nnnnnn table values for FormData_pg_attribute.
- *
- * [Similar examples are Schema_pg_type, Schema_pg_proc, Schema_pg_attribute, etc, in
- *  pg_attribute.h]
- */
-#define Schema_pg_aoseg \
-{ -1, {"segno"}, 				 23, -1, 4, 1, 0, -1, -1, true, 'p', 'i', false, false, false, true, 0 }, \
-{ -1, {"eof"},					 20, -1, 8, 2, 0, -1, -1, true, 'p', 'd', false, false, false, true, 0 }, \
-{ -1, {"tupcount"},				 20, -1, 8, 3, 0, -1, -1, true, 'p', 'd', false, false, false, true, 0 }, \
-{ -1, {"varblockcount"},		 20, -1, 8, 4, 0, -1, -1, true, 'p', 'd', false, false, false, true, 0 }, \
-{ -1, {"eofuncompressed"},		 20, -1, 8, 5, 0, -1, -1, true, 'p', 'd', false, false, false, true, 0 }, \
-{ -1, {"modcount"}, 			 20, -1, 8, 6, 0, -1, -1, true, 'p', 'i', false, false, false, true, 0 }, \
-{ -1, {"formatversion"},		 21, -1, 2, 7, 0, -1, -1, true, 'p', 's', false, false, false, true, 0 }, \
-{ -1, {"state"}, 				 21, -1, 2, 8, 0, -1, -1, true, 'p', 's', false, false, false, true, 0 }
-
-/*
- * pg_aoseg_nnnnnn table values for FormData_pg_class.
- */
-#define Class_pg_aoseg \
-  {"pg_appendonly"}, PG_CATALOG_NAMESPACE, -1, BOOTSTRAP_SUPERUSERID, 0, \
-               -1, DEFAULTTABLESPACE_OID, \
-               25, 10000, 0, 0, false, false, RELKIND_RELATION, RELSTORAGE_HEAP, Natts_pg_aoseg, \
-               0, false, false, false, false, false, FirstNormalTransactionId, {0}, {{{'\0','\0','\0','\0'},{'\0'}}}
-
 
 /*
  * GUC variables
@@ -152,16 +127,11 @@ typedef struct FileSegTotals
 										 * values */
 } FileSegTotals;
 
-typedef enum
-{
-	SegfileNoLock,
-	SegfileTryLock,
-	SegfileForceLock
-}			SegfileLockStrategy;
-
 extern FileSegInfo *NewFileSegInfo(int segno);
 
 extern void InsertInitialSegnoEntry(Relation parentrel, int segno);
+
+extern void ValidateAppendonlySegmentDataBeforeStorage(int segno);
 
  /*
   * GetFileSegInfo
@@ -178,8 +148,6 @@ extern void InsertInitialSegnoEntry(Relation parentrel, int segno);
 extern FileSegInfo *GetFileSegInfo(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot, int segno);
 
 extern FileSegInfo **GetAllFileSegInfo(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot, int *totalsegs);
-
-extern FileSegInfo **GetAllFileSegInfo_pg_aoseg_rel(char *relationName, Relation pg_aoseg_rel, Snapshot appendOnlyMetaDataSnapshot, int *totalsegs);
 
 extern void UpdateFileSegInfo(Relation parentrel,
 				  int segno,
@@ -199,22 +167,8 @@ extern int64 GetAOTotalBytes(Relation parentrel, Snapshot appendOnlyMetaDataSnap
 extern void FreeAllSegFileInfo(FileSegInfo **allSegInfo,
 				   int totalSegFiles);
 
-extern Datum
-			gp_update_ao_master_stats_name(PG_FUNCTION_ARGS);
-
-extern Datum
-			gp_update_ao_master_stats_oid(PG_FUNCTION_ARGS);
-
-extern Datum
-			get_ao_distribution_name(PG_FUNCTION_ARGS);
-
-extern Datum
-			get_ao_distribution_oid(PG_FUNCTION_ARGS);
-
-extern Datum
-			get_ao_compression_ratio_name(PG_FUNCTION_ARGS);
-
-extern Datum
-			get_ao_compression_ratio_oid(PG_FUNCTION_ARGS);
+extern Datum gp_update_ao_master_stats(PG_FUNCTION_ARGS);
+extern Datum get_ao_distribution(PG_FUNCTION_ARGS);
+extern Datum get_ao_compression_ratio(PG_FUNCTION_ARGS);
 
 #endif							/* AOSEGFILES_H */

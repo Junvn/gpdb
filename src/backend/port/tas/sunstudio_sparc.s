@@ -3,11 +3,11 @@
 ! sunstudio_sparc.s
 !	  compare and swap for Sun Studio on Sparc
 !
-! Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+! Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
 ! Portions Copyright (c) 1994, Regents of the University of California
 !
 ! IDENTIFICATION
-!	  $PostgreSQL: pgsql/src/backend/port/tas/sunstudio_sparc.s,v 1.1 2008/10/29 16:06:47 petere Exp $
+!	  src/backend/port/tas/sunstudio_sparc.s
 !
 !-------------------------------------------------------------------------
 
@@ -24,19 +24,21 @@
 
 	.global pg_atomic_cas
 pg_atomic_cas:
-	
+
 	! "cas" only works on sparcv9 and sparcv8plus chips, and
 	! requies a compiler targeting these CPUs.  It will fail
 	! on a compiler targeting sparcv8, and of course will not
 	! be understood by a sparcv8 CPU.  gcc continues to use
 	! "ldstub" because it targets sparcv7.
 	!
-	! There is actually a trick for embedding "cas" in a 
+	! There is actually a trick for embedding "cas" in a
 	! sparcv8-targeted compiler, but it can only be run
 	! on a sparcv8plus/v9 cpus:
 	!
 	!   http://cvs.opensolaris.org/source/xref/on/usr/src/lib/libc/sparc/threads/sparc.il
 	!
+	! NB: We're assuming we're running on a TSO system here - solaris
+	! userland luckily always has done so.
 
 #if defined(__sparcv9) || defined(__sparcv8plus)
 	cas     [%o0],%o2,%o1

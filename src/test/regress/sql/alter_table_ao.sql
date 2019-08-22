@@ -3,7 +3,7 @@
 --
 ---
 --- basic support for alter add column with NULL default to AO tables
---- 
+---
 drop table if exists ao1;
 create table ao1(col1 varchar(2), col2 int) WITH (APPENDONLY=TRUE) distributed randomly;
 
@@ -71,9 +71,9 @@ select  pg_class.relname, attname, typname from pg_attribute, pg_class, pg_type 
 select relname, attname, adsrc from pg_class, pg_attribute, pg_attrdef where attrelid = pg_class.oid and adrelid = pg_class.oid and adnum = pg_attribute.attnum and pg_class.relname = 'ao1';
 
 
---- 
+---
 --- check with IS NOT NULL constraint
---- 
+---
 drop table if exists ao1;
 create table ao1(col1 varchar(2), col2 int) WITH (APPENDONLY=TRUE) distributed randomly;
 
@@ -108,9 +108,9 @@ select * from ao1;
 -- MPP-19664 
 -- Test ALTER TABLE ADD COLUMN WITH NULL DEFAULT on AO/CO TABLES
 --
---- 
+---
 --- basic support for alter add column with NULL default to AO/CO tables
---- 
+---
 drop table if exists aoco1;
 create table aoco1(col1 varchar(2), col2 int)
 WITH (APPENDONLY=TRUE, ORIENTATION=column) distributed randomly;
@@ -155,9 +155,9 @@ select  pg_class.relname, attname, typname from pg_attribute, pg_class, pg_type 
 -- the same effect as no entry).
 select relname, attname, adsrc from pg_class, pg_attribute, pg_attrdef where attrelid = pg_class.oid and adrelid = pg_class.oid and adnum = pg_attribute.attnum and pg_class.relname = 'aoco1';
 
---- 
+---
 --- check with IS NOT NULL constraint
---- 
+---
 drop table if exists aoco1;
 create table aoco1(col1 varchar(2), col2 int)
 WITH (APPENDONLY=TRUE, ORIENTATION=column) distributed randomly;
@@ -288,6 +288,7 @@ select * from testbug_char5 order by 1,2;
 begin work;
 create table testbug_char5_exchange (timest character varying(6), user_id numeric(16,0) NOT NULL, tag1 char(5), tag2 char(5))
   with (appendonly=true, compresstype=zlib, compresslevel=3) distributed by (user_id);
+create index on testbug_char5_exchange using btree(tag1);
 insert into testbug_char5_exchange values ('201205', 3333, '2', '2');
 alter table testbug_char5 truncate partition part201205;
 select count(*) from testbug_char5;

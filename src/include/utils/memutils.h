@@ -9,10 +9,10 @@
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/utils/memutils.h,v 1.64 2008/01/01 19:45:59 momjian Exp $
+ * src/include/utils/memutils.h
  *
  *-------------------------------------------------------------------------
  */
@@ -22,27 +22,31 @@
 #include "nodes/memnodes.h"
 #include "utils/memaccounting.h"
 
+
 /*
- * MaxAllocSize
- *		Quasi-arbitrary limit on size of allocations.
+ * MaxAllocSize, MaxAllocHugeSize
+ *		Quasi-arbitrary limits on size of allocations.
  *
  * Note:
- *		There is no guarantee that allocations smaller than MaxAllocSize
- *		will succeed.  Allocation requests larger than MaxAllocSize will
- *		be summarily denied.
+ *		There is no guarantee that smaller allocations will succeed, but
+ *		larger requests will be summarily denied.
  *
- * XXX This is deliberately chosen to correspond to the limiting size
- * of varlena objects under TOAST.	See VARATT_MASK_SIZE in postgres.h.
- *
- * XXX Also, various places in aset.c assume they can compute twice an
- * allocation's size without overflow, so beware of raising this.
+ * palloc() enforces MaxAllocSize, chosen to correspond to the limiting size
+ * of varlena objects under TOAST.  See VARSIZE_4B() and related macros in
+ * postgres.h.  Many datatypes assume that any allocatable size can be
+ * represented in a varlena header.  This limit also permits a caller to use
+ * an "int" variable for an index into or length of an allocation.  Callers
+ * careful to avoid these hazards can access the higher limit with
+ * MemoryContextAllocHuge().  Both limits permit code to assume that it may
+ * compute twice an allocation's size without overflow.
  */
 #define MaxAllocSize	((Size) 0x3fffffff)		/* 1 gigabyte - 1 */
 
-static inline bool AllocSizeIsValid(Size sz)
-{
-        return (sz < MaxAllocSize);
-}
+#define AllocSizeIsValid(size)	((Size) (size) <= MaxAllocSize)
+
+#define MaxAllocHugeSize	(SIZE_MAX / 2)
+
+#define AllocHugeSizeIsValid(size)	((Size) (size) <= MaxAllocHugeSize)
 
 /*
  * Multiple chunks can share a SharedChunkHeader if their shared information
@@ -66,8 +70,8 @@ typedef struct SharedChunkHeader
  * All chunks allocated by any memory context manager are required to be
  * preceded by a StandardChunkHeader at a spacing of STANDARDCHUNKHEADERSIZE.
  * A currently-allocated chunk must contain a backpointer to its owning
- * context as well as the allocated size of the chunk.	The backpointer is
- * used by pfree() and repalloc() to find the context to call.	The allocated
+ * context as well as the allocated size of the chunk.  The backpointer is
+ * used by pfree() and repalloc() to find the context to call.  The allocated
  * size is not absolutely essential, but it's expected to be needed by any
  * reasonable implementation.
  */
@@ -131,11 +135,11 @@ typedef struct AllocChunkData *AllocChunk;
 /*
  * AllocSetContext is our standard implementation of MemoryContext.
  *
- * Note: isReset means there is nothing for AllocSetReset to do.  This is
- * different from the aset being physically empty (empty blocks list) because
- * we may still have a keeper block.  It's also different from the set being
- * logically empty, because we don't attempt to detect pfree'ing the last
- * active chunk.
+ * Note: header.isReset means there is nothing for AllocSetReset to do.
+ * This is different from the aset being physically empty (empty blocks list)
+ * because we may still have a keeper block.  It's also different from the set
+ * being logically empty, because we don't attempt to detect pfree'ing the
+ * last active chunk.
  */
 typedef struct AllocSetContext
 {
@@ -143,7 +147,6 @@ typedef struct AllocSetContext
 	/* Info about storage allocated in this context: */
 	AllocBlock	blocks;			/* head of list of blocks in this set */
 	AllocChunk	freelist[ALLOCSET_NUM_FREELISTS];		/* free chunk lists */
-	bool		isReset;		/* T = no space alloced since last reset */
 	/* Allocation parameters for this context: */
 	Size		initBlockSize;	/* initial block size */
 	Size		maxBlockSize;	/* maximum block size */
@@ -182,6 +185,8 @@ extern PGDLLIMPORT MemoryContext TopTransactionContext;
 extern PGDLLIMPORT MemoryContext CurTransactionContext;
 extern PGDLLIMPORT MemoryContext MemoryAccountMemoryContext;
 extern PGDLLIMPORT MemoryContext MemoryAccountDebugContext;
+extern PGDLLIMPORT MemoryContext DispatcherContext;
+extern PGDLLIMPORT MemoryContext InterconnectContext;
 
 /* This is a transient link to the active portal's memory context: */
 extern PGDLLIMPORT MemoryContext PortalContext;
@@ -195,8 +200,11 @@ extern void MemoryContextReset(MemoryContext context);
 extern void MemoryContextResetChildren(MemoryContext context);
 extern void MemoryContextDeleteChildren(MemoryContext context);
 extern void MemoryContextResetAndDeleteChildren(MemoryContext context);
+extern void MemoryContextSetParent(MemoryContext context,
+					   MemoryContext new_parent);
 extern Size GetMemoryChunkSpace(void *pointer);
 extern MemoryContext GetMemoryChunkContext(void *pointer);
+extern MemoryContext MemoryContextGetParent(MemoryContext context);
 extern bool MemoryContextIsEmpty(MemoryContext context);
 
 /* Statistics */
@@ -229,7 +237,8 @@ __declspec(noreturn)
 extern void MemoryContextError(int errorcode, MemoryContext context,
                                const char *sfile, int sline,
                                const char *fmt, ...)
-                              __attribute__((__noreturn__));
+                              __attribute__((__noreturn__))
+                              __attribute__((format(PG_PRINTF_ATTRIBUTE, 5, 6)));
 
 /*
  * This routine handles the context-type-independent part of memory
@@ -270,14 +279,26 @@ extern uint64 mpool_bytes_used(MPool *mpool);
 #define ALLOCSET_DEFAULT_MINSIZE   0
 #define ALLOCSET_DEFAULT_INITSIZE  (8 * 1024)
 #define ALLOCSET_DEFAULT_MAXSIZE   (8 * 1024 * 1024)
+#define ALLOCSET_DEFAULT_SIZES \
+	ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE
 
 /*
- * Recommended alloc parameters for "small" contexts that are not expected
+ * Recommended alloc parameters for "small" contexts that are never expected
  * to contain much data (for example, a context to contain a query plan).
  */
 #define ALLOCSET_SMALL_MINSIZE	 0
 #define ALLOCSET_SMALL_INITSIZE  (1 * 1024)
 #define ALLOCSET_SMALL_MAXSIZE	 (8 * 1024)
+#define ALLOCSET_SMALL_SIZES \
+	ALLOCSET_SMALL_MINSIZE, ALLOCSET_SMALL_INITSIZE, ALLOCSET_SMALL_MAXSIZE
+
+/*
+ * Recommended alloc parameters for contexts that should start out small,
+ * but might sometimes grow big.
+ */
+#define ALLOCSET_START_SMALL_SIZES \
+	ALLOCSET_SMALL_MINSIZE, ALLOCSET_SMALL_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE
+
 
 /*
  * Threshold above which a request in an AllocSet context is certain to be
@@ -286,127 +307,5 @@ extern uint64 mpool_bytes_used(MPool *mpool);
  * to know it.
  */
 #define ALLOCSET_SEPARATE_THRESHOLD  8192
-
-typedef struct SwitchedMemoryContext
-{
-	MemoryContext oldContext;
-	MemoryContext newContext;
-}
-SwitchedMemoryContext;
-
-/**
- * Shorthand for doing an AllocSetContextCreate and then switching to the new context,
- *   using DEFAULT memory values
- */
-static inline SwitchedMemoryContext
-AllocSetCreateDefaultContextInCurrentAndSwitchTo(const char *name)
-{
-	SwitchedMemoryContext res;
-	res.newContext = AllocSetContextCreate(CurrentMemoryContext, name,
-									   ALLOCSET_DEFAULT_MINSIZE,
-									   ALLOCSET_DEFAULT_INITSIZE,
-									   ALLOCSET_DEFAULT_MAXSIZE);
-
-   	res.oldContext = MemoryContextSwitchTo(res.newContext);
-   	return res;
-}
-
-/**
- * Shorthand for doing an AllocSetContextCreate and then switching to the new context,
- *   using SMALL memory values
- */
-static inline SwitchedMemoryContext
-AllocSetCreateSmallContextInCurrentAndSwitchTo(const char *name)
-{
-	SwitchedMemoryContext res;
-	res.newContext = AllocSetContextCreate(CurrentMemoryContext, name,
-									   ALLOCSET_SMALL_MINSIZE,
-									   ALLOCSET_SMALL_INITSIZE,
-									   ALLOCSET_SMALL_MAXSIZE);
-
-   	res.oldContext = MemoryContextSwitchTo(res.newContext);
-   	return res;
-}
-
-static inline void
-DeleteAndRestoreSwitchedMemoryContext(SwitchedMemoryContext context)
-{
-	MemoryContextSwitchTo(context.oldContext);
-	MemoryContextDelete(context.newContext);
-}
-
-/*
- * floor_log2_Size
- *
- * Returns the largest integer i such that 2**i <= sz
- */
-int floor_log2_Size(Size sz);   /* in utils/mmgr/mcxt.c */
-
-static inline int
-floor_log2_Size_inline(Size sz)
-{
-    unsigned    u;
-    int         shift;
-
-    Assert(sz > 0);
-
-    if (sizeof(sz) > 4 &&
-        sz > (Size)0xffffffff)
-    {
-        u = (unsigned)((sz >> 16) >> 16);
-        shift = 32;
-    }
-    else
-    {
-        u = (unsigned)sz;
-        shift = 0;
-    }
-
-    if (u > 0xffff)
-    {
-        u >>= 16;
-        shift += 16;
-    }
-    if (u > 0xff)
-    {
-        u >>= 8;
-        shift += 8;
-    }
-    if (u > 0xf)
-    {
-        u >>= 4;
-        shift += 4;
-    }
-    if (u > 3)
-    {
-        u >>= 2;
-        shift += 2;
-    }
-    if (u > 1)
-        shift += 1;
-
-    Assert(sz >> shift == (Size)1);
-    return shift;
-}                               /* floor_log2_Size_inline */
-
-/*
- * ceil_log2_Size
- *
- * Returns the smallest integer i such that sz <= 2**i
- */
-int ceil_log2_Size(Size sz);    /* in utils/mmgr/mcxt.c */
-
-static inline int
-ceil_log2_Size_inline(Size sz)
-{
-    int     shift = floor_log2_Size_inline(sz);
-
-    if (sz > (Size)1 << shift)
-        shift++;
-
-    Assert(sz <= (Size)1 << shift);
-    return shift;
-}                               /* ceil_log2_Size_inline */
-
 
 #endif   /* MEMUTILS_H */

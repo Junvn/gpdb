@@ -48,21 +48,22 @@ SELECT ts_lexize('hunspell', 'footballklubber');
 SELECT ts_lexize('hunspell', 'ballyklubber');
 SELECT ts_lexize('hunspell', 'footballyklubber');
 
--- Synonim dictionary
+-- Synonym dictionary
 CREATE TEXT SEARCH DICTIONARY synonym (
-						Template=synonym, 
+						Template=synonym,
 						Synonyms=synonym_sample
 );
 
 SELECT ts_lexize('synonym', 'PoStGrEs');
 SELECT ts_lexize('synonym', 'Gogle');
+SELECT ts_lexize('synonym', 'indices');
 
 -- Create and simple test thesaurus dictionary
 -- More tests in configuration checks because ts_lexize()
 -- cannot pass more than one word to thesaurus.
 CREATE TEXT SEARCH DICTIONARY thesaurus (
                         Template=thesaurus,
-						DictFile=thesaurus_sample, 
+						DictFile=thesaurus_sample,
 						Dictionary=english_stem
 );
 
@@ -98,12 +99,14 @@ CREATE TEXT SEARCH CONFIGURATION synonym_tst (
 						COPY=english
 );
 
-ALTER TEXT SEARCH CONFIGURATION synonym_tst ALTER MAPPING FOR 
-	asciiword, hword_asciipart, asciihword 
+ALTER TEXT SEARCH CONFIGURATION synonym_tst ALTER MAPPING FOR
+	asciiword, hword_asciipart, asciihword
 	WITH synonym, english_stem;
 
 SELECT to_tsvector('synonym_tst', 'Postgresql is often called as postgres or pgsql and pronounced as postgre');
 SELECT to_tsvector('synonym_tst', 'Most common mistake is to write Gogle instead of Google');
+SELECT to_tsvector('synonym_tst', 'Indexes or indices - Which is right plural form of index?');
+SELECT to_tsquery('synonym_tst', 'Index & indices');
 
 -- test thesaurus in configuration
 -- see thesaurus_sample.ths to understand 'odd' resulting tsvector
@@ -111,10 +114,10 @@ CREATE TEXT SEARCH CONFIGURATION thesaurus_tst (
 						COPY=synonym_tst
 );
 
-ALTER TEXT SEARCH CONFIGURATION thesaurus_tst ALTER MAPPING FOR 
-	asciiword, hword_asciipart, asciihword 
+ALTER TEXT SEARCH CONFIGURATION thesaurus_tst ALTER MAPPING FOR
+	asciiword, hword_asciipart, asciihword
 	WITH synonym, thesaurus, english_stem;
 
 SELECT to_tsvector('thesaurus_tst', 'one postgres one two one two three one');
-SELECT to_tsvector('thesaurus_tst', 'Supernovae star is very new star and usually called supernovae (abbrevation SN)');
+SELECT to_tsvector('thesaurus_tst', 'Supernovae star is very new star and usually called supernovae (abbreviation SN)');
 SELECT to_tsvector('thesaurus_tst', 'Booking tickets is looking like a booking a tickets');

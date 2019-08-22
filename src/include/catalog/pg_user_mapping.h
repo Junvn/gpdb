@@ -3,13 +3,13 @@
  * pg_user_mapping.h
  *	  definition of the system "user mapping" relation (pg_user_mapping)
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/catalog/pg_user_mapping.h,v 1.1 2008/12/19 16:25:19 petere Exp $
+ * src/include/catalog/pg_user_mapping.h
  *
  * NOTES
- *	  the genbki.sh script reads this file and generates .bki
+ *	  the genbki.pl script reads this file and generates .bki
  *	  information from the DATA() statements.
  *
  *-------------------------------------------------------------------------
@@ -28,14 +28,13 @@
 
 CATALOG(pg_user_mapping,1418)
 {
-	Oid			umuser;			/* Id of the user, InvalidOid if PUBLIC is wanted */
-	Oid			umserver;	   	/* server of this mapping */
+	Oid			umuser;			/* Id of the user, InvalidOid if PUBLIC is
+								 * wanted */
+	Oid			umserver;		/* server of this mapping */
 
-	/*
-	 * VARIABLE LENGTH FIELDS start here.  These fields may be NULL, too.
-	 */
-
+#ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	text		umoptions[1];	/* user mapping options */
+#endif
 } FormData_pg_user_mapping;
 
 /* ----------------

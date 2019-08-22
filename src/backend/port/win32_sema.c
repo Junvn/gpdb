@@ -3,10 +3,10 @@
  * win32_sema.c
  *	  Microsoft Windows Win32 Semaphores Emulation
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/port/win32_sema.c,v 1.9 2009/06/11 14:49:00 momjian Exp $
+ *	  src/backend/port/win32_sema.c
  *
  *-------------------------------------------------------------------------
  */
@@ -91,7 +91,7 @@ PGSemaphoreCreate(PGSemaphore sema)
 	}
 	else
 		ereport(PANIC,
-				(errmsg("could not create semaphore: error code %d", (int) GetLastError())));
+				(errmsg("could not create semaphore: error code %lu", GetLastError())));
 }
 
 /*
@@ -130,10 +130,10 @@ PGSemaphoreLock(PGSemaphore sema, bool interruptOK)
 	wh[1] = *sema;
 
 	/*
-	 * As in other implementations of PGSemaphoreLock, we need to check
-	 * for cancel/die interrupts each time through the loop.  But here,
-	 * there is no hidden magic about whether the syscall will internally
-	 * service a signal --- we do that ourselves.
+	 * As in other implementations of PGSemaphoreLock, we need to check for
+	 * cancel/die interrupts each time through the loop.  But here, there is
+	 * no hidden magic about whether the syscall will internally service a
+	 * signal --- we do that ourselves.
 	 */
 	do
 	{
@@ -162,7 +162,7 @@ PGSemaphoreLock(PGSemaphore sema, bool interruptOK)
 
 	if (errno != 0)
 		ereport(FATAL,
-				(errmsg("could not lock semaphore: error code %d", (int) GetLastError())));
+		(errmsg("could not lock semaphore: error code %lu", GetLastError())));
 }
 
 /*
@@ -175,7 +175,7 @@ PGSemaphoreUnlock(PGSemaphore sema)
 {
 	if (!ReleaseSemaphore(*sema, 1, NULL))
 		ereport(FATAL,
-				(errmsg("could not unlock semaphore: error code %d", (int) GetLastError())));
+				(errmsg("could not unlock semaphore: error code %lu", GetLastError())));
 }
 
 /*
@@ -204,7 +204,7 @@ PGSemaphoreTryLock(PGSemaphore sema)
 
 	/* Otherwise we are in trouble */
 	ereport(FATAL,
-			(errmsg("could not try-lock semaphore: error code %d", (int) GetLastError())));
+	(errmsg("could not try-lock semaphore: error code %lu", GetLastError())));
 
 	/* keep compiler quiet */
 	return false;

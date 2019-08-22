@@ -80,6 +80,8 @@ extern bool rel_has_appendonly_partition(Oid relid);
 
 extern bool rel_is_child_partition(Oid relid);
 
+extern bool rel_is_interior_partition(Oid relid);
+
 extern bool rel_is_leaf_partition(Oid relid);
 
 extern bool rel_partitioning_is_uniform(Oid rootOid);
@@ -139,13 +141,8 @@ rel_get_part_path_pretty(Oid relid, char *separator, char *lastsep);
 extern bool 
 partition_policies_equal(GpPolicy *p, PartitionNode *pn);
 
-extern void 
-partition_get_policies_attrs(PartitionNode *pn,
-										 GpPolicy *master_policy,
-							             List **cols);
-
 /* RelationBuildPartitionDesc is built from get_parts */
-extern PartitionNode *get_parts(Oid relid, int2 level, Oid parent, bool inctemplate,
+extern PartitionNode *get_parts(Oid relid, int16 level, Oid parent, bool inctemplate,
 		  bool includesubparts);
 
 extern PartitionNode *RelationBuildPartitionDesc(Relation rel,
@@ -190,17 +187,6 @@ exchange_part_rule(Oid oldrelid, Oid newrelid);
 extern void
 exchange_permissions(Oid oldrelid, Oid newrelid);
 
-extern bool
-atpxModifyListOverlap (Relation rel,
-					   AlterPartitionId *pid,
-					   PgPartRule   	*prule,
-					   PartitionElem 	*pelem,
-					   bool bAdd);
-extern bool
-atpxModifyRangeOverlap (Relation 		 		 rel,
-						AlterPartitionId 		*pid,
-						PgPartRule   			*prule,
-						PartitionElem 			*pelem);
 extern List *
 atpxRenameList(PartitionNode *pNode,
 			   char *old_parentname, const char *new_parentname, int *skipped);
@@ -209,7 +195,7 @@ extern List *
 basic_AT_oids(Relation rel, AlterTableCmd *cmd);
 
 extern AlterTableCmd *basic_AT_cmd(AlterTableCmd *cmd);
-extern bool can_implement_dist_on_part(Relation rel, List *dist_cnames);
+extern bool can_implement_dist_on_part(Relation rel, DistributedBy *dist);
 extern bool is_exchangeable(Relation rel, Relation oldrel, Relation newrel, bool fthrow);
 
 extern void

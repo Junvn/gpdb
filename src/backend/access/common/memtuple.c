@@ -21,8 +21,6 @@
 
 #include "cdb/cdbvars.h"
 
-#include "utils/debugbreak.h"
-
 #define MAX_ATTR_COUNT_STATIC_ALLOC 20
 
 /* Memory tuple format:
@@ -548,11 +546,6 @@ static inline unsigned char *memtuple_get_nullp(MemTuple mtup, MemTupleBinding *
 {
 	return mtup->PRIVATE_mt_bits + (mtbind_has_oid(pbind) ? sizeof(Oid) : 0);
 }
-static inline int memtuple_get_nullp_len(MemTupleBinding *pbind)
-{
-	return (pbind->tupdesc->natts + 7) >> 3;
-}
-
 
 /* form a memtuple from values and isnull, to a prespecified buffer */
 MemTuple memtuple_form_to(
@@ -605,19 +598,6 @@ MemTuple memtuple_form_to(
 			continue;
 		}
 
-		if (attr->attlen == -1 &&
-				attr->attalign == 'd' &&
-				attr->attndims == 0 &&
-				!VARATT_IS_EXTENDED(DatumGetPointer(values[i])))
-		{
-			if (old_values == NULL)
-				old_values = (Datum *)palloc0(pbind->tupdesc->natts * sizeof(Datum));
-			old_values[i] = values[i];
-			values[i] = toast_flatten_tuple_attribute(values[i], attr->atttypid, attr->atttypmod);
-			if (values[i] == old_values[i])
-				old_values[i] = 0;
-		}
-
 		if (attr->attlen == -1 && VARATT_IS_EXTERNAL(DatumGetPointer(values[i])))
 		{
 			if(inline_toast)
@@ -643,7 +623,7 @@ MemTuple memtuple_form_to(
 	if(!destlen)
 	{
 		Assert(!mtup);
-		mtup = (MemTuple) palloc(len);
+		mtup = (MemTuple) palloc0(len);
 	}
 	else if(*destlen < len)
 	{
@@ -674,6 +654,7 @@ MemTuple memtuple_form_to(
 	{
 		*destlen = len;
 		Assert(mtup);
+		memset(mtup, 0, len);
 	}
 
 	/* Set mtlen, this set the lead bit, len, and clears hasnull bit 
@@ -705,9 +686,6 @@ MemTuple memtuple_form_to(
 		/* if null bitmap is more than 4 bytes, add needed space */
 		start += pbind->null_bitmap_extra_size;
 		varlen_start += pbind->null_bitmap_extra_size;
-
-		/* clear null bitmap. */
-		memset(nullp, 0, memtuple_get_nullp_len(pbind));
 	}
 
 	/* It is very important to setup the null bitmap first before we 
@@ -872,6 +850,9 @@ MemTuple memtuple_form_to(
 bool memtuple_attisnull(MemTuple mtup, MemTupleBinding *pbind, int attnum)
 {
 	MemTupleBindingCols *colbind = memtuple_get_islarge(mtup) ? &pbind->large_bind : &pbind->bind;
+	unsigned char 		*nullp;
+	MemTupleAttrBinding *attrbind;
+
 	Assert(mtup && pbind && pbind->tupdesc);
 	Assert(attnum > 0);
 	
@@ -892,7 +873,9 @@ bool memtuple_attisnull(MemTuple mtup, MemTupleBinding *pbind, int attnum)
 	if(!memtuple_get_hasnull(mtup))
 		return false;
 	
-	return (mtup->PRIVATE_mt_bits[colbind->bindings[attnum-1].null_byte] & colbind->bindings[attnum-1].null_mask);
+	nullp = memtuple_get_nullp(mtup, pbind);
+	attrbind = &(colbind->bindings[attnum - 1]);
+	return (nullp[attrbind->null_byte] & attrbind->null_mask);
 }
 
 static Datum memtuple_getattr_by_alignment(MemTuple mtup, MemTupleBinding *pbind, int attnum, bool *isnull, bool use_null_saves_aligned)

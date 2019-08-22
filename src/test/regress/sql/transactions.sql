@@ -4,7 +4,7 @@
 
 BEGIN;
 
-SELECT * 
+SELECT *
    INTO TABLE xacttest
    FROM aggtest;
 
@@ -27,10 +27,10 @@ SELECT * FROM aggtest;
 
 ABORT;
 
--- should not exist 
+-- should not exist
 SELECT oid FROM pg_class WHERE relname = 'disappear';
 
--- should have members again 
+-- should have members again
 SELECT * FROM aggtest;
 
 
@@ -38,6 +38,48 @@ SELECT * FROM aggtest;
 
 CREATE TABLE writetest (a int);
 CREATE TEMPORARY TABLE temptest (a int);
+
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE; -- ok
+SELECT * FROM writetest; -- ok
+SET TRANSACTION READ WRITE; --fail
+COMMIT;
+
+BEGIN;
+SET TRANSACTION READ ONLY; -- ok
+SET TRANSACTION READ WRITE; -- ok
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+SAVEPOINT x;
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+SET TRANSACTION READ ONLY; -- ok
+SET TRANSACTION READ WRITE; --fail
+COMMIT;
+
+BEGIN;
+SET TRANSACTION READ WRITE; -- ok
+SAVEPOINT x;
+SET TRANSACTION READ WRITE; -- ok
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+SET TRANSACTION READ ONLY; -- ok
+SET TRANSACTION READ WRITE; --fail
+COMMIT;
+
+BEGIN;
+SET TRANSACTION READ WRITE; -- ok
+SAVEPOINT x;
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+ROLLBACK TO SAVEPOINT x;
+SHOW transaction_read_only;  -- off
+SAVEPOINT y;
+SET TRANSACTION READ ONLY; -- ok
+SELECT * FROM writetest; -- ok
+RELEASE SAVEPOINT y;
+SHOW transaction_read_only;  -- off
+COMMIT;
 
 SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;
 
@@ -129,7 +171,7 @@ BEGIN;
 			DELETE FROM savepoints WHERE a=2;
 ROLLBACK;
 COMMIT;		-- should not be in a transaction block
-		
+
 SELECT * FROM savepoints;
 
 -- test whole-tree commit on an aborted subtransaction
@@ -291,6 +333,25 @@ DROP TABLE foo;
 DROP TABLE baz;
 DROP TABLE barbaz;
 
+
+-- test case for problems with revalidating an open relation during abort
+create function inverse(int) returns float8 as
+$$
+begin
+  analyze revalidate_bug;
+  return 1::float8/$1;
+exception
+  when division_by_zero then return 0;
+end$$ language plpgsql volatile;
+
+create table revalidate_bug (c float8 unique);
+insert into revalidate_bug values (1);
+insert into revalidate_bug values (inverse(0));
+
+drop table revalidate_bug;
+drop function inverse(int);
+
+
 -- verify that cursors created during an aborted subtransaction are
 -- closed, but that we do not rollback the effect of any FETCHs
 -- performed in the aborted subtransaction
@@ -326,8 +387,43 @@ fetch from foo;
 
 abort;
 
--- tests for the "tid" type
-SELECT '(3, 3)'::tid = '(3, 4)'::tid;
-SELECT '(3, 3)'::tid = '(3, 3)'::tid;
-SELECT '(3, 3)'::tid <> '(3, 3)'::tid;
-SELECT '(3, 3)'::tid <> '(3, 4)'::tid;
+
+-- Test for proper cleanup after a failure in a cursor portal
+-- that was created in an outer subtransaction
+CREATE FUNCTION invert(x float8) RETURNS float8 LANGUAGE plpgsql AS
+$$ begin return 1/x; end $$;
+
+CREATE FUNCTION create_temp_tab() RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  CREATE TEMP TABLE new_table (f1 float8);
+  -- case of interest is that we fail while holding an open
+  -- relcache reference to new_table
+  INSERT INTO new_table SELECT invert(0.0);
+  RETURN 'foo';
+END $$;
+
+BEGIN;
+DECLARE ok CURSOR FOR SELECT * FROM int8_tbl;
+DECLARE ctt CURSOR FOR SELECT create_temp_tab();
+FETCH ok;
+SAVEPOINT s1;
+FETCH ok;  -- should work
+FETCH ctt; -- error occurs here
+ROLLBACK TO s1;
+FETCH ok;  -- should work
+FETCH ctt; -- must be rejected
+COMMIT;
+
+DROP FUNCTION create_temp_tab();
+DROP FUNCTION invert(x float8);
+
+
+-- Test for successful cleanup of an aborted transaction at session exit.
+-- THIS MUST BE THE LAST TEST IN THIS FILE.
+
+begin;
+select 1/0;
+rollback to X;
+
+-- DO NOT ADD ANYTHING HERE.

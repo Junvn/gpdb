@@ -4,10 +4,10 @@
  *
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/parser/parse_func.h,v 1.62 2008/12/18 18:20:35 tgl Exp $
+ * src/include/parser/parse_func.h
  *
  *-------------------------------------------------------------------------
  */
@@ -28,7 +28,7 @@ typedef struct _InhPaths
 	int			nsupers;		/* number of superclasses */
 	Oid			self;			/* this class */
 	Oid		   *supervec;		/* vector of superclasses */
-} InhPaths;
+}	InhPaths;
 
 /* Result codes for func_get_detail */
 typedef enum
@@ -43,17 +43,15 @@ typedef enum
 
 
 extern Node *ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
-				  List *agg_order, Expr *agg_filter,
-				  bool agg_star, bool agg_distinct, bool func_variadic,
-				  bool is_column,
-				  WindowDef *over, int location);
+				  FuncCall *fn, int location);
 
-extern FuncDetailCode func_get_detail(List *funcname, List *fargs,
+extern FuncDetailCode func_get_detail(List *funcname,
+				List *fargs, List *fargnames,
 				int nargs, Oid *argtypes,
 				bool expand_variadic, bool expand_defaults,
 				Oid *funcid, Oid *rettype,
-				bool *retset, int *nvargs, Oid **true_typeids,
-				List **argdefaults);
+				bool *retset, int *nvargs, Oid *vatype,
+				Oid **true_typeids, List **argdefaults);
 
 extern int func_match_argtypes(int nargs,
 					Oid *input_typeids,
@@ -64,17 +62,15 @@ extern FuncCandidateList func_select_candidate(int nargs,
 					  Oid *input_typeids,
 					  FuncCandidateList candidates);
 
-extern bool typeInheritsFrom(Oid subclassTypeId, Oid superclassTypeId);
-
 extern void make_fn_arguments(ParseState *pstate,
 				  List *fargs,
 				  Oid *actual_arg_types,
 				  Oid *declared_arg_types);
 
-extern const char *funcname_signature_string(const char *funcname,
-						  int nargs, const Oid *argtypes);
-extern const char *func_signature_string(List *funcname,
-					  int nargs, const Oid *argtypes);
+extern const char *funcname_signature_string(const char *funcname, int nargs,
+						  List *argnames, const Oid *argtypes);
+extern const char *func_signature_string(List *funcname, int nargs,
+					  List *argnames, const Oid *argtypes);
 
 extern Oid LookupFuncName(List *funcname, int nargs, const Oid *argtypes,
 			   bool noError);
@@ -82,8 +78,6 @@ extern Oid LookupFuncNameTypeNames(List *funcname, List *argtypes,
 						bool noError);
 extern Oid LookupAggNameTypeNames(List *aggname, List *argtypes,
 					   bool noError);
-
-extern void check_pg_get_expr_args(ParseState *pstate, Oid fnoid, List *args);
 
 extern void parseCheckTableFunctions(ParseState *pstate, Query *qry);
 

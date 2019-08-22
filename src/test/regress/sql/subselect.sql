@@ -151,7 +151,7 @@ SELECT * FROM foo WHERE id IN
 CREATE TABLE orderstest (
     approver_ref integer,
     po_ref integer,
-    ordercancelled boolean
+    ordercanceled boolean
 );
 
 INSERT INTO orderstest VALUES (1, 1, false);
@@ -172,8 +172,8 @@ SELECT *,
    WHEN ord.approver_ref=1 THEN '---' ELSE 'Approved'
  END) AS "Approved",
 (SELECT CASE
- WHEN ord.ordercancelled
- THEN 'Cancelled'
+ WHEN ord.ordercanceled
+ THEN 'Canceled'
  ELSE
   (SELECT CASE
 		WHEN ord.po_ref=1
@@ -184,11 +184,11 @@ SELECT *,
 				ELSE 'Approved'
 			END)
 		ELSE 'PO'
-	END) 
+	END)
 END) AS "Status",
 (CASE
- WHEN ord.ordercancelled
- THEN 'Cancelled'
+ WHEN ord.ordercanceled
+ THEN 'Canceled'
  ELSE
   (CASE
 		WHEN ord.po_ref=1
@@ -199,7 +199,7 @@ END) AS "Status",
 				ELSE 'Approved'
 			END)
 		ELSE 'PO'
-	END) 
+	END)
 END) AS "Status_OK"
 FROM orderstest ord;
 
@@ -240,6 +240,11 @@ select * from shipped_view;
 create rule shipped_view_update as on update to shipped_view do instead
     update shipped set partnum = new.partnum, value = new.value
         where ttype = new.ttype and ordnum = new.ordnum;
+
+update shipped_view set value = 11
+    from int4_tbl a join int4_tbl b
+      on (a.f1 = (select f1 from int4_tbl c where c.f1=b.f1))
+    where ordnum = a.f1;
 
 select * from shipped_view;
 
@@ -338,15 +343,20 @@ select (select (a.*)::text) from view_a a;
 -- Check that whole-row Vars reading the result of a subselect don't include
 -- any junk columns therein
 --
-
-select q from (select max(f1) from int4_tbl group by f1 order by f1) q
-  order by max;
+-- In GPDB, the ORDER BY in the subquery or CTE doesn't force an ordering
+-- for the whole query. Mark these with the "order none" gpdiff directive,
+-- so that differences in result order are ignored.
+select q from (select max(f1) from int4_tbl group by f1 order by f1) q;  -- order none
 with q as (select max(f1) from int4_tbl group by f1 order by f1)
-  select q from q;
+  select q from q;  -- order none
 
 --
 -- Test case for sublinks pushed down into subselects via join alias expansion
 --
+-- Greenplum note: This query will only work with ORCA. This type of query
+-- was not supported in postgres versions prior to 8.4, and thus was never
+-- supported in the planner. After 8.4 versions, the planner works, but
+-- the plan it creates is not currently parallel safe.
 
 select
   (select sq1) as qq1
@@ -378,8 +388,58 @@ select * from outer_7597 where (f1, f2) not in (select * from inner_7597);
 select '1'::text in (select '1'::name union all select '1'::name);
 
 --
--- Check sane behavior with nested IN SubLinks
+-- Test case for planner bug with nested EXISTS handling
 --
+select a.thousand from tenk1 a, tenk1 b
+-- GPDB_92_MERGE_FIXME: ORCA cannot decorrelate this query, and generates
+-- correct-but-slow plan that takes 45 minutes. Wedge in a hack to
+-- conditionally short-circuit it only when running under ORCA
+, (SELECT name, setting FROM pg_settings WHERE (name, setting) = ('optimizer', 'off')) AS FIXME
+where a.thousand = b.thousand
+  and exists ( select 1 from tenk1 c where b.hundred = c.hundred
+                   and not exists ( select 1 from tenk1 d
+                                    where a.thousand = d.thousand ) );
+
+--
+-- Check that nested sub-selects are not pulled up if they contain volatiles
+--
+explain (verbose, costs off)
+  select x, x from
+    (select (select current_database()) as x from (values(1),(2)) v(y)) ss;
+explain (verbose, costs off)
+  select x, x from
+    (select (select random()) as x from (values(1),(2)) v(y)) ss;
+explain (verbose, costs off)
+  select x, x from
+    (select (select current_database() where y=y) as x from (values(1),(2)) v(y)) ss;
+explain (verbose, costs off)
+  select x, x from
+    (select (select random() where y=y) as x from (values(1),(2)) v(y)) ss;
+
+--
+-- Check we behave sanely in corner case of empty SELECT list (bug #8648)
+--
+create temp table nocolumns();
+select exists(select * from nocolumns);
+
+--
+-- Check behavior with a SubPlan in VALUES (bug #14924)
+--
+select val.x
+  from generate_series(1,10) as s(i),
+  lateral (
+    values ((select s.i + 1)), (s.i + 101)
+  ) as val(x)
+where s.i < 10 and (select val.x) < 110;
+
+--
+-- Check sane behavior with nested IN SubLinks
+-- GPDB_94_MERGE_FIXME: ORCA plan is correct but very pricy. Should we fallback to planner?
+--
+explain (verbose, costs off)
+select * from int4_tbl where
+  (case when f1 in (select unique1 from tenk1 a) then f1 else null end) in
+  (select ten from tenk1 b);
 select * from int4_tbl where
   (case when f1 in (select unique1 from tenk1 a) then f1 else null end) in
   (select ten from tenk1 b);
@@ -387,9 +447,48 @@ select * from int4_tbl where
 --
 -- Check for incorrect optimization when IN subquery contains a SRF
 --
-set enable_hashjoin to 0;
-explain select * from int4_tbl o where (f1, f1) in
+explain (verbose, costs off)
+select * from int4_tbl o where (f1, f1) in
   (select f1, generate_series(1,2) / 10 g from int4_tbl i group by f1);
 select * from int4_tbl o where (f1, f1) in
   (select f1, generate_series(1,2) / 10 g from int4_tbl i group by f1);
-reset enable_hashjoin;
+
+--
+-- check for over-optimization of whole-row Var referencing an Append plan
+--
+select (select q from
+         (select 1,2,3 where f1 > 0
+          union all
+          select 4,5,6.0 where f1 <= 0
+         ) q )
+from int4_tbl;
+
+--
+-- Check that volatile quals aren't pushed down past a DISTINCT:
+-- nextval() should not be called more than the nominal number of times
+--
+create temp sequence ts1;
+
+select * from
+  (select distinct ten from tenk1) ss
+  where ten < 10 + nextval('ts1')
+  order by 1;
+
+select nextval('ts1');
+
+--
+-- Ensure that backward scan direction isn't propagated into
+-- expression subqueries (bug #15336)
+--
+--start_ignore
+begin;
+
+declare c1 scroll cursor for
+ select * from generate_series(1,4) i
+  where i <> all (values (2),(3));
+
+move forward all in c1;
+fetch backward all in c1;
+
+commit;
+--end_ignore

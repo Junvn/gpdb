@@ -135,13 +135,11 @@ select find_operator('analyze select * from mpp21834_t2,mpp21834_t1 where mpp218
 select find_operator('analyze select * from mpp21834_t2,mpp21834_t1 where mpp21834_t2.i < mpp21834_t1.i;','Nested Loop');
 
 -- CLEANUP
--- start_ignore
 drop index index_2;
 drop index index_1;
 drop table if exists mpp21834_t2;
 drop table if exists mpp21834_t1;
 reset optimizer_enable_hashjoin;
--- end_ignore
 
 
 --
@@ -167,13 +165,13 @@ insert into mpp23288(a) select generate_series(1,20);
 analyze mpp23288;
 
 -- TEST
-select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and t2.a =10) order by t2.a, t1.a;','Dynamic Table Scan');
+select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and t2.a =10) order by t2.a, t1.a;','Dynamic Seq Scan');
 select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and t2.a =10) order by t2.a, t1.a;
 
-select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and (t2.a = 10 or t2.a = 5 or t2.a = 12)) order by t2.a, t1.a;','Dynamic Table Scan');
+select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and (t2.a = 10 or t2.a = 5 or t2.a = 12)) order by t2.a, t1.a;','Dynamic Seq Scan');
 select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and (t2.a = 10 or t2.a = 5 or t2.a = 12)) order by t2.a, t1.a;
 
-select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on t1.a < t2.a and t2.a = 1 or t2.a < 10 order by t2.a, t1.a;','Dynamic Table Scan');
+select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on t1.a < t2.a and t2.a = 1 or t2.a < 10 order by t2.a, t1.a;','Dynamic Seq Scan');
 select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on t1.a < t2.a and t2.a = 1 or t2.a < 10 order by t2.a, t1.a;
 
 -- CLEANUP
@@ -218,13 +216,11 @@ select count_operator('select * from mpp24151_t, mpp24151_pt where tid = ptid an
 select * from mpp24151_t, mpp24151_pt where tid = ptid and pt1 = 'hello0';
 
 -- CLEANUP
--- start_ignore
 drop index ptid_idx;
 drop index pt1_idx;
 drop table if exists mpp24151_t;
 drop table if exists mpp24151_pt;
 reset optimizer_enable_dynamictablescan;
--- end_ignore
 
 
 --
@@ -312,7 +308,7 @@ create index dbs_index on dbs using bitmap(c3);
 
 
 -- TEST
-select find_operator('(select * from dts where c2 = 1) union (select * from dts where c2 = 2) union (select * from dts where c2 = 3) union (select * from dts where c2 = 4) union (select * from dts where c2 = 5) union (select * from dts where c2 = 6) union (select * from dts where c2 = 7) union (select * from dts where c2 = 8) union (select * from dts where c2 = 9) union (select * from dts where c2 = 10);', 'Dynamic Table Scan');
+select find_operator('(select * from dts where c2 = 1) union (select * from dts where c2 = 2) union (select * from dts where c2 = 3) union (select * from dts where c2 = 4) union (select * from dts where c2 = 5) union (select * from dts where c2 = 6) union (select * from dts where c2 = 7) union (select * from dts where c2 = 8) union (select * from dts where c2 = 9) union (select * from dts where c2 = 10);', 'Dynamic Seq Scan');
 
 (select * from dts where c2 = 1) union
 (select * from dts where c2 = 2) union
@@ -339,19 +335,17 @@ select find_operator('(select * from dis where c3 = 1) union (select * from dis 
 (select * from dis where c3 = 9) union
 (select * from dis where c3 = 10);
 
-select find_operator('select * from dbs where c2= 15 and c3 = 5;', 'Bitmap Table Scan');
+select find_operator('select * from dbs where c2= 15 and c3 = 5;', 'Bitmap Heap Scan');
 
 select * from dbs where c2= 15 and c3 = 5;
 
 -- CLEANUP
--- start_ignore
 drop index dbs_index;
 drop table if exists dbs;
 drop index dis_index;
 drop table if exists dis;
 drop table if exists dts;
 reset optimizer_enable_dynamictablescan;
--- end_ignore
 
 --
 -- Partition elimination for heterogenous DynamicIndexScans
@@ -510,6 +504,9 @@ INSERT INTO part_tbl VALUES (2015111000, 479534741, 99999999);
 INSERT INTO part_tbl VALUES (2015111000, 479534742, 99999999);
 CREATE INDEX part_tbl_idx 
 ON part_tbl(profile_key);
+-- start_ignore
+analyze part_tbl;
+-- end_ignore
 EXPLAIN SELECT * FROM part_tbl WHERE profile_key = 99999999;
 SELECT * FROM part_tbl WHERE profile_key = 99999999;
 DROP TABLE part_tbl;
@@ -531,15 +528,17 @@ deallocate f3;
 create table r_part(a int, b int) partition by range(a) (start (1) end(10) every(1));
 create table r_co(a int, b int) with (orientation=column, appendonly=true) partition by range(a) (start (1) end(10) every(1)) ;
 
-insert into r_part values (1,1), (2,2), (3,3);
+insert into r_part values (1,1), (2,2), (3,3), (4,4), (5,5), (6,6), (7,7), (8,8);
 
-select * from r_part order by a,b;
+-- following tests rely on the data distribution, verify them
+select gp_segment_id, * from r_part order by a,b;
 
 analyze r_part;
 
 explain select * from r_part r1, r_part r2 where r1.a=1; -- should eliminate partitions in the r1 copy of r_part
 
-explain select * from r_part where a in (1,2); -- should eliminate partitions
+-- the numbers in the filter should be both on segment 0
+explain select * from r_part where a in (7,8); -- should eliminate partitions
 
 -- Test partition elimination in prepared statements
 prepare f1(int) as select * from r_part where a = 1 order by a,b; 

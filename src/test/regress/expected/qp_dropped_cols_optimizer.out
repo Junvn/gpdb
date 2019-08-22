@@ -796,7 +796,7 @@ SELECT * FROM dropped_col_tab ORDER BY 1,2,3;
 (1 row)
 
 ALTER TABLE dropped_col_tab DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE dropped_col_tab DROP COLUMN col2;
 ALTER TABLE dropped_col_tab DROP COLUMN col3;
 ALTER TABLE dropped_col_tab DROP COLUMN col4;
@@ -850,7 +850,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitdefpt_dml_char ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitdefpt_dml_char SPLIT DEFAULT PARTITION at ('d') into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_char" with relation "pg_temp_180148"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_char" with relation "pg_temp_44819"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_addcol_splitdefpt_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_char_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitdefpt_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_char_1_prt_def" for table "mpp21090_dropcol_addcol_splitdefpt_dml_char"
@@ -938,7 +938,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitdefpt_dml_decimal ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitdefpt_dml_decimal SPLIT DEFAULT PARTITION at (5.00) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_decimal" with relation "pg_temp_180300"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_decimal" with relation "pg_temp_44960"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_addcol_splitdefpt_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_decim_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitdefpt_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_decimal_1_prt_def" for table "mpp21090_dropcol_addcol_splitdefpt_dml_decimal"
@@ -1026,7 +1026,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitdefpt_dml_int4 ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitdefpt_dml_int4 SPLIT DEFAULT PARTITION at (50000000) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_int4" with relation "pg_temp_180483"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_int4" with relation "pg_temp_45132"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_addcol_splitdefpt_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_int4_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitdefpt_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_int4_1_prt_def" for table "mpp21090_dropcol_addcol_splitdefpt_dml_int4"
@@ -1114,7 +1114,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitdefpt_dml_int8 ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitdefpt_dml_int8 SPLIT DEFAULT PARTITION at (500000000000000000) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_int8" with relation "pg_temp_180635"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_int8" with relation "pg_temp_45273"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_addcol_splitdefpt_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_int8_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitdefpt_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_int8_1_prt_def" for table "mpp21090_dropcol_addcol_splitdefpt_dml_int8"
@@ -1202,7 +1202,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitdefpt_dml_interval ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitdefpt_dml_interval SPLIT DEFAULT PARTITION at ('30 secs') into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_interval" with relation "pg_temp_180787"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_interval" with relation "pg_temp_45414"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_addcol_splitdefpt_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_inter_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitdefpt_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_interval_1_prt_def" for table "mpp21090_dropcol_addcol_splitdefpt_dml_interval"
@@ -1290,7 +1290,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitdefpt_dml_numeric ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitdefpt_dml_numeric SPLIT DEFAULT PARTITION at (5.000000) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_numeric" with relation "pg_temp_180939"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_addcol_splitdefpt_dml_numeric" with relation "pg_temp_45555"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_addcol_splitdefpt_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_numer_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitdefpt_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitdefpt_dml_numeric_1_prt_def" for table "mpp21090_dropcol_addcol_splitdefpt_dml_numeric"
@@ -1377,7 +1377,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitpt_dml_char ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitpt_dml_char SPLIT PARTITION partone at ('d') into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_char" with relation "pg_temp_181122"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_char" with relation "pg_temp_45727"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_addcol_splitpt_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_char_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitpt_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_char_1_prt_partsplitwo" for table "mpp21090_dropcol_addcol_splitpt_dml_char"
@@ -1464,7 +1464,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitpt_dml_decimal ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitpt_dml_decimal SPLIT PARTITION partone at (5.00) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_decimal" with relation "pg_temp_181366"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_decimal" with relation "pg_temp_45943"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_addcol_splitpt_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_decimal_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitpt_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_decimal_1_prt_partsplitwo" for table "mpp21090_dropcol_addcol_splitpt_dml_decimal"
@@ -1551,7 +1551,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitpt_dml_int4 ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitpt_dml_int4 SPLIT PARTITION partone at (50000000) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_int4" with relation "pg_temp_181646"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_int4" with relation "pg_temp_46198"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_addcol_splitpt_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_int4_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitpt_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_int4_1_prt_partsplitwo" for table "mpp21090_dropcol_addcol_splitpt_dml_int4"
@@ -1638,7 +1638,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitpt_dml_int8 ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitpt_dml_int8 SPLIT PARTITION partone at (500000000000000000) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_int8" with relation "pg_temp_181890"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_int8" with relation "pg_temp_46414"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_addcol_splitpt_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_int8_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitpt_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_int8_1_prt_partsplitwo" for table "mpp21090_dropcol_addcol_splitpt_dml_int8"
@@ -1725,7 +1725,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitpt_dml_interval ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitpt_dml_interval SPLIT PARTITION partone at ('30 secs') into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_interval" with relation "pg_temp_182134"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_interval" with relation "pg_temp_46630"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_addcol_splitpt_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_interval_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitpt_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_interval_1_prt_partsplitwo" for table "mpp21090_dropcol_addcol_splitpt_dml_interval"
@@ -1812,7 +1812,7 @@ SELECT * FROM mpp21090_dropcol_addcol_splitpt_dml_numeric ORDER BY 1,2,3,4;
 (3 rows)
 
 ALTER TABLE mpp21090_dropcol_addcol_splitpt_dml_numeric SPLIT PARTITION partone at (5.000000) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_numeric" with relation "pg_temp_182378"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_addcol_splitpt_dml_numeric" with relation "pg_temp_46846"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_addcol_splitpt_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_numeric_1_prt_partsplitone" for table "mpp21090_dropcol_addcol_splitpt_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_addcol_splitpt_dml_numeric_1_prt_partsplitwo" for table "mpp21090_dropcol_addcol_splitpt_dml_numeric"
@@ -1867,8 +1867,8 @@ col3 char,
 col4 boolean,
 col5 int
 ) WITH OIDS DISTRIBUTED by(col4);
-NOTICE:  CREATE TABLE will create implicit sequence "oidtab_col1_seq" for serial column "oidtab.col1"
-NOTICE:  OIDS=TRUE is not recommended for user-created tables. Use OIDS=FALSE to prevent wrap-around of the OID counter
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
 ALTER TABLE oidtab DROP COLUMN col2;
 INSERT INTO oidtab(col3,col4,col5) SELECT 'a',True,1;
 SELECT * FROM oidtab ORDER BY 1,2,3,4;
@@ -1903,8 +1903,8 @@ col3 char,
 col4 char,
 col5 int
 ) WITH OIDS DISTRIBUTED by(col4);
-NOTICE:  CREATE TABLE will create implicit sequence "oidtab_col1_seq" for serial column "oidtab.col1"
-NOTICE:  OIDS=TRUE is not recommended for user-created tables. Use OIDS=FALSE to prevent wrap-around of the OID counter
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
 ALTER TABLE oidtab DROP COLUMN col2;
 INSERT INTO oidtab(col3,col4,col5) SELECT 'a','z',1;
 SELECT * FROM oidtab ORDER BY 1,2,3,4;
@@ -1938,8 +1938,8 @@ col3 char,
 col4 decimal,
 col5 int
 ) WITH OIDS DISTRIBUTED by(col4);
-NOTICE:  CREATE TABLE will create implicit sequence "oidtab_col1_seq" for serial column "oidtab.col1"
-NOTICE:  OIDS=TRUE is not recommended for user-created tables. Use OIDS=FALSE to prevent wrap-around of the OID counter
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
 ALTER TABLE oidtab DROP COLUMN col2;
 INSERT INTO oidtab(col3,col4,col5) SELECT 'a',2.00,1;
 SELECT * FROM oidtab ORDER BY 1,2,3,4;
@@ -1973,8 +1973,8 @@ col3 char,
 col4 int4,
 col5 int
 ) WITH OIDS DISTRIBUTED by(col4);
-NOTICE:  CREATE TABLE will create implicit sequence "oidtab_col1_seq" for serial column "oidtab.col1"
-NOTICE:  OIDS=TRUE is not recommended for user-created tables. Use OIDS=FALSE to prevent wrap-around of the OID counter
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
 ALTER TABLE oidtab DROP COLUMN col2;
 INSERT INTO oidtab(col3,col4,col5) SELECT 'a',2000000000,1;
 SELECT * FROM oidtab ORDER BY 1,2,3,4;
@@ -2008,8 +2008,8 @@ col3 char,
 col4 int8,
 col5 int
 ) WITH OIDS DISTRIBUTED by(col4);
-NOTICE:  CREATE TABLE will create implicit sequence "oidtab_col1_seq" for serial column "oidtab.col1"
-NOTICE:  OIDS=TRUE is not recommended for user-created tables. Use OIDS=FALSE to prevent wrap-around of the OID counter
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
 ALTER TABLE oidtab DROP COLUMN col2;
 INSERT INTO oidtab(col3,col4,col5) SELECT 'a',2000000000000000000,1;
 SELECT * FROM oidtab ORDER BY 1,2,3,4;
@@ -2043,8 +2043,8 @@ col3 char,
 col4 interval,
 col5 int
 ) WITH OIDS DISTRIBUTED by(col4);
-NOTICE:  CREATE TABLE will create implicit sequence "oidtab_col1_seq" for serial column "oidtab.col1"
-NOTICE:  OIDS=TRUE is not recommended for user-created tables. Use OIDS=FALSE to prevent wrap-around of the OID counter
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
 ALTER TABLE oidtab DROP COLUMN col2;
 INSERT INTO oidtab(col3,col4,col5) SELECT 'a','1 day',1;
 SELECT * FROM oidtab ORDER BY 1,2,3,4;
@@ -2078,8 +2078,8 @@ col3 char,
 col4 numeric,
 col5 int
 ) WITH OIDS DISTRIBUTED by(col4);
-NOTICE:  CREATE TABLE will create implicit sequence "oidtab_col1_seq" for serial column "oidtab.col1"
-NOTICE:  OIDS=TRUE is not recommended for user-created tables. Use OIDS=FALSE to prevent wrap-around of the OID counter
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
 ALTER TABLE oidtab DROP COLUMN col2;
 INSERT INTO oidtab(col3,col4,col5) SELECT 'a',2.000000,1;
 SELECT * FROM oidtab ORDER BY 1,2,3,4;
@@ -2113,8 +2113,8 @@ col3 char,
 col4 text,
 col5 int
 ) WITH OIDS DISTRIBUTED by(col4);
-NOTICE:  CREATE TABLE will create implicit sequence "oidtab_col1_seq" for serial column "oidtab.col1"
-NOTICE:  OIDS=TRUE is not recommended for user-created tables. Use OIDS=FALSE to prevent wrap-around of the OID counter
+NOTICE:  OIDS=TRUE is not recommended for user-created tables
+HINT:  Use OIDS=FALSE to prevent wrap-around of the OID counter.
 ALTER TABLE oidtab DROP COLUMN col2;
 INSERT INTO oidtab(col3,col4,col5) SELECT 'a','abcdefghijklmnop',1;
 SELECT * FROM oidtab ORDER BY 1,2,3,4;
@@ -2172,7 +2172,7 @@ SELECT * FROM mpp21090_dropcol_splitdefpt_addcol_dml_char ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_dropcol_splitdefpt_addcol_dml_char SPLIT DEFAULT PARTITION at ('d') into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_char" with relation "pg_temp_182955"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_char" with relation "pg_temp_47398"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdefpt_addcol_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_char_1_prt_partsplitone" for table "mpp21090_dropcol_splitdefpt_addcol_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_char_1_prt_def" for table "mpp21090_dropcol_splitdefpt_addcol_dml_char"
@@ -2260,7 +2260,7 @@ SELECT * FROM mpp21090_dropcol_splitdefpt_addcol_dml_decimal ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_dropcol_splitdefpt_addcol_dml_decimal SPLIT DEFAULT PARTITION at (5.00) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_decimal" with relation "pg_temp_183119"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_decimal" with relation "pg_temp_47540"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdefpt_addcol_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_decim_1_prt_partsplitone" for table "mpp21090_dropcol_splitdefpt_addcol_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_decimal_1_prt_def" for table "mpp21090_dropcol_splitdefpt_addcol_dml_decimal"
@@ -2348,7 +2348,7 @@ SELECT * FROM mpp21090_dropcol_splitdefpt_addcol_dml_int4 ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_dropcol_splitdefpt_addcol_dml_int4 SPLIT DEFAULT PARTITION at (50000000) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_int4" with relation "pg_temp_183317"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_int4" with relation "pg_temp_47714"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdefpt_addcol_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_int4_1_prt_partsplitone" for table "mpp21090_dropcol_splitdefpt_addcol_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_int4_1_prt_def" for table "mpp21090_dropcol_splitdefpt_addcol_dml_int4"
@@ -2436,7 +2436,7 @@ SELECT * FROM mpp21090_dropcol_splitdefpt_addcol_dml_int8 ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_dropcol_splitdefpt_addcol_dml_int8 SPLIT DEFAULT PARTITION at (500000000000000000) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_int8" with relation "pg_temp_183481"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_int8" with relation "pg_temp_47856"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdefpt_addcol_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_int8_1_prt_partsplitone" for table "mpp21090_dropcol_splitdefpt_addcol_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_int8_1_prt_def" for table "mpp21090_dropcol_splitdefpt_addcol_dml_int8"
@@ -2524,7 +2524,7 @@ SELECT * FROM mpp21090_dropcol_splitdefpt_addcol_dml_interval ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_dropcol_splitdefpt_addcol_dml_interval SPLIT DEFAULT PARTITION at ('30 secs') into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_interval" with relation "pg_temp_183645"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_interval" with relation "pg_temp_47998"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdefpt_addcol_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_inter_1_prt_partsplitone" for table "mpp21090_dropcol_splitdefpt_addcol_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_interval_1_prt_def" for table "mpp21090_dropcol_splitdefpt_addcol_dml_interval"
@@ -2612,7 +2612,7 @@ SELECT * FROM mpp21090_dropcol_splitdefpt_addcol_dml_numeric ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_dropcol_splitdefpt_addcol_dml_numeric SPLIT DEFAULT PARTITION at (5.000000) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_numeric" with relation "pg_temp_183809"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdefpt_addcol_dml_numeric" with relation "pg_temp_48140"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdefpt_addcol_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_numer_1_prt_partsplitone" for table "mpp21090_dropcol_splitdefpt_addcol_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdefpt_addcol_dml_numeric_1_prt_def" for table "mpp21090_dropcol_splitdefpt_addcol_dml_numeric"
@@ -2693,7 +2693,7 @@ SELECT * FROM mpp21090_dropcol_splitdfpt_dml_char ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_char DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_char SPLIT DEFAULT PARTITION at ('d') into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_char" with relation "pg_temp_184007"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_char" with relation "pg_temp_48314"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdfpt_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_char_1_prt_partsplitone" for table "mpp21090_dropcol_splitdfpt_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_char_1_prt_def" for table "mpp21090_dropcol_splitdfpt_dml_char"
@@ -2756,7 +2756,7 @@ SELECT * FROM mpp21090_dropcol_splitdfpt_dml_decimal ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_decimal DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_decimal SPLIT DEFAULT PARTITION at (5.00) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_decimal" with relation "pg_temp_184126"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_decimal" with relation "pg_temp_48433"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdfpt_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_decimal_1_prt_partsplitone" for table "mpp21090_dropcol_splitdfpt_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_decimal_1_prt_def" for table "mpp21090_dropcol_splitdfpt_dml_decimal"
@@ -2819,7 +2819,7 @@ SELECT * FROM mpp21090_dropcol_splitdfpt_dml_int4 ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_int4 DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_int4 SPLIT DEFAULT PARTITION at (50000000) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_int4" with relation "pg_temp_184268"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_int4" with relation "pg_temp_48575"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdfpt_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_int4_1_prt_partsplitone" for table "mpp21090_dropcol_splitdfpt_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_int4_1_prt_def" for table "mpp21090_dropcol_splitdfpt_dml_int4"
@@ -2882,7 +2882,7 @@ SELECT * FROM mpp21090_dropcol_splitdfpt_dml_int8 ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_int8 DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_int8 SPLIT DEFAULT PARTITION at (500000000000000000) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_int8" with relation "pg_temp_184387"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_int8" with relation "pg_temp_48694"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdfpt_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_int8_1_prt_partsplitone" for table "mpp21090_dropcol_splitdfpt_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_int8_1_prt_def" for table "mpp21090_dropcol_splitdfpt_dml_int8"
@@ -2945,7 +2945,7 @@ SELECT * FROM mpp21090_dropcol_splitdfpt_dml_interval ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_interval DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_interval SPLIT DEFAULT PARTITION at ('30 secs') into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_interval" with relation "pg_temp_184506"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_interval" with relation "pg_temp_48813"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdfpt_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_interval_1_prt_partsplitone" for table "mpp21090_dropcol_splitdfpt_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_interval_1_prt_def" for table "mpp21090_dropcol_splitdfpt_dml_interval"
@@ -3008,7 +3008,7 @@ SELECT * FROM mpp21090_dropcol_splitdfpt_dml_numeric ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_numeric DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitdfpt_dml_numeric SPLIT DEFAULT PARTITION at (5.000000) into (partition partsplitone,partition def);
-NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_numeric" with relation "pg_temp_184625"
+NOTICE:  exchanged partition "def" of relation "mpp21090_dropcol_splitdfpt_dml_numeric" with relation "pg_temp_48932"
 NOTICE:  dropped partition "def" for relation "mpp21090_dropcol_splitdfpt_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_numeric_1_prt_partsplitone" for table "mpp21090_dropcol_splitdfpt_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitdfpt_dml_numeric_1_prt_def" for table "mpp21090_dropcol_splitdfpt_dml_numeric"
@@ -3070,7 +3070,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_dml_char ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_dml_char DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_dml_char SPLIT PARTITION partone at ('d') into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_char" with relation "pg_temp_184767"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_char" with relation "pg_temp_49074"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_char_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_char_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_dml_char"
@@ -3132,7 +3132,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_dml_decimal ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_dml_decimal DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_dml_decimal SPLIT PARTITION partone at (5.00) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_decimal" with relation "pg_temp_184945"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_decimal" with relation "pg_temp_49252"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_decimal_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_decimal_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_dml_decimal"
@@ -3194,7 +3194,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_dml_int4 ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_dml_int4 DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_dml_int4 SPLIT PARTITION partone at (50000000) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_int4" with relation "pg_temp_185148"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_int4" with relation "pg_temp_49455"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_int4_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_int4_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_dml_int4"
@@ -3256,7 +3256,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_dml_int8 ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_dml_int8 DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_dml_int8 SPLIT PARTITION partone at (500000000000000000) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_int8" with relation "pg_temp_185326"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_int8" with relation "pg_temp_49633"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_int8_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_int8_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_dml_int8"
@@ -3318,7 +3318,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_dml_interval ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_dml_interval DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_dml_interval SPLIT PARTITION partone at ('30 secs') into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_interval" with relation "pg_temp_185504"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_interval" with relation "pg_temp_49811"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_interval_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_interval_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_dml_interval"
@@ -3380,7 +3380,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_dml_numeric ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_dml_numeric DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_dml_numeric SPLIT PARTITION partone at (5.000000) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_numeric" with relation "pg_temp_185682"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_dml_numeric" with relation "pg_temp_49989"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_numeric_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_dml_numeric_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_dml_numeric"
@@ -3448,7 +3448,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_idx_dml_char ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_char DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_char SPLIT PARTITION partone at ('d') into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_char" with relation "pg_temp_185885"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_char" with relation "pg_temp_50192"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_idx_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_char_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_idx_dml_char"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_char_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_idx_dml_char"
@@ -3516,7 +3516,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_idx_dml_decimal ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_decimal DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_decimal SPLIT PARTITION partone at (5.00) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_decimal" with relation "pg_temp_186171"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_decimal" with relation "pg_temp_50478"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_idx_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_decimal_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_idx_dml_decimal"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_decimal_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_idx_dml_decimal"
@@ -3584,7 +3584,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_idx_dml_int4 ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_int4 DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_int4 SPLIT PARTITION partone at (50000000) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_int4" with relation "pg_temp_186482"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_int4" with relation "pg_temp_50789"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_idx_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_int4_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_idx_dml_int4"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_int4_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_idx_dml_int4"
@@ -3652,7 +3652,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_idx_dml_int8 ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_int8 DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_int8 SPLIT PARTITION partone at (500000000000000000) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_int8" with relation "pg_temp_186768"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_int8" with relation "pg_temp_51075"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_idx_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_int8_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_idx_dml_int8"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_int8_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_idx_dml_int8"
@@ -3720,7 +3720,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_idx_dml_interval ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_interval DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_interval SPLIT PARTITION partone at ('30 secs') into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_interval" with relation "pg_temp_187054"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_interval" with relation "pg_temp_51361"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_idx_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_interval_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_idx_dml_interval"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_interval_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_idx_dml_interval"
@@ -3788,7 +3788,7 @@ SELECT * FROM mpp21090_dropcol_splitpt_idx_dml_numeric ORDER BY 1,2,3,4;
 
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_numeric DROP COLUMN col4;
 ALTER TABLE mpp21090_dropcol_splitpt_idx_dml_numeric SPLIT PARTITION partone at (5.000000) into (partition partsplitone,partition partsplitwo);
-NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_numeric" with relation "pg_temp_187340"
+NOTICE:  exchanged partition "partone" of relation "mpp21090_dropcol_splitpt_idx_dml_numeric" with relation "pg_temp_51647"
 NOTICE:  dropped partition "partone" for relation "mpp21090_dropcol_splitpt_idx_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_numeric_1_prt_partsplitone" for table "mpp21090_dropcol_splitpt_idx_dml_numeric"
 NOTICE:  CREATE TABLE will create partition "mpp21090_dropcol_splitpt_idx_dml_numeric_1_prt_partsplitwo" for table "mpp21090_dropcol_splitpt_idx_dml_numeric"
@@ -3843,7 +3843,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_boolean ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_boolean DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_boolean SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_boolean ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -3884,7 +3884,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_boolean ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_boolean DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_boolean SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_boolean ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -3925,7 +3925,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_boolean ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_boolean DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_boolean SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_boolean ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -3967,7 +3967,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_char ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_char SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_char ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4008,7 +4008,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_char ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_char SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_char ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4049,7 +4049,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_char ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_char SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_char ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4091,7 +4091,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_decimal ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_decimal SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_decimal ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4132,7 +4132,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_decimal ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_decimal SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_decimal ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4173,7 +4173,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_decimal ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_decimal SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_decimal ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4215,7 +4215,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_int4 ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_int4 SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_int4 ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4256,7 +4256,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_int4 ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_int4 SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_int4 ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4297,7 +4297,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_int4 ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_int4 SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_int4 ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4339,7 +4339,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_int8 ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_int8 SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_int8 ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4380,7 +4380,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_int8 ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_int8 SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_int8 ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4421,7 +4421,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_int8 ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_int8 SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_int8 ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4463,7 +4463,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_interval ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_interval SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_interval ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4504,7 +4504,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_interval ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_interval SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_interval ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4545,7 +4545,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_interval ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_interval SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_interval ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4587,7 +4587,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_numeric ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_numeric SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_numeric ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4628,7 +4628,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_numeric ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_numeric SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_numeric ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4669,7 +4669,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_numeric ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_numeric SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_numeric ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4711,7 +4711,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_text ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_text DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_text SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_text ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4752,7 +4752,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_text ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_text DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_text SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_text ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -4793,7 +4793,7 @@ SELECT * FROM mpp21090_drop_distcol_dml_text ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_drop_distcol_dml_text DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_drop_distcol_dml_text SELECT 1.00,'b','2014-01-02',1;
 SELECT * FROM mpp21090_drop_distcol_dml_text ORDER BY 1,2,3;
  col2 | col3 |    col4    | col5 
@@ -9377,11 +9377,11 @@ SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_char ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addcol_addpt_dropcol_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addcol_addpt_dropcol_char SELECT 'z','c',1, 'z';
 SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_char ORDER BY 1,2,3;
  col2 | col3 | col4 | col5 
@@ -9446,11 +9446,11 @@ SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_decimal ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addcol_addpt_dropcol_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addcol_addpt_dropcol_decimal SELECT 35.00,'c',1, 35.00;
 SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_decimal ORDER BY 1,2,3;
  col2  | col3 | col4 | col5  
@@ -9515,11 +9515,11 @@ SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_int4 ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addcol_addpt_dropcol_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addcol_addpt_dropcol_int4 SELECT 35000000,'c',1, 35000000;
 SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_int4 ORDER BY 1,2,3;
    col2   | col3 | col4 |   col5   
@@ -9584,11 +9584,11 @@ SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_int8 ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addcol_addpt_dropcol_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addcol_addpt_dropcol_int8 SELECT 3500000000000000000,'c',1, 3500000000000000000;
 SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_int8 ORDER BY 1,2,3;
         col2         | col3 | col4 |        col5         
@@ -9653,11 +9653,11 @@ SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_interval ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addcol_addpt_dropcol_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addcol_addpt_dropcol_interval SELECT '14 hours','c',1, '14 hours';
 SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_interval ORDER BY 1,2,3;
    col2   | col3 | col4 |   col5   
@@ -9722,11 +9722,11 @@ SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_numeric ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addcol_addpt_dropcol_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addcol_addpt_dropcol_numeric SELECT 35.000000,'c',1, 35.000000;
 SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_numeric ORDER BY 1,2,3;
    col2    | col3 | col4 |   col5    
@@ -9791,11 +9791,11 @@ SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_text ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addcol_addpt_dropcol_text DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addcol_addpt_dropcol_text SELECT 'xyz','c',1, 'xyz';
 SELECT * FROM mpp21090_pttab_addcol_addpt_dropcol_text ORDER BY 1,2,3;
        col2       | col3 | col4 |       col5       
@@ -9859,11 +9859,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_char ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_addcol_dml_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_addcol_dml_char SELECT 'z','c',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_char ORDER BY 1,2,3;
  col2 | col3 | col4 
@@ -9939,11 +9939,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_decimal ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_addcol_dml_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_addcol_dml_decimal SELECT 35.00,'c',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_decimal ORDER BY 1,2,3;
  col2  | col3 | col4 
@@ -10019,11 +10019,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_int4 ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_addcol_dml_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_addcol_dml_int4 SELECT 35000000,'c',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_int4 ORDER BY 1,2,3;
    col2   | col3 | col4 
@@ -10099,11 +10099,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_int8 ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_addcol_dml_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_addcol_dml_int8 SELECT 3500000000000000000,'c',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_int8 ORDER BY 1,2,3;
         col2         | col3 | col4 
@@ -10179,11 +10179,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_interval ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_addcol_dml_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_addcol_dml_interval SELECT '14 hours','c',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_interval ORDER BY 1,2,3;
    col2   | col3 | col4 
@@ -10259,11 +10259,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_numeric ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_addcol_dml_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_addcol_dml_numeric SELECT 35.000000,'c',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_numeric ORDER BY 1,2,3;
    col2    | col3 | col4 
@@ -10339,11 +10339,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_text ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_addcol_dml_text DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_addcol_dml_text SELECT 'xyz','c',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_addcol_dml_text ORDER BY 1,2,3;
        col2       | col3 | col4 
@@ -10419,11 +10419,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_char ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_dml_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_dml_char SELECT 'z','b',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_char ORDER BY 1,2,3;
  col2 | col3 | col4 
@@ -10486,11 +10486,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_decimal ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_dml_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_dml_decimal SELECT 35.00,'b',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_decimal ORDER BY 1,2,3;
  col2  | col3 | col4 
@@ -10553,11 +10553,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_int4 ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_dml_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_dml_int4 SELECT 35000000,'b',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_int4 ORDER BY 1,2,3;
    col2   | col3 | col4 
@@ -10620,11 +10620,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_int8 ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_dml_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_dml_int8 SELECT 3500000000000000000,'b',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_int8 ORDER BY 1,2,3;
         col2         | col3 | col4 
@@ -10687,11 +10687,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_interval ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_dml_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_dml_interval SELECT '14 hours','b',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_interval ORDER BY 1,2,3;
    col2   | col3 | col4 
@@ -10754,11 +10754,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_numeric ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_dml_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_dml_numeric SELECT 35.000000,'b',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_numeric ORDER BY 1,2,3;
    col2    | col3 | col4 
@@ -10821,11 +10821,11 @@ SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_text ORDER BY 1,2,3;
 (2 rows)
 
 ALTER TABLE mpp21090_pttab_addpt_dropcol_dml_text DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 INSERT INTO mpp21090_pttab_addpt_dropcol_dml_text SELECT 'xyz','b',1;
 SELECT * FROM mpp21090_pttab_addpt_dropcol_dml_text ORDER BY 1,2,3;
        col2       | col3 | col4 
@@ -11890,10 +11890,10 @@ NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_c
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_char_1_prt_partthree" for table "mpp21090_pttab_dropfirstcol_addpt_char"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_char VALUES('x','x','a','x',0);
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_char ADD PARTITION partfour VALUES('y','z','-');
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_char_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_char"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_char SELECT 'z','b','z', 1;
@@ -11946,10 +11946,10 @@ NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_d
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_decimal_1_prt_partthree" for table "mpp21090_pttab_dropfirstcol_addpt_decimal"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_decimal VALUES(2.00,2.00,'a',2.00,0);
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_decimal ADD PARTITION partfour start(30.00) end(40.00) inclusive;
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_decimal_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_decimal"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_decimal SELECT 35.00,'b',35.00, 1;
@@ -12008,10 +12008,10 @@ NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_i
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_char_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_char_1_prt_partthree"
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_char ADD PARTITION partfour VALUES('y','z','-');
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_index_char_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_index_char"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_index_char SELECT 'z','b','z', 1;
@@ -12070,10 +12070,10 @@ NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_i
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_decimal_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_decimal_1_prt_partthree"
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_decimal ADD PARTITION partfour start(30.00) end(40.00) inclusive;
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_index_decimal_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_index_decimal"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_index_decimal SELECT 35.00,'b',35.00, 1;
@@ -12132,10 +12132,10 @@ NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_i
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_int4_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_int4_1_prt_partthree"
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_int4 ADD PARTITION partfour start(300000001) end(400000001);
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_index_int4_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_index_int4"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_index_int4 SELECT 350000000,'b',350000000, 1;
@@ -12194,10 +12194,10 @@ NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_i
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_int8_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_int8_1_prt_partthree"
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_int8 ADD PARTITION partfour start(3000000000000000001) end(4000000000000000001);
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_index_int8_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_index_int8"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_index_int8 SELECT 3500000000000000000,'b',3500000000000000000, 1;
@@ -12256,10 +12256,10 @@ NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_i
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_interval_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_interva_1_prt_partthree"
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_interval ADD PARTITION partfour start('12 hours') end('1 day') inclusive;
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_index_interval_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_index_interval"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_index_interval SELECT '14 hours','b','14 hours', 1;
@@ -12318,10 +12318,10 @@ NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_i
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_numeric_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_pttab_dropfirstcol_addpt_index_numeric_1_prt_partthree"
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_index_numeric ADD PARTITION partfour start(30.000000) end(40.000000) inclusive;
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_index_numeric_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_index_numeric"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_index_numeric SELECT 35.000000,'b',35.000000, 1;
@@ -12374,10 +12374,10 @@ NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_i
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_int4_1_prt_partthree" for table "mpp21090_pttab_dropfirstcol_addpt_int4"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_int4 VALUES(20000000,20000000,'a',20000000,0);
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_int4 ADD PARTITION partfour start(300000001) end(400000001);
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_int4_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_int4"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_int4 SELECT 35000000,'b',35000000, 1;
@@ -12430,10 +12430,10 @@ NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_i
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_int8_1_prt_partthree" for table "mpp21090_pttab_dropfirstcol_addpt_int8"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_int8 VALUES(2000000000000000000,2000000000000000000,'a',2000000000000000000,0);
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_int8 ADD PARTITION partfour start(3000000000000000001) end(4000000000000000001);
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_int8_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_int8"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_int8 SELECT 3500000000000000000,'b',3500000000000000000, 1;
@@ -12486,10 +12486,10 @@ NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_i
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_interval_1_prt_partthree" for table "mpp21090_pttab_dropfirstcol_addpt_interval"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_interval VALUES('1 hour','1 hour','a','1 hour',0);
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_interval ADD PARTITION partfour start('12 hours') end('1 day') inclusive;
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_interval_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_interval"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_interval SELECT '14 hours','b','14 hours', 1;
@@ -12542,10 +12542,10 @@ NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_n
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_numeric_1_prt_partthree" for table "mpp21090_pttab_dropfirstcol_addpt_numeric"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_numeric VALUES(2.000000,2.000000,'a',2.000000,0);
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_numeric ADD PARTITION partfour start(30.000000) end(40.000000) inclusive;
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_numeric_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_numeric"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_numeric SELECT 35.000000,'b',35.000000, 1;
@@ -12598,10 +12598,10 @@ NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_t
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_text_1_prt_partthree" for table "mpp21090_pttab_dropfirstcol_addpt_text"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_text VALUES('abcdefghijklmnop','abcdefghijklmnop','a','abcdefghijklmnop',0);
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_text DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_pttab_dropfirstcol_addpt_text ADD PARTITION partfour VALUES('xyz');
 NOTICE:  CREATE TABLE will create partition "mpp21090_pttab_dropfirstcol_addpt_text_1_prt_partfour" for table "mpp21090_pttab_dropfirstcol_addpt_text"
 INSERT INTO mpp21090_pttab_dropfirstcol_addpt_text SELECT 'xyz','b','xyz', 1;
@@ -13715,15 +13715,15 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_addcol_dml_char ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_char ADD COLUMN col1 char DEFAULT 'g';
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_addcol_dml_char_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_addcol_dml_char_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_char_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_char) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_char_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_char including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_addcol_dml_char_candidate VALUES('g','z',1,'g','g');
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_char EXCHANGE PARTITION FOR('d') WITH TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_char_candidate;
@@ -13820,15 +13820,15 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_addcol_dml_decimal ORDER BY 1,2,3,4
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_decimal ADD COLUMN col1 decimal DEFAULT 2.00;
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_addcol_dml_decimal_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_addcol_dml_decimal_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_decimal_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_decimal) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_decimal_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_decimal including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_addcol_dml_decimal_candidate VALUES(2.00,'z',1,2.00,2.00);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_decimal EXCHANGE PARTITION FOR(5.00) WITH TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_decimal_candidate;
@@ -13925,15 +13925,15 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_addcol_dml_int4 ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int4 ADD COLUMN col1 int4 DEFAULT 20000000;
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_addcol_dml_int4_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_addcol_dml_int4_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int4_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_int4) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int4_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_int4 including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_addcol_dml_int4_candidate VALUES(20000000,'z',1,20000000,20000000);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int4 EXCHANGE PARTITION FOR(50000000) WITH TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int4_candidate;
@@ -14030,15 +14030,15 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_addcol_dml_int8 ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int8 ADD COLUMN col1 int8 DEFAULT 200000000000000000;
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_addcol_dml_int8_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_addcol_dml_int8_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int8_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_int8) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int8_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_int8 including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_addcol_dml_int8_candidate VALUES(200000000000000000,'z',1,200000000000000000,200000000000000000);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int8 EXCHANGE PARTITION FOR(500000000000000000) WITH TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_int8_candidate;
@@ -14135,15 +14135,15 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_addcol_dml_interval ORDER BY 1,2,3,
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_interval ADD COLUMN col1 interval DEFAULT '10 secs';
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_addcol_dml_interval_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_addcol_dml_interval_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_interval_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_interval) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_interval_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_interval including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_addcol_dml_interval_candidate VALUES('10 secs','z',1,'10 secs','10 secs');
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_interval EXCHANGE PARTITION FOR('30 secs') WITH TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_interval_candidate;
@@ -14240,15 +14240,15 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_addcol_dml_numeric ORDER BY 1,2,3,4
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_numeric ADD COLUMN col1 numeric DEFAULT 2.000000;
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_addcol_dml_numeric_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_addcol_dml_numeric_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_numeric_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_numeric) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_numeric_candidate( like mpp21090_xchange_pttab_dropcol_addcol_dml_numeric including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_addcol_dml_numeric_candidate VALUES(2.000000,'z',1,2.000000,2.000000);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_numeric EXCHANGE PARTITION FOR(5.000000) WITH TABLE mpp21090_xchange_pttab_dropcol_addcol_dml_numeric_candidate;
@@ -14345,14 +14345,14 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_dml_char ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_dml_char_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_dml_char_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_char_candidate( like mpp21090_xchange_pttab_dropcol_dml_char) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_char_candidate( like mpp21090_xchange_pttab_dropcol_dml_char including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_dml_char_candidate VALUES('g','z',1,'g');
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_char EXCHANGE PARTITION FOR('d') WITH TABLE mpp21090_xchange_pttab_dropcol_dml_char_candidate;
@@ -14449,14 +14449,14 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_dml_decimal ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_dml_decimal_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_dml_decimal_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_decimal_candidate( like mpp21090_xchange_pttab_dropcol_dml_decimal) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_decimal_candidate( like mpp21090_xchange_pttab_dropcol_dml_decimal including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_dml_decimal_candidate VALUES(2.00,'z',1,2.00);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_decimal EXCHANGE PARTITION FOR(5.00) WITH TABLE mpp21090_xchange_pttab_dropcol_dml_decimal_candidate;
@@ -14553,14 +14553,14 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_dml_int4 ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_dml_int4_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_dml_int4_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_int4_candidate( like mpp21090_xchange_pttab_dropcol_dml_int4) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_int4_candidate( like mpp21090_xchange_pttab_dropcol_dml_int4 including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_dml_int4_candidate VALUES(20000000,'z',1,20000000);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_int4 EXCHANGE PARTITION FOR(50000000) WITH TABLE mpp21090_xchange_pttab_dropcol_dml_int4_candidate;
@@ -14657,14 +14657,14 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_dml_int8 ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_dml_int8_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_dml_int8_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_int8_candidate( like mpp21090_xchange_pttab_dropcol_dml_int8) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_int8_candidate( like mpp21090_xchange_pttab_dropcol_dml_int8 including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_dml_int8_candidate VALUES(200000000000000000,'z',1,200000000000000000);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_int8 EXCHANGE PARTITION FOR(500000000000000000) WITH TABLE mpp21090_xchange_pttab_dropcol_dml_int8_candidate;
@@ -14761,14 +14761,14 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_dml_interval ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_dml_interval_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_dml_interval_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_interval_candidate( like mpp21090_xchange_pttab_dropcol_dml_interval) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_interval_candidate( like mpp21090_xchange_pttab_dropcol_dml_interval including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_dml_interval_candidate VALUES('10 secs','z',1,'10 secs');
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_interval EXCHANGE PARTITION FOR('30 secs') WITH TABLE mpp21090_xchange_pttab_dropcol_dml_interval_candidate;
@@ -14865,14 +14865,14 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_dml_numeric ORDER BY 1,2,3,4;
 (1 row)
 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_dml_numeric_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_dml_numeric_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_numeric_candidate( like mpp21090_xchange_pttab_dropcol_dml_numeric) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_dml_numeric_candidate( like mpp21090_xchange_pttab_dropcol_dml_numeric including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_dml_numeric_candidate VALUES(2.000000,'z',1,2.000000);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_dml_numeric EXCHANGE PARTITION FOR(5.000000) WITH TABLE mpp21090_xchange_pttab_dropcol_dml_numeric_candidate;
@@ -14975,14 +14975,14 @@ NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_char_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_char_1_prt_partthree"
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_char DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_idx_dml_char_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_idx_dml_char_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_char_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_char) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_char_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_char including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_idx_dml_char_candidate VALUES('g','z',1,'g');
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_char EXCHANGE PARTITION FOR('d') WITH TABLE mpp21090_xchange_pttab_dropcol_idx_dml_char_candidate;
@@ -15085,14 +15085,14 @@ NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_decimal_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_decimal_1_prt_partthree"
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_decimal DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_idx_dml_decimal_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_idx_dml_decimal_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_decimal_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_decimal) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_decimal_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_decimal including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_idx_dml_decimal_candidate VALUES(2.00,'z',1,2.00);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_decimal EXCHANGE PARTITION FOR(5.00) WITH TABLE mpp21090_xchange_pttab_dropcol_idx_dml_decimal_candidate;
@@ -15195,14 +15195,14 @@ NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_int4_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_int4_1_prt_partthree"
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_int4 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_idx_dml_int4_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_idx_dml_int4_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_int4_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_int4) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_int4_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_int4 including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_idx_dml_int4_candidate VALUES(20000000,'z',1,20000000);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_int4 EXCHANGE PARTITION FOR(50000000) WITH TABLE mpp21090_xchange_pttab_dropcol_idx_dml_int4_candidate;
@@ -15305,14 +15305,14 @@ NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_int8_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_int8_1_prt_partthree"
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_int8 DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_idx_dml_int8_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_idx_dml_int8_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_int8_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_int8) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_int8_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_int8 including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_idx_dml_int8_candidate VALUES(200000000000000000,'z',1,200000000000000000);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_int8 EXCHANGE PARTITION FOR(500000000000000000) WITH TABLE mpp21090_xchange_pttab_dropcol_idx_dml_int8_candidate;
@@ -15415,14 +15415,14 @@ NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_interval_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_interval_1_prt_partthree"
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_interval DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_idx_dml_interval_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_idx_dml_interval_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_interval_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_interval) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_interval_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_interval including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_idx_dml_interval_candidate VALUES('10 secs','z',1,'10 secs');
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_interval EXCHANGE PARTITION FOR('30 secs') WITH TABLE mpp21090_xchange_pttab_dropcol_idx_dml_interval_candidate;
@@ -15525,14 +15525,14 @@ NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_numeric_1_prt_parttwo"
 NOTICE:  building index for child partition "mpp21090_xchange_pttab_dropcol_idx_dml_numeric_1_prt_partthree"
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_numeric DROP COLUMN col1;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 -- Create Candidate table for Exchange
 DROP TABLE IF EXISTS mpp21090_xchange_pttab_dropcol_idx_dml_numeric_candidate;
 NOTICE:  table "mpp21090_xchange_pttab_dropcol_idx_dml_numeric_candidate" does not exist, skipping
-CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_numeric_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_numeric) distributed randomly;
+CREATE TABLE mpp21090_xchange_pttab_dropcol_idx_dml_numeric_candidate( like mpp21090_xchange_pttab_dropcol_idx_dml_numeric including indexes) distributed randomly;
 INSERT INTO mpp21090_xchange_pttab_dropcol_idx_dml_numeric_candidate VALUES(2.000000,'z',1,2.000000);
 -- Exchange 
 ALTER TABLE mpp21090_xchange_pttab_dropcol_idx_dml_numeric EXCHANGE PARTITION FOR(5.000000) WITH TABLE mpp21090_xchange_pttab_dropcol_idx_dml_numeric_candidate;

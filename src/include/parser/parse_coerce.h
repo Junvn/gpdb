@@ -4,10 +4,10 @@
  *	Routines for type coercion.
  *
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/parser/parse_coerce.h,v 1.77 2008/08/28 23:09:48 tgl Exp $
+ * src/include/parser/parse_coerce.h
  *
  *-------------------------------------------------------------------------
  */
@@ -62,12 +62,12 @@ extern Node *coerce_to_specific_type(ParseState *pstate, Node *node,
 						Oid targetTypeId,
 						const char *constructName);
 
-extern int	parser_coercion_errposition(ParseState *pstate,
-										int coerce_location,
-										Node *input_expr);
+extern int parser_coercion_errposition(ParseState *pstate,
+							int coerce_location,
+							Node *input_expr);
 
-extern Oid	select_common_type(ParseState *pstate, List *exprs,
-							   const char *context, Node **which_expr);
+extern Oid select_common_type(ParseState *pstate, List *exprs,
+				   const char *context, Node **which_expr);
 extern Node *coerce_to_common_type(ParseState *pstate, Node *node,
 					  Oid targetTypeId,
 					  const char *context);

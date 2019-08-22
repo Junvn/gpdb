@@ -24,6 +24,7 @@
 
 #include "cdb/cdbsreh.h"
 #include "cdb/cdbutil.h"
+#include "cdb/cdbvars.h"
 #include "miscadmin.h"
 #include "utils/guc.h"
 #include "utils/resowner.h"
@@ -113,9 +114,10 @@ typedef struct
  *
  *  SSL Params
  *	extssl_protocol  CURL_SSLVERSION_TLSv1 				
- *  extssl_cipher 	 TLS_RSA_WITH_AES_128_CBC_SHA
  *  extssl_verifycert 	1
- *  extssl_verifyhost 	2 										
+ *  extssl_verifyhost 	2
+ *  extssl_no_verifycert 	0
+ *  extssl_no_verifyhost 	0
  *  extssl_cert 		"gpfdists/client.crt"
  *  extssl_key 			"gpfdists/client.key"
  *  extssl_pass 		"?" 										
@@ -124,10 +126,11 @@ typedef struct
  *  extssl_libcurldebug 1 	
  */
 
-static int extssl_protocol  = CURL_SSLVERSION_TLSv1;
-const char* extssl_cipher = "AES128-SHA";
-static int extssl_verifycert = 1;
-static int extssl_verifyhost = 2;
+const static int extssl_protocol  = CURL_SSLVERSION_TLSv1;
+const static int extssl_verifycert = 1;
+const static int extssl_verifyhost = 2;
+const static int extssl_no_verifycert = 0;
+const static int extssl_no_verifyhost = 0;
 const char* extssl_cert = "gpfdists/client.crt";
 const char* extssl_key = "gpfdists/client.key";
 const char* extssl_ca = "gpfdists/root.crt";
@@ -445,8 +448,8 @@ check_response(URL_CURL_FILE *file, int *rc, char **response_string)
 
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("connection with gpfdist failed for %s. "
-							"effective url: %s. %s\n%s", file->common.url, effective_url,
+					 errmsg("connection with gpfdist failed for \"%s\", effective url: \"%s\": %s; %s",
+							file->common.url, effective_url,
 							(oserrno != 0 ? connmsg : ""),
 							(curl_Error_Buffer[0] != '\0' ? curl_Error_Buffer : ""))));
 		}
@@ -566,10 +569,22 @@ gp_curl_easy_perform_backoff_and_check_response(URL_CURL_FILE *file)
 		CURLcode e = curl_easy_perform(file->curl->handle);
 		if (CURLE_OK != e)
 		{
-			elog(WARNING, "%s error (%d - %s)", file->curl_url, e, curl_easy_strerror(e));
 			if (CURLE_OPERATION_TIMEDOUT == e)
 			{
 				timeout_count++;
+				elog(LOG, "curl operation timeout, timeout_count = %d", timeout_count);
+				if (timeout_count >= 2)
+				{
+					ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("error when writing data to gpfdist %s, quit after %d timeout_count",
+							file->curl_url, timeout_count)));
+				}
+				continue;
+			}
+			else
+			{
+				elog(WARNING, "%s error (%d - %s)", file->curl_url, e, curl_easy_strerror(e));
 			}
 		}
 		else
@@ -583,6 +598,7 @@ gp_curl_easy_perform_backoff_and_check_response(URL_CURL_FILE *file)
 					return;
 
 				case FDIST_TIMEOUT:
+					elog(LOG, "%s timeout from gpfdist", file->curl_url);
 					break;
 
 				default:
@@ -596,7 +612,7 @@ gp_curl_easy_perform_backoff_and_check_response(URL_CURL_FILE *file)
 			response_string = NULL;
 		}
 
-		if (wait_time > MAX_TRY_WAIT_TIME || timeout_count >= 2)
+		if (wait_time > MAX_TRY_WAIT_TIME)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
@@ -754,7 +770,7 @@ set_httpheader(URL_CURL_FILE *fcurl, const char *name, const char *value)
 		elog(ERROR, "set_httpheader name/value is too long. name = %s, value=%s",
 			 name, value);
 
-	sprintf(tmp, "%s: %s", name, value);
+	snprintf(tmp, sizeof(tmp), "%s: %s", name, value);
 
 	new_httpheader = curl_slist_append(fcurl->curl->x_httpheader, tmp);
 	if (new_httpheader == NULL)
@@ -887,7 +903,7 @@ make_url(const char *url, char *buf, bool is_ipv6)
 			if (len > 8)
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("<port> substring size must not exceed %d characters", 8)));
+						 errmsg("<port> substring size must not exceed 8 characters")));
 
 			memcpy(portstr, hostname_end + 1, len);
 			portstr[len] = '\0';
@@ -912,7 +928,7 @@ make_url(const char *url, char *buf, bool is_ipv6)
 			if (len > 8)
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("<port> substring size must not exceed %d characters", 8)));
+						 errmsg("<port> substring size must not exceed 8 characters")));
 
 			memcpy(portstr, hostname_end + 1, len);
 			portstr[len] = '\0';
@@ -1262,16 +1278,18 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 		}
 
 		/* set cert verification */
-		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSL_VERIFYPEER, (long)extssl_verifycert);
+		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSL_VERIFYPEER,
+				(long)(verify_gpfdists_cert ? extssl_verifycert : extssl_no_verifycert));
 
 		/* set host verification */
-		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSL_VERIFYHOST, (long)extssl_verifyhost);
-
-		/* set ciphersuite */
-		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSL_CIPHER_LIST, extssl_cipher);
+		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSL_VERIFYHOST,
+				(long)(verify_gpfdists_cert ? extssl_verifyhost : extssl_no_verifyhost));
 
 		/* set protocol */
 		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSLVERSION, extssl_protocol);
+
+		/* disable session ID cache */
+		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSL_SESSIONID_CACHE, 0);
 
 		/* set debug */
 		if (CURLE_OK != (e = curl_easy_setopt(file->curl->handle, CURLOPT_VERBOSE, (long)extssl_libcurldebug)))
@@ -1482,7 +1500,7 @@ gp_proto1_read(char *buf, int bufsz, URL_CURL_FILE *file, CopyState pstate, char
 		if (n == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("gpfdist error: server closed connection.")));
+					 errmsg("gpfdist error: server closed connection")));
 
 		if (n < 5)
 			ereport(ERROR,
@@ -1595,7 +1613,7 @@ gp_proto1_read(char *buf, int bufsz, URL_CURL_FILE *file, CopyState pstate, char
 			 */
 			memcpy(&line_number, file->in.ptr + file->in.bot, len);
 			line_number = local_ntohll(line_number);
-			pstate->cur_lineno = line_number ? line_number - 1 : INT64_MIN;
+			pstate->cur_lineno = line_number ? line_number : INT64_MIN;
 			file->in.bot += 8;
 			Assert(file->in.bot <= file->in.top);
 			continue;
@@ -1627,8 +1645,8 @@ gp_proto1_read(char *buf, int bufsz, URL_CURL_FILE *file, CopyState pstate, char
 		if (!file->still_running)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("gpfdist server closed connection."),
-					 errhint("This is not a GPDB defect.  \nThe root cause is an overload of the ETL host or "
+					 errmsg("gpfdist server closed connection"),
+					 errhint("The root cause is likely to be an overload of the ETL host or "
 							 "a temporary network glitch between the database and the ETL host "
 							 "causing the connection between the gpfdist and database to disconnect.")));
 	}
@@ -1811,7 +1829,7 @@ curl_not_compiled_error(void)
 }
 
 URL_FILE *
-url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate, int *response_code, const char **response_string)
+url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 {
 	curl_not_compiled_error();
 	return NULL; /* keep compiler quiet */

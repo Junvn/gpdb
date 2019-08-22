@@ -1,7 +1,4 @@
 --Create a heap table with partitions ( having diff storage parameters)
---start_ignore
-drop table if exists pt_heap_tab cascade;
---end_ignore
  Create table  pt_heap_tab(a int, b text, c int , d int, e numeric,success bool) with ( appendonly=false )
  distributed by (a)
  partition by list(b)
@@ -14,10 +11,6 @@ drop table if exists pt_heap_tab cascade;
 
 --Create indexes on the table
  -- Partial index
---start_ignore
-drop index if exists heap_idx1 cascade;
-drop index if exists heap_idx2 cascade;
---end_ignore
  create index heap_idx1 on pt_heap_tab(a) where c > 10;
 
  -- Expression index
@@ -54,14 +47,9 @@ drop index if exists heap_idx2 cascade;
 
 --Exchange partition
  -- Create candidate table
---start_ignore
-drop table if exists heap_can cascade;
-drop table if exists ao_can cascade;
-drop table if exists co_can cascade;
---end_ignore
- create table heap_can(like pt_heap_tab);  
- create table ao_can(like pt_heap_tab) with (appendonly=true);   
- create table co_can(like pt_heap_tab)  with (appendonly=true,orientation=column);   
+ create table heap_can(like pt_heap_tab including indexes);
+ create table ao_can(like pt_heap_tab including indexes) with (appendonly=true);
+ create table co_can(like pt_heap_tab including indexes)  with (appendonly=true,orientation=column);
 
  -- Exchange
  alter table pt_heap_tab exchange partition for ('abc') with table ao_can ; -- Heap exchanged with  AO
@@ -79,10 +67,6 @@ drop table if exists co_can cascade;
  truncate table pt_heap_tab;
 
 --Further create some more indexes
---start_ignore
-drop index if exists heap_idx3 cascade;
-drop index if exists heap_idx4 cascade;
---end_ignore
  create index heap_idx3 on pt_heap_tab(c,d) where a = 40 OR a = 50; -- multicol indx
  CREATE INDEX heap_idx4 ON pt_heap_tab ((b || ' ' || e)); --Expression
 
@@ -92,9 +76,6 @@ drop index if exists heap_idx4 cascade;
 --Split default partition
  alter table pt_heap_tab split default partition at ('uvw') into (partition dft, partition uvw);
 --Create an AO table with partitions ( having diff storage parameters)
---start_ignore
- drop table if exists pt_ao_tab cascade;
---end_ignore
  Create table  pt_ao_tab(a int, b text, c int , d int, e numeric,success bool) with ( appendonly=true )
  distributed by (a)
  partition by list(b)
@@ -107,10 +88,6 @@ drop index if exists heap_idx4 cascade;
 
 --Create indexes on the table
  -- Partial index
---start_ignore
-drop index if exists ao_idx1 cascade;
-drop index if exists ao_idx2 cascade;
---end_ignore
  create index ao_idx1 on pt_ao_tab(a) where c > 10;
 
  -- Expression index
@@ -153,9 +130,9 @@ drop table if exists ao_can cascade;
 drop table if exists co_can cascade;
 --end_ignore
 
- create table heap_can(like pt_ao_tab);  
- create table ao_can(like pt_ao_tab) with (appendonly=true);   
- create table co_can(like pt_ao_tab)  with (appendonly=true,orientation=column);   
+ create table heap_can(like pt_ao_tab including indexes);
+ create table ao_can(like pt_ao_tab including indexes) with (appendonly=true);
+ create table co_can(like pt_ao_tab including indexes)  with (appendonly=true,orientation=column);
 
  -- Exchange
  alter table pt_ao_tab add partition pqr values ('pqr','pqr1','pqr2') WITH (appendonly=true,orientation=column,compresslevel=5);-- CO
@@ -174,10 +151,6 @@ drop table if exists co_can cascade;
  truncate table pt_ao_tab;
 
 --Further create some more indexes
---start_ignore
-drop index if exists ao_idx4 cascade;
-drop index if exists ao_idx3 cascade;
---end_ignore
  create index ao_idx3 on pt_ao_tab(c,d) where a = 40 OR a = 50; -- multicol indx
  CREATE INDEX ao_idx4 ON pt_ao_tab ((b || ' ' || e)); --Expression
 
@@ -248,9 +221,9 @@ drop table if exists ao_can cascade;
 drop table if exists co_can cascade;
 --end_ignore
 
- create table heap_can(like pt_co_tab);  
- create table ao_can(like pt_co_tab) with (appendonly=true);   
- create table co_can(like pt_co_tab)  with (appendonly=true,orientation=column);   
+ create table heap_can(like pt_co_tab including indexes);
+ create table ao_can(like pt_co_tab including indexes) with (appendonly=true);
+ create table co_can(like pt_co_tab including indexes)  with (appendonly=true,orientation=column);
 
  -- Exchange
  alter table pt_co_tab add partition pqr values ('pqr','pqr1','pqr2') WITH (appendonly=true,compresslevel=5);-- AO
@@ -290,10 +263,6 @@ drop table if exists co_can cascade;
  );
 
 -- Create indexes on the table
---start_ignore
-drop index if exists heap_rng_idx1 cascade;
-drop index if exists heap_rng_idx2 cascade;
---end_ignore
 
  -- partial index
  create index heap_rng_idx1 on pt_heap_tab_rng(a) where c > 10;
@@ -325,9 +294,9 @@ drop index if exists heap_rng_idx2 cascade;
   drop table if exists co_can;
 --end_ignore
 
-  create table heap_can(like pt_heap_tab_rng);  
-  create table ao_can(like pt_heap_tab_rng) with (appendonly=true);   
-  create table co_can(like pt_heap_tab_rng)  with (appendonly=true,orientation=column);   
+  create table heap_can(like pt_heap_tab_rng including indexes);
+  create table ao_can(like pt_heap_tab_rng including indexes) with (appendonly=true);
+  create table co_can(like pt_heap_tab_rng including indexes)  with (appendonly=true,orientation=column);
 
  alter table pt_heap_tab_rng add partition newco start(36) end(40) with (appendonly= true, orientation = column);
  alter table pt_heap_tab_rng add partition newao start(40) end(45) with (appendonly= true);
@@ -342,10 +311,6 @@ drop index if exists heap_rng_idx2 cascade;
  \d+ co_can
  \d+ heap_can
 -- Create more index indexes
---start_ignore
-drop index if exists heap_rng_idx4 cascade;
-drop index if exists heap_rng_idx3 cascade;
---end_ignore
  create index heap_rng_idx3 on pt_heap_tab_rng(c,d) where a = 40 OR a = 50; -- multicol indx
  CREATE INDEX heap_rng_idx4 ON pt_heap_tab_rng ((b || ' ' || e)); --Expression
 
@@ -368,10 +333,6 @@ drop index if exists heap_rng_idx3 cascade;
  );
 
 --Create indexes on the table
---start_ignore
-drop index if exists ao_rng_idx1 cascade;
-drop index if exists ao_rng_idx2 cascade;
---end_ignore
 
  -- partial index
  create index ao_rng_idx1 on pt_ao_tab_rng(a) where c > 10;
@@ -402,9 +363,9 @@ drop table if exists heap_can cascade;
 drop table if exists ao_can cascade;
 drop table if exists co_can cascade;
 --end_ignore
-  create table heap_can(like pt_ao_tab_rng);  
-  create table ao_can(like pt_ao_tab_rng) with (appendonly=true);   
-  create table co_can(like pt_ao_tab_rng)  with (appendonly=true,orientation=column);   
+  create table heap_can(like pt_ao_tab_rng including indexes);
+  create table ao_can(like pt_ao_tab_rng including indexes) with (appendonly=true);
+  create table co_can(like pt_ao_tab_rng including indexes)  with (appendonly=true,orientation=column);
 
  alter table pt_ao_tab_rng add partition newco start(36) end(40) with (appendonly= true, orientation = column);
  alter table pt_ao_tab_rng add partition newheap start(40) end(45) with (appendonly= false);
@@ -420,10 +381,6 @@ drop table if exists co_can cascade;
  \d+ heap_can
 
 -- Create more index indexes
---start_ignore
-drop index if exists ao_rng_idx4 cascade;
-drop index if exists ao_rng_idx3 cascade;
---end_ignore
 
  create index ao_rng_idx3 on pt_ao_tab_rng(c,d) where a = 40 OR a = 50; -- multicol indx
  CREATE INDEX ao_rng_idx4 ON pt_ao_tab_rng ((b || ' ' || e)); --Expression
@@ -446,10 +403,6 @@ drop index if exists ao_rng_idx3 cascade;
  );
 
 --Create indexes on the table
---start_ignore
-drop index if exists co_rng_idx1 cascade;
-drop index if exists co_rng_idx2 cascade;
---end_ignore
 
  -- partial index
  create index co_rng_idx1 on pt_co_tab_rng(a) where c > 10;
@@ -480,9 +433,9 @@ drop table if exists heap_can cascade;
 drop table if exists ao_can cascade;
 drop table if exists co_can cascade;
 --end_ignore
-  create table heap_can(like pt_co_tab_rng);  
-  create table ao_can(like pt_co_tab_rng) with (appendonly=true);   
-  create table co_can(like pt_co_tab_rng)  with (appendonly=true,orientation=column);   
+  create table heap_can(like pt_co_tab_rng including indexes);
+  create table ao_can(like pt_co_tab_rng including indexes) with (appendonly=true);
+  create table co_can(like pt_co_tab_rng including indexes)  with (appendonly=true,orientation=column);
 
  alter table pt_co_tab_rng add partition newao start(36) end(40) with (appendonly= true);
  alter table pt_co_tab_rng add partition newheap start(40) end(45) with (appendonly= false);
@@ -498,10 +451,6 @@ drop table if exists co_can cascade;
  \d+ heap_can
 
 -- Create more index indexes
---start_ignore
-drop index if exists co_rng_idx4 cascade;
-drop index if exists co_rng_idx3 cascade;
---end_ignore
 
  create index co_rng_idx3 on pt_co_tab_rng(c,d) where a = 40 OR a = 50; -- multicol indx
  CREATE INDEX co_rng_idx4 ON pt_co_tab_rng ((b || ' ' || e)); --Expression

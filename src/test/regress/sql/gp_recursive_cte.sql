@@ -1,15 +1,22 @@
 -- Tests exercising different behaviour of the WITH RECURSIVE implementation in GPDB
 -- GPDB's distributed nature requires thorough testing of many use cases in order to ensure correctness
 
+
 -- Setup
-
-
--- WITH RECURSIVE ref in a sublink in the main query
-
 create schema recursive_cte;
 set search_path=recursive_cte;
 create table recursive_table_1(id int);
 insert into recursive_table_1 values (1), (2), (100);
+
+-- Test the featureblocking GUC for recursive CTE
+set gp_recursive_cte to off;
+with recursive r(i) as (
+   select 1
+   union all
+   select i + 1 from r
+)
+select * from recursive_table_1 where recursive_table_1.id IN (select * from r limit 10);
+set gp_recursive_cte to on;
 
 -- WITH RECURSIVE ref used with IN without correlation
 with recursive r(i) as (
@@ -226,6 +233,58 @@ y as (
 )
 select * from y;
 
+-- WITH RECURSIVE ref used within a IN subquery in another recursive CTE
+with recursive
+r(i) as (
+    select 1
+    union all
+    select r.i + 1 from r, recursive_table_2 where i = recursive_table_2.id
+),
+y(i) as (
+    select 1
+    union all
+    select i + 1 from y, recursive_table_1 where i = recursive_table_1.id and i IN (select * from r limit 10)
+)
+select * from y limit 10;
+
+-- WITH RECURSIVE ref used within a NOT IN subquery in another recursive CTE
+with recursive
+r(i) as (
+    select 1
+    union all
+    select r.i + 1 from r, recursive_table_2 where i = recursive_table_2.id
+),
+y(i) as (
+    select 1
+    union all
+    select i + 1 from y, recursive_table_1 where i = recursive_table_1.id and i NOT IN (select * from r limit 10)
+)
+select * from y limit 10;
+
+-- WITH RECURSIVE non-recursive ref used within an IN subquery in a recursive CTE
+with recursive
+r as (
+    select * from recursive_table_2
+),
+y(i) as (
+    select 1
+    union all
+    select i + 1 from y, recursive_table_1 where i = recursive_table_1.id and i IN (select * from r)
+)
+select * from y limit 10;
+
+-- WITH RECURSIVE non-recursive ref used within a NOT IN subquery in a recursive CTE
+with recursive
+r as (
+    select * from recursive_table_2
+),
+y(i) as (
+    select 1
+    union all
+    select i + 1 from y, recursive_table_1 where i = recursive_table_1.id and i NOT IN (select * from r)
+)
+select * from y limit 10;
+
 create table recursive_table_3(id int, a int);
 insert into recursive_table_3 values (1, 2), (2, 3);
 -- WITH RECURSIVE ref used within a window function
@@ -318,3 +377,34 @@ WITH nr(i) AS
     SELECT SUM(j) FROM r
 )
 SELECT SUM(i) FROM nr;
+
+-- WITH RECURSIVE ref within a correlated subquery
+create table recursive_table_4(a int, b int);
+create table recursive_table_5(c int, d int);
+insert into recursive_table_4 select i, i* 2 from generate_series(1, 10) i;
+insert into recursive_table_5 select i/2, i from generate_series(1, 10) i;
+select * from recursive_table_4 where a > ALL (
+	with recursive r(i) as (
+		select sum(c) from recursive_table_5 where d < recursive_table_4.b
+		union all
+		select i / 2 from r where i > 0
+	)
+	select * from r
+);
+
+with recursive x(i) as (
+    select 1
+),
+y(i) as (
+    select sum(i) from x
+    union all
+    select i + 1 from y
+),
+z(i) as (
+    select avg(i) from x
+    union all
+    select i + 1 from z
+)
+(select * from y limit 5)
+union
+(select * from z limit 10);

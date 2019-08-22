@@ -3,10 +3,10 @@
  * uuid.c
  *	  Functions for the built-in type "uuid".
  *
- * Copyright (c) 2007-2008, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2014, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/uuid.c,v 1.9 2008/11/03 23:49:07 tgl Exp $
+ *	  src/backend/utils/adt/uuid.c
  *
  *-------------------------------------------------------------------------
  */
@@ -84,7 +84,7 @@ string_to_uuid(const char *source, pg_uuid_t *uuid)
 {
 	const char *src = source;
 	bool		braces = false;
-	int	i;
+	int			i;
 
 	if (src[0] == '{')
 	{

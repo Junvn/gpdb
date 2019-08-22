@@ -19,79 +19,9 @@
 #include "miscadmin.h"
 #include "access/transam.h"
 #include "cdb/cdbvars.h"
+#include "utils/guc.h"
 #include "utils/snapmgr.h"
-
-/*
- * Purpose of this function is on pretty same lines as
- * HeapTupleSatisfiesVacuum() just more from distributed perspective.
- *
- * Helps to determine the status of tuples for VACUUM, PagePruning and
- * FREEZING purposes. Here, what we mainly want to know is:
- * - if a tuple is potentially visible to *any* running transaction GLOBALLY
- * in cluster. If so, it can't be removed yet by VACUUM.
- * - also, if a tuple is visible to *all* current and future transactions,
- *   then it can be freezed by VACUUM.
- *
- * xminAllDistributedSnapshots is a cutoff XID (obtained from distributed
- * snapshot). Tuples deleted by dxids >= xminAllDistributedSnapshots are
- * deemed "recently dead"; they might still be visible to some open
- * transaction globally, so we can't remove them, even if we see that the
- * deleting transaction has committed and even if locally its lower than
- * OldestXmin.
- *
- * Function is coded with conservative mind-set, to make sure tuples are
- * deleted or freezed only if can be evaluated and guaranteed to be known
- * meeting above mentioned criteria. So, any scenarios in which global
- * snapshot can't be checked it returns to not do anything to the tuple. For
- * example running vacuum in utility mode for particular QE directly, in which
- * case don't have distributed snapshot to check against, it will not allow
- * marking tuples DEAD just based on local information.
- */
-bool
-localXidSatisfiesAnyDistributedSnapshot(TransactionId localXid)
-{
-	DistributedSnapshotWithLocalMapping *dslm;
-
-
-	Assert(TransactionIdIsNormal(localXid));
-
-	/*
-	 * For single user mode operation like initdb time, let the vacuum
-	 * cleanout and freeze tuples.
-	 */
-	if (!IsUnderPostmaster || !IsNormalProcessingMode())
-		return false;
-
-	dslm = GetCurrentDistributedSnapshotWithLocalMapping();
-
-	/* Only if we have distributed snapshot, evaluate against it */
-	if (dslm)
-	{
-		DistributedSnapshotCommitted distributedSnapshotCommitted =
-			DistributedSnapshotWithLocalMapping_CommittedTest(dslm, localXid, true);
-
-		switch (distributedSnapshotCommitted)
-		{
-			case DISTRIBUTEDSNAPSHOT_COMMITTED_INPROGRESS:
-				return true;
-
-			case DISTRIBUTEDSNAPSHOT_COMMITTED_IGNORE:
-				return false;
-
-			default:
-				elog(ERROR,
-					 "unrecognized distributed committed test result: %d for localXid %u",
-					 (int) distributedSnapshotCommitted, localXid);
-				break;
-		}
-	}
-
-	/*
-	 * If don't have snapshot or distributed snapshot, can't check the global
-	 * visibility and hence convey not to clean-up the tuple.
-	 */
-	return true;
-}
+#include "storage/procarray.h"
 
 /*
  * DistributedSnapshotWithLocalMapping_CommittedTest
@@ -112,6 +42,8 @@ DistributedSnapshotWithLocalMapping_CommittedTest(
 	uint32		i;
 	DistributedTransactionId distribXid = InvalidDistributedTransactionId;
 
+	Assert(!IS_QUERY_DISPATCHER());
+
 	/*
 	 * Return early if local xid is not normal as it cannot have distributed
 	 * xid associated with it.
@@ -124,7 +56,7 @@ DistributedSnapshotWithLocalMapping_CommittedTest(
 	 * through our cache in distributed snapshot looking for a possible
 	 * corresponding local xid only if it has value in checking.
 	 */
-	if (dslm->currentLocalXidsCount)
+	if (dslm->currentLocalXidsCount > 0)
 	{
 		Assert(TransactionIdIsNormal(dslm->minCachedLocalXid));
 		Assert(TransactionIdIsNormal(dslm->maxCachedLocalXid));
@@ -245,9 +177,9 @@ DistributedSnapshotWithLocalMapping_CommittedTest(
 
 	/*
 	 * Any xid >= xmax is in-progress, distributed xmax points to the
-	 * committer, so it must be visible, so ">" instead of ">="
+	 * latestCompletedDxid + 1.
 	 */
-	if (distribXid > ds->xmax)
+	if (distribXid >= ds->xmax)
 	{
 		elog((Debug_print_snapshot_dtm ? LOG : DEBUG5),
 			 "distributedsnapshot committed but invisible: distribXid %d dxmax %d dxmin %d distribSnapshotId %d",
@@ -265,10 +197,9 @@ DistributedSnapshotWithLocalMapping_CommittedTest(
 			 * the distributed committed log in a subsequent check. We can
 			 * only record local xids till cache size permits.
 			 */
-			if (dslm->currentLocalXidsCount < dslm->maxLocalXidsCount)
+			if (dslm->currentLocalXidsCount < ds->count)
 			{
 				Assert(dslm->inProgressMappedLocalXids != NULL);
-
 				dslm->inProgressMappedLocalXids[dslm->currentLocalXidsCount++] =
 					localXid;
 
@@ -317,15 +248,22 @@ DistributedSnapshot_Reset(DistributedSnapshot *distributedSnapshot)
 	distributedSnapshot->xmin = InvalidDistributedTransactionId;
 	distributedSnapshot->xmax = InvalidDistributedTransactionId;
 	distributedSnapshot->count = 0;
-
-	/* maxCount and inProgressXidArray left untouched */
-	if (distributedSnapshot->maxCount < 0)
-		elog(ERROR, "cannot reset a copied distributed snapshot");
+	if (distributedSnapshot->inProgressXidArray == NULL)
+	{
+		distributedSnapshot->inProgressXidArray =
+			(DistributedTransactionId*) malloc(GetMaxSnapshotXidCount() * sizeof(DistributedTransactionId));
+		if (distributedSnapshot->inProgressXidArray == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory")));
+	}
 }
 
 /*
  * Make a copy of a DistributedSnapshot, allocating memory for the in-progress
  * array if necessary.
+ *
+ * Note: 'target' should be from a static variable, like the argument of GetSnapshotData()
  */
 void
 DistributedSnapshot_Copy(DistributedSnapshot *target,
@@ -333,61 +271,40 @@ DistributedSnapshot_Copy(DistributedSnapshot *target,
 {
 	DistributedSnapshot_Reset(target);
 
+	Assert(source->xminAllDistributedSnapshots);
+	Assert(source->xminAllDistributedSnapshots <= source->xmin);
+
 	elog((Debug_print_full_dtm ? LOG : DEBUG5),
-		 "DistributedSnapshot_Copy target maxCount %d, inProgressXidArray %p, and "
-		 "source maxCount %d, count %d, inProgressXidArray %p",
-		 target->maxCount,
+		 "DistributedSnapshot_Copy target inProgressXidArray %p, and "
+		 "source count %d, inProgressXidArray %p",
 		 target->inProgressXidArray,
-		 source->maxCount,
 		 source->count,
 		 source->inProgressXidArray);
-
-	/*
-	 * If we have allocated space for the in-progress distributed
-	 * transactions, check against that space.  Otherwise, use the source
-	 * maxCount as guide in allocating space.
-	 */
-	if (target->inProgressXidArray)
-	{
-		if (target->maxCount < source->count)
-		{
-			free(target->inProgressXidArray);
-			target->maxCount = 0;
-			target->inProgressXidArray = NULL;
-		}
-	}
-
-	/*
-	 * Allocate the XID array if necessary. Make it large enough to hold
-	 * the snapshot we're copying, plus a little headroom to make it more
-	 * likely that the space can be reused on next call.
-	 */
-	if (target->inProgressXidArray == NULL)
-	{
-#define EXTRA_XID_ARRAY_HEADROOM 10
-		int			maxCount = source->count + EXTRA_XID_ARRAY_HEADROOM;
-
-		target->inProgressXidArray =
-			(DistributedTransactionId *)
-			malloc(maxCount * sizeof(DistributedTransactionId));
-		if (target->inProgressXidArray == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory")));
-		target->maxCount = maxCount;
-	}
 
 	target->distribTransactionTimeStamp = source->distribTransactionTimeStamp;
 	target->xminAllDistributedSnapshots = source->xminAllDistributedSnapshots;
 	target->distribSnapshotId = source->distribSnapshotId;
-
 	target->xmin = source->xmin;
 	target->xmax = source->xmax;
 	target->count = source->count;
 
+	if (source->count == 0)
+		return;
+
+	if (target->inProgressXidArray == NULL)
+	{
+		target->inProgressXidArray =
+			(DistributedTransactionId*) malloc(GetMaxSnapshotXidCount() * sizeof(DistributedTransactionId));
+		if (target->inProgressXidArray == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory")));
+	}
+
+	Assert(source->count <= GetMaxSnapshotXidCount());
 	memcpy(target->inProgressXidArray,
-		   source->inProgressXidArray,
-		   source->count * sizeof(DistributedTransactionId));
+			source->inProgressXidArray,
+			source->count * sizeof(DistributedTransactionId));
 }
 
 int
@@ -433,7 +350,6 @@ int
 DistributedSnapshot_Deserialize(const char *buf, DistributedSnapshot *ds)
 {
 	const char *p = buf;
-	int32		count;
 
 	memcpy(&ds->distribTransactionTimeStamp, p, sizeof(DistributedTransactionTimeStamp));
 	p += sizeof(DistributedTransactionTimeStamp);
@@ -445,53 +361,27 @@ DistributedSnapshot_Deserialize(const char *buf, DistributedSnapshot *ds)
 	p += sizeof(DistributedTransactionId);
 	memcpy(&ds->xmax, p, sizeof(DistributedTransactionId));
 	p += sizeof(DistributedTransactionId);
-	memcpy(&count, p, sizeof(int32));
+	memcpy(&ds->count, p, sizeof(int32));
 	p += sizeof(int32);
 
-	/*
-	 * If we have allocated space for the in-progress distributed
-	 * transactions, check against that space.  Otherwise, use the received
-	 * maxCount as guide in allocating space.
-	 */
-	if (ds->inProgressXidArray)
+	if (ds->count > 0)
 	{
-		if (ds->maxCount <= 0)
-			elog(ERROR, "Bad allocation of in-progress array");
+		int xipsize = sizeof(DistributedTransactionId) * ds->count;
 
-		if (ds->maxCount < count)
-		{
-			free(ds->inProgressXidArray);
-			ds->maxCount = 0;
-			ds->inProgressXidArray = NULL;
-		}
-	}
-
-	if (ds->inProgressXidArray == NULL)
-	{
-		int			maxCount = count + 10;
-
-		ds->inProgressXidArray = (DistributedTransactionId *)
-			malloc(maxCount * sizeof(DistributedTransactionId));
 		if (ds->inProgressXidArray == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory")));
-		ds->maxCount = maxCount;
-	}
+		{
+			ds->inProgressXidArray =
+				(DistributedTransactionId *)malloc(sizeof(DistributedTransactionId) * GetMaxSnapshotXidCount());
+			if (ds->inProgressXidArray == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("out of memory")));
+		}
 
-	if (count > 0)
-	{
-		int			xipsize;
-
-		Assert(ds->inProgressXidArray != NULL);
-
-		xipsize = sizeof(DistributedTransactionId) * count;
 		memcpy(ds->inProgressXidArray, p, xipsize);
 		p += xipsize;
 	}
-	ds->count = count;
 
 	Assert((p - buf) == DistributedSnapshot_SerializeSize(ds));
-
 	return (p - buf);
 }

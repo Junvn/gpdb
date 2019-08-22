@@ -29,7 +29,7 @@
  *
  * CreateDestReceiver returns a receiver object appropriate to the specified
  * destination.  The executor, as well as utility statements that can return
- * tuples, are passed the resulting DestReceiver* pointer.	Each executor run
+ * tuples, are passed the resulting DestReceiver* pointer.  Each executor run
  * or utility execution calls the receiver's rStartup method, then the
  * receiveSlot method (zero or more times), then the rShutdown method.
  * The same receiver object may be re-used multiple times; eventually it is
@@ -45,10 +45,10 @@
  * allocated object (for destination types that require no local state),
  * in which case rDestroy is a no-op.  Alternatively it can be a palloc'd
  * object that has DestReceiver as its first field and contains additional
- * fields (see printtup.c for an example).	These additional fields are then
+ * fields (see printtup.c for an example).  These additional fields are then
  * accessible to the DestReceiver functions by casting the DestReceiver*
- * pointer passed to them.	The palloc'd object is pfree'd by the rDestroy
- * method.	Note that the caller of CreateDestReceiver should take care to
+ * pointer passed to them.  The palloc'd object is pfree'd by the rDestroy
+ * method.  Note that the caller of CreateDestReceiver should take care to
  * do so in a memory context that is long-lived enough for the receiver
  * object not to disappear while still needed.
  *
@@ -57,10 +57,10 @@
  * calls in portal and cursor manipulations.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/tcop/dest.h,v 1.56 2008/11/30 20:51:25 tgl Exp $
+ * src/include/tcop/dest.h
  *
  *-------------------------------------------------------------------------
  */
@@ -79,7 +79,7 @@
  *		destination.  Someday this will probably need to be improved.
  *
  * Note: only the values DestNone, DestDebug, DestRemote are legal for the
- * global variable whereToSendOutput.	The other values may be used
+ * global variable whereToSendOutput.   The other values may be used
  * as the destination for individual commands.
  * ----------------
  */
@@ -93,7 +93,8 @@ typedef enum
 	DestTuplestore,				/* results sent to Tuplestore */
 	DestIntoRel,				/* results sent to relation (SELECT INTO) */
 	DestCopyOut,				/* results sent to COPY TO code */
-	DestSQLFunction				/* results sent to SQL-language func mgr */
+	DestSQLFunction,			/* results sent to SQL-language func mgr */
+	DestTransientRel			/* results sent to transient relation */
 } CommandDest;
 
 /* ----------------
@@ -124,7 +125,8 @@ struct _DestReceiver
 	/* Private fields might appear beyond this point... */
 };
 
-extern DestReceiver *None_Receiver;		/* permanent receiver for DestNone */
+extern PGDLLIMPORT DestReceiver *None_Receiver; /* permanent receiver for
+												 * DestNone */
 
 /* The primary destination management functions */
 

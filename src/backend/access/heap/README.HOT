@@ -1,4 +1,4 @@
-$PostgreSQL: pgsql/src/backend/access/heap/README.HOT,v 1.4 2008/10/02 20:59:31 momjian Exp $
+src/backend/access/heap/README.HOT
 
 Heap Only Tuples (HOT)
 ======================
@@ -246,6 +246,12 @@ scans reasonably sized, the maximum number of line pointers per page
 is arbitrarily capped at MaxHeapTuplesPerPage (the most tuples that
 could fit without HOT pruning).
 
+Effectively, space reclamation happens during tuple retrieval when the
+page is nearly full (<10% free) and a buffer cleanup lock can be
+acquired.  This means that UPDATE, DELETE, and SELECT can trigger space
+reclamation, but often not during INSERT ... VALUES because it does
+not retrieve a row.
+
 
 VACUUM
 ------
@@ -253,27 +259,6 @@ VACUUM
 There is little change to regular vacuum.  It performs pruning to remove
 dead heap-only tuples, and cleans up any dead line pointers as if they were
 regular dead tuples.
-
-
-VACUUM FULL
------------
-
-VACUUM FULL performs an extra operation of collapsing out redirecting line
-pointers, by moving the first non-DEAD tuple of each HOT chain to the root
-position and clearing its heap-only-tuple flag.  This effectively changes
-the user-visible CTID of that tuple.  This would be completely unsafe
-during normal concurrent operation, but since VACUUM FULL takes full
-exclusive lock on the table, it should be OK.  (Note that VACUUM FULL has
-always felt free to change tuples' CTIDs by moving them across pages.)
-Eliminating redirection links means that the main body of VACUUM FULL
-doesn't have to deal with them, which seems a good thing since VACUUM FULL
-is horrendously complex already.
-
-When VACUUM FULL tries to move tuple chains, it does not distinguish regular
-and heap-only tuples, but just moves both types the same.  This is OK because
-it will move the entire non-DEAD tail of an update chain and remove index
-entries for each item moved.  At worst, we'll uselessly search for index
-entries matching the heap-only tuples included in the move.
 
 
 Statistics
@@ -302,7 +287,7 @@ a "broken" chain that can't be indexed properly.
 
 To address this issue, regular (non-concurrent) CREATE INDEX makes the
 new index usable only by new transactions and transactions that don't
-have snapshots older than the the CREATE INDEX command.  This prevents
+have snapshots older than the CREATE INDEX command.  This prevents
 queries that can see the inconsistent HOT chains from trying to use the
 new index and getting incorrect results.  Queries that can see the index
 can only see the rows that were visible after the index was created,
@@ -406,6 +391,28 @@ because we have outwaited any transactions that would need to avoid using
 the index.  (indcheckxmin is only needed because non-concurrent CREATE
 INDEX doesn't want to wait; its stronger lock would create too much risk of
 deadlock if it did.)
+
+
+DROP INDEX CONCURRENTLY
+-----------------------
+
+DROP INDEX CONCURRENTLY is sort of the reverse sequence of CREATE INDEX
+CONCURRENTLY.  We first mark the index as not indisvalid, and then wait for
+any transactions that could be using it in queries to end.  (During this
+time, index updates must still be performed as normal, since such
+transactions might expect freshly inserted tuples to be findable.)
+Then, we clear indisready and indislive, and again wait for transactions
+that could be updating the index to end.  Finally we can drop the index
+normally (though taking only ShareUpdateExclusiveLock on its parent table).
+
+The reason we need the pg_index.indislive flag is that after the second
+wait step begins, we don't want transactions to be touching the index at
+all; otherwise they might suffer errors if the DROP finally commits while
+they are reading catalog entries for the index.  If we had only indisvalid
+and indisready, this state would be indistinguishable from the first stage
+of CREATE INDEX CONCURRENTLY --- but in that state, we *do* want
+transactions to examine the index, since they must consider it in
+HOT-safety checks.
 
 
 Limitations and Restrictions

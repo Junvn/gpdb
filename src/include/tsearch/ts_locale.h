@@ -3,9 +3,9 @@
  * ts_locale.h
  *		locale compatibility layer for tsearch
  *
- * Copyright (c) 1998-2008, PostgreSQL Global Development Group
+ * Copyright (c) 1998-2014, PostgreSQL Global Development Group
  *
- * $PostgreSQL: pgsql/src/include/tsearch/ts_locale.h,v 1.8 2008/06/18 20:55:42 tgl Exp $
+ * src/include/tsearch/ts_locale.h
  *
  *-------------------------------------------------------------------------
  */
@@ -67,7 +67,7 @@ extern char *lowerstr(const char *str);
 extern char *lowerstr_with_len(const char *str, int len);
 
 extern bool tsearch_readline_begin(tsearch_readline_state *stp,
-								   const char *filename);
+					   const char *filename);
 extern char *tsearch_readline(tsearch_readline_state *stp);
 extern void tsearch_readline_end(tsearch_readline_state *stp);
 

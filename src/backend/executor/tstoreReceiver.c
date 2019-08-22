@@ -9,11 +9,11 @@
  * data even if the underlying table is dropped.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/tstoreReceiver.c,v 1.21 2008/12/01 17:06:21 tgl Exp $
+ *	  src/backend/executor/tstoreReceiver.c
  *
  *-------------------------------------------------------------------------
  */
@@ -119,8 +119,8 @@ tstoreReceiveSlot_detoast(TupleTableSlot *slot, DestReceiver *self)
 
 	/*
 	 * Fetch back any out-of-line datums.  We build the new datums array in
-	 * myState->outvalues[] (but we can re-use the slot's isnull array).
-	 * Also, remember the fetched values to free afterwards.
+	 * myState->outvalues[] (but we can re-use the slot's isnull array). Also,
+	 * remember the fetched values to free afterwards.
 	 */
 	nfree = 0;
 	for (i = 0; i < natts; i++)
@@ -134,7 +134,7 @@ tstoreReceiveSlot_detoast(TupleTableSlot *slot, DestReceiver *self)
 			if (VARATT_IS_EXTERNAL(DatumGetPointer(val)))
 			{
 				val = PointerGetDatum(heap_tuple_fetch_attr((struct varlena *)
-														DatumGetPointer(val)));
+													  DatumGetPointer(val)));
 				myState->tofree[nfree++] = val;
 			}
 		}

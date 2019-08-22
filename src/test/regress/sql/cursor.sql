@@ -1,5 +1,3 @@
-CREATE EXTENSION IF NOT EXISTS gp_inject_fault;
-
 DROP TABLE if exists lu_customer;
 CREATE TABLE lu_customer (
     customer_id numeric(28,0),
@@ -53,11 +51,11 @@ abort;
 CREATE TABLE cursor_writer_reader (a int, b int) DISTRIBUTED BY (a);
 BEGIN;
 INSERT INTO cursor_writer_reader VALUES(1, 666);
-select gp_inject_fault('qe_got_snapshot_and_interconnect', 'suspend', 2);
+select gp_inject_fault_infinite('qe_got_snapshot_and_interconnect', 'suspend', 2);
 DECLARE cursor_c2 CURSOR FOR SELECT * FROM cursor_writer_reader WHERE b=666 ORDER BY 1;
 SAVEPOINT x;
 UPDATE cursor_writer_reader SET b=333 WHERE b=666;
-select gp_inject_fault('qe_got_snapshot_and_interconnect', 'status', 2);
+select gp_wait_until_triggered_fault('qe_got_snapshot_and_interconnect', 1, 2);
 select gp_inject_fault('qe_got_snapshot_and_interconnect', 'resume', 2);
 FETCH cursor_c2;
 SELECT * FROM cursor_writer_reader WHERE b=666 ORDER BY 1;

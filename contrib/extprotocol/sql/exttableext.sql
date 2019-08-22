@@ -674,7 +674,7 @@ DROP FUNCTION formatter_import_todrop();
 -- Note: Only STABLE is supported for formatter, this is enforced
 -- When it is not STABLE (VOLATILE, or IMMUTABLE),
 -- the expected error like:
--- ERROR: formatter function formatter_export_i is not declared STABLE. (seg1 rh55-qavm55:7533 pid=14816)
+-- ERROR: formatter function formatter_export_i is not declared STABLE (seg1 rh55-qavm55:7533 pid=14816)
 
     -- Create RET and WET using IMMUTABLE functions will succeed
     -- However query such RET or WET should fail
@@ -689,7 +689,7 @@ DROP FUNCTION formatter_import_todrop();
     FORMAT 'CUSTOM' (FORMATTER='formatter_import_i');
 
     INSERT INTO format_w (SELECT * FROM formatsource);
-    -- ERROR:  formatter function formatter_export_i is not declared STABLE.  (seg1 rh55-qavm55:7533 pid=14816)
+    -- ERROR:  formatter function formatter_export_i is not declared STABLE  (seg1 rh55-qavm55:7533 pid=14816)
 
     -- Create RET and WET using STABLE functions 
     DROP EXTERNAL TABLE IF EXISTS format_w;
@@ -1078,10 +1078,10 @@ select max(cnt) - min(cnt)  > 20 from t;
     LOCATION ('demoprot://format_long_test13') 
     FORMAT 'CUSTOM' (FORMATTER='formatter_import_s');
 
-    -- Drop colum value1 from source table formatsource
+    -- Drop column value1 from source table formatsource
     ALTER TABLE formatsource DROP COLUMN value1;
 
-    -- Drop colum value1 from RET and WET
+    -- Drop column value1 from RET and WET
     ALTER EXTERNAL TABLE format_r DROP COLUMN value1;
     ALTER EXTERNAL TABLE format_w DROP COLUMN value1;
 
@@ -1276,14 +1276,6 @@ validatorfunc = url_validator
     -- Create a non-privileged user demoprot_nopriv
     drop role if exists demoprot_nopriv;
     create role demoprot_nopriv with login ;
-
-    -- Create a gphdfs_user with CREATEEXTTABLE privilege using gphdfs protocol
-    drop role if exists gphdfs_user;
-    create role gphdfs_user with login CREATEEXTTABLE (protocol='gphdfs');
-    -- WARNING:  GRANT/REVOKE on gphdfs is deprecated
-    -- HINT:  Issue the GRANT or REVOKE on the protocol itself
-    -- NOTICE:  resource queue required -- using default resource queue "pg_default"
-    -- CREATE ROLE
 
 
 -- Test 92: Rename existing protocol

@@ -3,6 +3,9 @@
  * pg_attribute_encoding.h
  *	  some where to stash column level ENCODING () clauses
  *
+ * GPDB_90_MERGE_FIXME: pg_attribute now has an attoptions field. We should
+ * get rid of this table, and start using pg_attribute.attoptions instead.
+ *
  * Portions Copyright (c) EMC, 2011
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
  *
@@ -23,12 +26,12 @@
  *		typedef struct FormData_pg_attribute_encoding
  * ----------------
  */
-#define AttributeEncodingRelationId	3231
+#define AttributeEncodingRelationId	6231
 
-CATALOG(pg_attribute_encoding,3231) BKI_WITHOUT_OIDS
+CATALOG(pg_attribute_encoding,6231) BKI_WITHOUT_OIDS
 {
 	Oid		attrelid;		
-	int2	attnum;			
+	int16	attnum;			
 	text	attoptions[1];	
 } FormData_pg_attribute_encoding;
 

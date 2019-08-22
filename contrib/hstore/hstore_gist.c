@@ -1,13 +1,13 @@
 /*
- * $PostgreSQL: pgsql/contrib/hstore/hstore_gist.c,v 1.9 2008/05/12 00:00:42 alvherre Exp $
+ * contrib/hstore/hstore_gist.c
  */
 #include "postgres.h"
 
 #include "access/gist.h"
-#include "access/itup.h"
 #include "access/skey.h"
-#include "crc32.h"
+#include "catalog/pg_type.h"
 
+#include "crc32.h"
 #include "hstore.h"
 
 /* bigint defines */
@@ -40,7 +40,7 @@ typedef char *BITVECP;
 typedef struct
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	int4		flag;
+	int32		flag;
 	char		data[1];
 } GISTTYPE;
 
@@ -48,7 +48,7 @@ typedef struct
 
 #define ISALLTRUE(x)	( ((GISTTYPE*)x)->flag & ALLISTRUE )
 
-#define GTHDRSIZE		(VARHDRSZ + sizeof(int4))
+#define GTHDRSIZE		(VARHDRSZ + sizeof(int32))
 #define CALCGTSIZE(flag) ( GTHDRSIZE+(((flag) & ALLISTRUE) ? 0 : SIGLEN) )
 
 #define GETSIGN(x)		( (BITVECP)( (char*)x+GTHDRSIZE ) )
@@ -69,10 +69,7 @@ typedef struct
 #define WISH_F(a,b,c) (double)( -(double)(((a)-(b))*((a)-(b))*((a)-(b)))*(c) )
 
 PG_FUNCTION_INFO_V1(ghstore_in);
-Datum		ghstore_in(PG_FUNCTION_ARGS);
-
 PG_FUNCTION_INFO_V1(ghstore_out);
-Datum		ghstore_out(PG_FUNCTION_ARGS);
 
 
 Datum
@@ -97,14 +94,6 @@ PG_FUNCTION_INFO_V1(ghstore_picksplit);
 PG_FUNCTION_INFO_V1(ghstore_union);
 PG_FUNCTION_INFO_V1(ghstore_same);
 
-Datum		ghstore_consistent(PG_FUNCTION_ARGS);
-Datum		ghstore_compress(PG_FUNCTION_ARGS);
-Datum		ghstore_decompress(PG_FUNCTION_ARGS);
-Datum		ghstore_penalty(PG_FUNCTION_ARGS);
-Datum		ghstore_picksplit(PG_FUNCTION_ARGS);
-Datum		ghstore_union(PG_FUNCTION_ARGS);
-Datum		ghstore_same(PG_FUNCTION_ARGS);
-
 Datum
 ghstore_compress(PG_FUNCTION_ARGS)
 {
@@ -114,29 +103,26 @@ ghstore_compress(PG_FUNCTION_ARGS)
 	if (entry->leafkey)
 	{
 		GISTTYPE   *res = (GISTTYPE *) palloc0(CALCGTSIZE(0));
-		HStore	   *toastedval = (HStore *) DatumGetPointer(entry->key);
-		HStore	   *val = (HStore *) DatumGetPointer(PG_DETOAST_DATUM(entry->key));
-		HEntry	   *ptr = ARRPTR(val);
-		char	   *words = STRPTR(val);
+		HStore	   *val = DatumGetHStoreP(entry->key);
+		HEntry	   *hsent = ARRPTR(val);
+		char	   *ptr = STRPTR(val);
+		int			count = HS_COUNT(val);
+		int			i;
 
 		SET_VARSIZE(res, CALCGTSIZE(0));
 
-		while (ptr - ARRPTR(val) < val->size)
+		for (i = 0; i < count; ++i)
 		{
 			int			h;
 
-			h = crc32_sz((char *) (words + ptr->pos), ptr->keylen);
+			h = crc32_sz((char *) HS_KEY(hsent, ptr, i), HS_KEYLEN(hsent, i));
 			HASH(GETSIGN(res), h);
-			if (!ptr->valisnull)
+			if (!HS_VALISNULL(hsent, i))
 			{
-				h = crc32_sz((char *) (words + ptr->pos + ptr->keylen), ptr->vallen);
+				h = crc32_sz((char *) HS_VAL(hsent, ptr, i), HS_VALLEN(hsent, i));
 				HASH(GETSIGN(res), h);
 			}
-			ptr++;
 		}
-
-		if (val != toastedval)
-			pfree(val);
 
 		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
 		gistentryinit(*retval, PointerGetDatum(res),
@@ -146,7 +132,7 @@ ghstore_compress(PG_FUNCTION_ARGS)
 	}
 	else if (!ISALLTRUE(DatumGetPointer(entry->key)))
 	{
-		int4		i;
+		int32		i;
 		GISTTYPE   *res;
 		BITVECP		sign = GETSIGN(DatumGetPointer(entry->key));
 
@@ -170,28 +156,14 @@ ghstore_compress(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(retval);
 }
 
+/*
+ * Since type ghstore isn't toastable (and doesn't need to be),
+ * this function can be a no-op.
+ */
 Datum
 ghstore_decompress(PG_FUNCTION_ARGS)
 {
-	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	GISTENTRY  *retval;
-	HStore	   *key;
-
-	key = (HStore *) PG_DETOAST_DATUM(entry->key);
-
-	if (key != (HStore *) DatumGetPointer(entry->key))
-	{
-		/* need to pass back the decompressed item */
-		retval = palloc(sizeof(GISTENTRY));
-		gistentryinit(*retval, PointerGetDatum(key),
-					  entry->rel, entry->page, entry->offset, entry->leafkey);
-		PG_RETURN_POINTER(retval);
-	}
-	else
-	{
-		/* we can return the entry as-is */
-		PG_RETURN_POINTER(entry);
-	}
+	PG_RETURN_POINTER(PG_GETARG_POINTER(0));
 }
 
 Datum
@@ -209,7 +181,7 @@ ghstore_same(PG_FUNCTION_ARGS)
 		*result = false;
 	else
 	{
-		int4		i;
+		int32		i;
 		BITVECP		sa = GETSIGN(a),
 					sb = GETSIGN(b);
 
@@ -226,10 +198,10 @@ ghstore_same(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
-static int4
+static int32
 sizebitvec(BITVECP sign)
 {
-	int4		size = 0,
+	int32		size = 0,
 				i;
 
 	LOOPBYTE
@@ -270,10 +242,10 @@ hemdist(GISTTYPE *a, GISTTYPE *b)
 	return hemdistsign(GETSIGN(a), GETSIGN(b));
 }
 
-static int4
+static int32
 unionkey(BITVECP sbase, GISTTYPE *add)
 {
-	int4		i;
+	int32		i;
 	BITVECP		sadd = GETSIGN(add);
 
 	if (ISALLTRUE(add))
@@ -287,12 +259,12 @@ Datum
 ghstore_union(PG_FUNCTION_ARGS)
 {
 	GistEntryVector *entryvec = (GistEntryVector *) PG_GETARG_POINTER(0);
-	int4		len = entryvec->n;
+	int32		len = entryvec->n;
 
 	int		   *size = (int *) PG_GETARG_POINTER(1);
 	BITVEC		base;
-	int4		i;
-	int4		flag = 0;
+	int32		i;
+	int32		flag = 0;
 	GISTTYPE   *result;
 
 	MemSet((void *) base, 0, sizeof(BITVEC));
@@ -333,13 +305,13 @@ ghstore_penalty(PG_FUNCTION_ARGS)
 typedef struct
 {
 	OffsetNumber pos;
-	int4		cost;
+	int32		cost;
 } SPLITCOST;
 
 static int
 comparecost(const void *a, const void *b)
 {
-	return ((SPLITCOST *) a)->cost - ((SPLITCOST *) b)->cost;
+	return ((const SPLITCOST *) a)->cost - ((const SPLITCOST *) b)->cost;
 }
 
 
@@ -356,11 +328,11 @@ ghstore_picksplit(PG_FUNCTION_ARGS)
 			   *datum_r;
 	BITVECP		union_l,
 				union_r;
-	int4		size_alpha,
+	int32		size_alpha,
 				size_beta;
-	int4		size_waste,
+	int32		size_waste,
 				waste = -1;
-	int4		nbytes;
+	int32		nbytes;
 	OffsetNumber seed_1 = 0,
 				seed_2 = 0;
 	OffsetNumber *left,
@@ -500,7 +472,6 @@ ghstore_picksplit(PG_FUNCTION_ARGS)
 	}
 
 	*right = *left = FirstOffsetNumber;
-	pfree(costvector);
 
 	v->spl_ldatum = PointerGetDatum(datum_l);
 	v->spl_rdatum = PointerGetDatum(datum_r);
@@ -514,6 +485,7 @@ ghstore_consistent(PG_FUNCTION_ARGS)
 {
 	GISTTYPE   *entry = (GISTTYPE *) DatumGetPointer(((GISTENTRY *) PG_GETARG_POINTER(0))->key);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
+
 	/* Oid		subtype = PG_GETARG_OID(3); */
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	bool		res = true;
@@ -527,36 +499,86 @@ ghstore_consistent(PG_FUNCTION_ARGS)
 
 	sign = GETSIGN(entry);
 
-	if (strategy == HStoreContainsStrategyNumber || strategy == 13 /* hack for old strats */ )
+	if (strategy == HStoreContainsStrategyNumber ||
+		strategy == HStoreOldContainsStrategyNumber)
 	{
 		HStore	   *query = PG_GETARG_HS(1);
 		HEntry	   *qe = ARRPTR(query);
 		char	   *qv = STRPTR(query);
+		int			count = HS_COUNT(query);
+		int			i;
 
-		while (res && qe - ARRPTR(query) < query->size)
+		for (i = 0; res && i < count; ++i)
 		{
-			int			crc = crc32_sz((char *) (qv + qe->pos), qe->keylen);
+			int			crc = crc32_sz((char *) HS_KEY(qe, qv, i), HS_KEYLEN(qe, i));
 
 			if (GETBIT(sign, HASHVAL(crc)))
 			{
-				if (!qe->valisnull)
+				if (!HS_VALISNULL(qe, i))
 				{
-					crc = crc32_sz((char *) (qv + qe->pos + qe->keylen), qe->vallen);
+					crc = crc32_sz((char *) HS_VAL(qe, qv, i), HS_VALLEN(qe, i));
 					if (!GETBIT(sign, HASHVAL(crc)))
 						res = false;
 				}
 			}
 			else
 				res = false;
-			qe++;
 		}
 	}
 	else if (strategy == HStoreExistsStrategyNumber)
 	{
-		text	   *query = PG_GETARG_TEXT_P(1);
-		int			crc = crc32_sz(VARDATA(query), VARSIZE(query) - VARHDRSZ);
+		text	   *query = PG_GETARG_TEXT_PP(1);
+		int			crc = crc32_sz(VARDATA_ANY(query), VARSIZE_ANY_EXHDR(query));
 
 		res = (GETBIT(sign, HASHVAL(crc))) ? true : false;
+	}
+	else if (strategy == HStoreExistsAllStrategyNumber)
+	{
+		ArrayType  *query = PG_GETARG_ARRAYTYPE_P(1);
+		Datum	   *key_datums;
+		bool	   *key_nulls;
+		int			key_count;
+		int			i;
+
+		deconstruct_array(query,
+						  TEXTOID, -1, false, 'i',
+						  &key_datums, &key_nulls, &key_count);
+
+		for (i = 0; res && i < key_count; ++i)
+		{
+			int			crc;
+
+			if (key_nulls[i])
+				continue;
+			crc = crc32_sz(VARDATA(key_datums[i]), VARSIZE(key_datums[i]) - VARHDRSZ);
+			if (!(GETBIT(sign, HASHVAL(crc))))
+				res = FALSE;
+		}
+	}
+	else if (strategy == HStoreExistsAnyStrategyNumber)
+	{
+		ArrayType  *query = PG_GETARG_ARRAYTYPE_P(1);
+		Datum	   *key_datums;
+		bool	   *key_nulls;
+		int			key_count;
+		int			i;
+
+		deconstruct_array(query,
+						  TEXTOID, -1, false, 'i',
+						  &key_datums, &key_nulls, &key_count);
+
+		res = FALSE;
+
+		for (i = 0; !res && i < key_count; ++i)
+		{
+			int			crc;
+
+			if (key_nulls[i])
+				continue;
+			crc = crc32_sz(VARDATA(key_datums[i]), VARSIZE(key_datums[i]) - VARHDRSZ);
+			if (GETBIT(sign, HASHVAL(crc)))
+				res = TRUE;
+		}
 	}
 	else
 		elog(ERROR, "Unsupported strategy number: %d", strategy);

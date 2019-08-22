@@ -74,8 +74,16 @@
             exceeds the <codeph>MAX_COST</codeph> value set for the resource queue, the query is
             rejected as too expensive.</pd>
           <pd>
-            <note>Use <codeph>MEMORY_LIMIT</codeph> and <codeph>ACTIVE_STATEMENTS</codeph> to set
-              limits for resource queues rather than <codeph>MAX_COST</codeph>. </note>
+            <note>GPORCA and the Postgres Planner utilize different
+              query costing models and may compute different costs for the same query.
+              The Greenplum Database resource queue resource management scheme neither
+              differentiates nor aligns costs between GPORCA and the Postgres Planner; it
+              uses the literal cost value returned from the optimizer to throttle
+              queries.<p> When resource queue-based resource management is active, use the
+              <codeph>MEMORY_LIMIT</codeph> and <codeph>ACTIVE_STATEMENTS</codeph> limits for
+              resource queues rather than configuring cost-based limits. Even when using GPORCA,
+              Greenplum Database may fall back to using the Postgres Planner for certain
+              queries, so using cost-based limits can lead to unexpected results.</p></note>
           </pd>
         </plentry>
       </parml></p>
@@ -231,6 +239,15 @@
         unbounded amounts of memory.</p>
       <p>For more information on configuring memory limits on a resource queue, and other memory
         utilization controls, see <xref href="#topic12" type="topic" format="dita"/>.</p>
+    <section id="topic113x" xml:lang="en">
+      <title>statement_mem and Low Memory Queries</title>
+        <p>A low <codeph>statement_mem</codeph> setting (for example, in the 
+          1-3MB range) has been shown
+          to increase the performance of queries with low memory requirements. Use
+          the <codeph>statement_mem</codeph> server configuration parameter to
+          override the setting on a per-query basis. For example:
+          <codeblock>SET statement_mem='2MB';</codeblock></p>
+    </section>
     </body>
   </topic>
   <topic id="priorities">
@@ -294,7 +311,7 @@
       <p>Enabling and using resource management in Greenplum Database involves the following
         high-level tasks:</p>
       <ol id="ol_ec5_4dy_wq">
-        <li>Configure resource managment. See <xref href="#topic9" format="dita"/>.</li>
+        <li>Configure resource management. See <xref href="#topic9" format="dita"/>.</li>
         <li id="iz153167">Create the resource queues and set limits on them. See <xref
             href="#topic10" type="topic" format="dita"/> and <xref href="#topic19" format="dita"
           />.</li>
@@ -377,8 +394,7 @@
                 value for this parameter should be sufficient for typical database operations. </li>
               <li id="iz174445"><codeph>gp_resqueue_priority_cpucores_per_segment</codeph> -
                 Specifies the number of CPU cores allocated per segment instance. The default value
-                is 4 for the master and segments. For Greenplum Data Computing Appliance Version 2,
-                the default value is 4 for segments and 25 for the master. <p>Each host checks its
+                is 4 for the master and segments. <p>Each host checks its
                   own <codeph>postgresql.conf</codeph> file for the value of this parameter. This
                   parameter also affects the master node, where it should be set to a value
                   reflecting the higher ratio of CPU cores. For example, on a cluster that has 10
@@ -720,7 +736,7 @@ MEMORY_LIMIT='2000MB');
         pg_stat_activity 
    WHERE pg_roles.rolresqueue=pg_locks.objid 
    AND pg_locks.objid=gp_toolkit.gp_resqueue_status.queueid
-   AND pg_stat_activity.procpid=pg_locks.pid;
+   AND pg_stat_activity.pid=pg_locks.pid
    AND pg_stat_activity.usename=pg_roles.rolname;
 </codeblock>
         </p>

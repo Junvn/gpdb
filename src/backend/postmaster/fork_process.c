@@ -4,15 +4,17 @@
  *	 EXEC_BACKEND case; it might be extended to do so, but it would be
  *	 considerably more complex.
  *
- * Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2014, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/postmaster/fork_process.c,v 1.9 2009/01/01 17:23:46 momjian Exp $
+ *	  src/backend/postmaster/fork_process.c
  */
 #include "postgres.h"
 #include "postmaster/fork_process.h"
 
+#include <fcntl.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 #ifdef USE_SSL
@@ -62,6 +64,69 @@ fork_process(void)
 #ifdef LINUX_PROFILE
 		setitimer(ITIMER_PROF, &prof_itimer, NULL);
 #endif
+
+		/*
+		 * By default, Linux tends to kill the postmaster in out-of-memory
+		 * situations, because it blames the postmaster for the sum of child
+		 * process sizes *including shared memory*.  (This is unbelievably
+		 * stupid, but the kernel hackers seem uninterested in improving it.)
+		 * Therefore it's often a good idea to protect the postmaster by
+		 * setting its oom_score_adj value negative (which has to be done in a
+		 * root-owned startup script). If you just do that much, all child
+		 * processes will also be protected against OOM kill, which might not
+		 * be desirable.  You can then choose to build with
+		 * LINUX_OOM_SCORE_ADJ #defined to 0, or to some other value that you
+		 * want child processes to adopt here.
+		 */
+#ifdef LINUX_OOM_SCORE_ADJ
+		{
+			/*
+			 * Use open() not stdio, to ensure we control the open flags. Some
+			 * Linux security environments reject anything but O_WRONLY.
+			 */
+			int			fd = open("/proc/self/oom_score_adj", O_WRONLY, 0);
+
+			/* We ignore all errors */
+			if (fd >= 0)
+			{
+				char		buf[16];
+				int			rc;
+
+				snprintf(buf, sizeof(buf), "%d\n", LINUX_OOM_SCORE_ADJ);
+				rc = write(fd, buf, strlen(buf));
+				(void) rc;
+				close(fd);
+			}
+		}
+#endif   /* LINUX_OOM_SCORE_ADJ */
+
+		/*
+		 * Older Linux kernels have oom_adj not oom_score_adj.  This works
+		 * similarly except with a different scale of adjustment values. If
+		 * it's necessary to build Postgres to work with either API, you can
+		 * define both LINUX_OOM_SCORE_ADJ and LINUX_OOM_ADJ.
+		 */
+#ifdef LINUX_OOM_ADJ
+		{
+			/*
+			 * Use open() not stdio, to ensure we control the open flags. Some
+			 * Linux security environments reject anything but O_WRONLY.
+			 */
+			int			fd = open("/proc/self/oom_adj", O_WRONLY, 0);
+
+			/* We ignore all errors */
+			if (fd >= 0)
+			{
+				char		buf[16];
+				int			rc;
+
+				snprintf(buf, sizeof(buf), "%d\n", LINUX_OOM_ADJ);
+				rc = write(fd, buf, strlen(buf));
+				(void) rc;
+				close(fd);
+			}
+		}
+#endif   /* LINUX_OOM_ADJ */
 
 		/*
 		 * Make sure processes do not share OpenSSL randomness state.

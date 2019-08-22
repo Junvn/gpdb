@@ -5,12 +5,12 @@
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeSort.c,v 1.62 2008/01/01 19:45:49 momjian Exp $
+ *	  src/backend/executor/nodeSort.c
  *
  *-------------------------------------------------------------------------
  */
@@ -28,6 +28,7 @@
 #include "utils/faultinjector.h"
 
 static void ExecSortExplainEnd(PlanState *planstate, struct StringInfoData *buf);
+static void ExecEagerFreeSort(SortState *node);
 
 /* ----------------------------------------------------------------
  *		ExecSort
@@ -62,7 +63,6 @@ ExecSort(SortState *node)
 
 	estate = node->ss.ps.state;
 	dir = estate->es_direction;
-
 	tuplesortstate = node->tuplesortstate->sortstore;
 
 	/*
@@ -121,7 +121,9 @@ ExecSort(SortState *node)
 				tupDesc,
 				plannode->numCols,
 				plannode->sortColIdx,
-				plannode->sortOperators, plannode->nullsFirst,
+				plannode->sortOperators,
+				plannode->collations,
+				plannode->nullsFirst,
 				PlanStateOperatorMemKB((PlanState *) node),
 				true
 				);
@@ -131,7 +133,9 @@ ExecSort(SortState *node)
 			tuplesortstate = tuplesort_begin_heap(&node->ss, tupDesc,
 												  plannode->numCols,
 												  plannode->sortColIdx,
-												  plannode->sortOperators, plannode->nullsFirst,
+												  plannode->sortOperators,
+												  plannode->collations,
+												  plannode->nullsFirst,
 												  PlanStateOperatorMemKB((PlanState *) node),
 												  node->randomAccess);
 		}
@@ -153,7 +157,7 @@ ExecSort(SortState *node)
 		}
 
 		/* If EXPLAIN ANALYZE, share our Instrumentation object with sort. */
-		if (node->ss.ps.instrument)
+		if (node->ss.ps.instrument && node->ss.ps.instrument->need_cdb)
 			tuplesort_set_instrument(tuplesortstate,
 									 node->ss.ps.instrument,
 									 node->ss.ps.cdbexplainbuf);
@@ -181,14 +185,12 @@ ExecSort(SortState *node)
 			slot = ExecProcNode(outerNode);
 
 			if (TupIsNull(slot))
-			{
 				break;
-			}
 
 			tuplesort_puttupleslot(tuplesortstate, slot);
 		}
 
-		SIMPLE_FAULT_INJECTOR(ExecSortBeforeSorting);
+		SIMPLE_FAULT_INJECTOR("execsort_before_sorting");
 
 		/*
 		 * Complete the sort.
@@ -245,7 +247,7 @@ ExecSort(SortState *node)
 								  ScanDirectionIsForward(dir),
 								  slot);
 
-	if (TupIsNull(slot) && !node->ss.ps.delayEagerFree)
+	if (TupIsNull(slot) && !node->delayEagerFree)
 	{
 		ExecEagerFreeSort(node);
 	}
@@ -313,8 +315,6 @@ ExecInitSort(Sort *node, EState *estate, int eflags)
 	 * ExecQual or ExecProject.
 	 */
 
-#define SORT_NSLOTS 2
-
 	/*
 	 * tuple table initialization
 	 *
@@ -326,7 +326,7 @@ ExecInitSort(Sort *node, EState *estate, int eflags)
 	/* 
 	 * CDB: Offer extra info for EXPLAIN ANALYZE.
 	 */
-	if (estate->es_instrument)
+	if (estate->es_instrument && (estate->es_instrument & INSTRUMENT_CDB))
 	{
 		/* Allocate string buffer. */
 		sortstate->ss.ps.cdbexplainbuf = makeStringInfo();
@@ -339,7 +339,7 @@ ExecInitSort(Sort *node, EState *estate, int eflags)
 	 * If eflag contains EXEC_FLAG_REWIND or EXEC_FLAG_BACKWARD or EXEC_FLAG_MARK,
 	 * then this node is not eager free safe.
 	 */
-	sortstate->ss.ps.delayEagerFree =
+	sortstate->delayEagerFree =
 		((eflags & (EXEC_FLAG_REWIND | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)) != 0);
 
 	/*
@@ -371,7 +371,7 @@ ExecInitSort(Sort *node, EState *estate, int eflags)
 	 */
 	if (IsA(outerPlan((Plan *)node), Motion))
 	{
-		sortstate->ss.ps.delayEagerFree = true;
+		sortstate->delayEagerFree = true;
 	}
 
 	/*
@@ -393,14 +393,6 @@ ExecInitSort(Sort *node, EState *estate, int eflags)
 			   "sort node initialized");
 
 	return sortstate;
-}
-
-int
-ExecCountSlotsSort(Sort *node)
-{
-	return ExecCountSlotsNode(outerPlan((Plan *) node)) +
-		ExecCountSlotsNode(innerPlan((Plan *) node)) +
-		SORT_NSLOTS;
 }
 
 /* ----------------------------------------------------------------
@@ -466,11 +458,11 @@ ExecSortRestrPos(SortState *node)
 }
 
 void
-ExecReScanSort(SortState *node, ExprContext *exprCtxt)
+ExecReScanSort(SortState *node)
 {
 	/*
-	 * If we haven't sorted yet, just return. If outerplan' chgParam is not
-	 * NULL then it will be re-scanned by ExecProcNode, else - no reason to
+	 * If we haven't sorted yet, just return. If outerplan's chgParam is not
+	 * NULL then it will be re-scanned by ExecProcNode, else no reason to
 	 * re-scan it at all.
 	 */
 	if (!node->sort_Done)
@@ -486,7 +478,7 @@ ExecReScanSort(SortState *node, ExprContext *exprCtxt)
 	 *
 	 * Otherwise we can just rewind and rescan the sorted output.
 	 */
-	if (((PlanState *) node)->lefttree->chgParam != NULL ||
+	if (node->ss.ps.lefttree->chgParam != NULL ||
 		node->bounded != node->bounded_Done ||
 		node->bound != node->bound_Done ||
 		!node->randomAccess ||
@@ -503,15 +495,11 @@ ExecReScanSort(SortState *node, ExprContext *exprCtxt)
 		 * if chgParam of subnode is not null then plan will be re-scanned by
 		 * first ExecProcNode.
 		 */
-		if (((PlanState *) node)->lefttree->chgParam == NULL)
-		{
-			ExecReScan(((PlanState *) node)->lefttree, exprCtxt);
-		}
+		if (node->ss.ps.lefttree->chgParam == NULL)
+			ExecReScan(node->ss.ps.lefttree);
 	}
 	else
-	{
 		tuplesort_rescan(node->tuplesortstate->sortstore);
-	}
 }
 
 
@@ -531,7 +519,7 @@ ExecSortExplainEnd(PlanState *planstate, struct StringInfoData *buf)
 
 }                               /* ExecSortExplainEnd */
 
-void
+static void
 ExecEagerFreeSort(SortState *node)
 {
 	Sort	   *plan = (Sort *) node->ss.ps.plan;
@@ -577,4 +565,11 @@ ExecEagerFreeSort(SortState *node)
 		tuplesort_end(node->tuplesortstate->sortstore);
 		node->tuplesortstate->sortstore = NULL;
 	}
+}
+
+void
+ExecSquelchSort(SortState *node)
+{
+	ExecEagerFreeSort(node);
+	ExecSquelchNode(outerPlanState(node));
 }

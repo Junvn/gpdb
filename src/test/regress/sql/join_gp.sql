@@ -1,5 +1,15 @@
+-- Extra GPDB tests for joins.
 
+-- Ignore "workfile compresssion is not supported by this build" (see
+-- 'zlib' test):
+--
+-- start_matchignore
+-- m/ERROR:  workfile compresssion is not supported by this build/
+-- end_matchignore
+
+--
 -- test numeric hash join
+--
 
 set enable_hashjoin to on;
 set enable_mergejoin to off;
@@ -191,9 +201,9 @@ insert into dept select i, 99 from generate_series(100,15000) as i;
 
 ANALYZE dept;
 
--- Test rescannable hashjoin with spilling hashtable for buffile
+-- Test rescannable hashjoin with spilling hashtable
 set statement_mem='1000kB';
-set gp_workfile_type_hashjoin=buffile;
+set gp_workfile_compression = off;
 WITH RECURSIVE subdept(id, parent_department, name) AS
 (
 	-- non recursive term
@@ -205,8 +215,8 @@ WITH RECURSIVE subdept(id, parent_department, name) AS
 )
 SELECT count(*) FROM subdept;
 
--- Test rescannable hashjoin with spilling hashtable for bfz
-set gp_workfile_type_hashjoin=bfz;
+-- Test rescannable hashjoin with spilling hashtable, with compression
+set gp_workfile_compression = on;
 WITH RECURSIVE subdept(id, parent_department, name) AS
 (
 	-- non recursive term
@@ -231,6 +241,260 @@ WITH RECURSIVE subdept(id, parent_department, name) AS
 )
 SELECT count(*) FROM subdept;
 
+
+-- MPP-29458
+-- When we join on a clause with two different types. If one table distribute by one type, the query plan
+-- will redistribute data on another type. But the has values of two types would not be equal. The data will
+-- redistribute to wrong segments.
+create table test_timestamp_t1 (id  numeric(10,0) ,field_dt date) distributed by (id);
+create table test_timestamp_t2 (id numeric(10,0),field_tms timestamp without time zone) distributed by (id,field_tms);
+
+insert into test_timestamp_t1 values(10 ,'2018-1-10');
+insert into test_timestamp_t1 values(11 ,'2018-1-11');
+insert into test_timestamp_t2 values(10 ,'2018-1-10'::timestamp);
+insert into test_timestamp_t2 values(11 ,'2018-1-11'::timestamp);
+
+-- Test nest loop redistribute keys
+set enable_nestloop to on;
+set enable_hashjoin to on;
+set enable_mergejoin to on;
+select count(*) from test_timestamp_t1 t1 ,test_timestamp_t2 t2 where T1.id = T2.id and T1.field_dt = t2.field_tms;
+
+-- Test hash join redistribute keys
+set enable_nestloop to off;
+set enable_hashjoin to on;
+set enable_mergejoin to on;
+select count(*) from test_timestamp_t1 t1 ,test_timestamp_t2 t2 where T1.id = T2.id and T1.field_dt = t2.field_tms;
+
+drop table test_timestamp_t1;
+drop table test_timestamp_t2;
+
+-- Test merge join redistribute keys
+create table test_timestamp_t1 (id  numeric(10,0) ,field_dt date) distributed randomly;
+
+create table test_timestamp_t2 (id numeric(10,0),field_tms timestamp without time zone) distributed by (field_tms);
+
+insert into test_timestamp_t1 values(10 ,'2018-1-10');
+insert into test_timestamp_t1 values(11 ,'2018-1-11');
+insert into test_timestamp_t2 values(10 ,'2018-1-10'::timestamp);
+insert into test_timestamp_t2 values(11 ,'2018-1-11'::timestamp);
+
+select * from test_timestamp_t1 t1 full outer join test_timestamp_t2 t2 on T1.id = T2.id and T1.field_dt = t2.field_tms;
+
+-- test float type
+set enable_nestloop to off;
+set enable_hashjoin to on;
+set enable_mergejoin to on;
+create table test_float1(id int, data float4)  DISTRIBUTED BY (data);
+create table test_float2(id int, data float8)  DISTRIBUTED BY (data);
+insert into test_float1 values(1, 10), (2, 20);
+insert into test_float2 values(3, 10), (4, 20);
+select t1.id, t1.data, t2.id, t2.data from test_float1 t1, test_float2 t2 where t1.data = t2.data;
+
+-- test int type
+create table test_int1(id int, data int4)  DISTRIBUTED BY (data);
+create table test_int2(id int, data int8)  DISTRIBUTED BY (data);
+insert into test_int1 values(1, 10), (2, 20);
+insert into test_int2 values(3, 10), (4, 20);
+select t1.id, t1.data, t2.id, t2.data from test_int1 t1, test_int2 t2 where t1.data = t2.data;
+
+-- Test to ensure that for full outer join on varchar columns, planner is successful in finding a sort operator in the catalog
+create table input_table(a varchar(30), b varchar(30)) distributed by (a);
+set enable_hashjoin = off;
+explain (costs off) select X.a from input_table X full join (select a from input_table) Y ON X.a = Y.a;
+
 -- Cleanup
+reset enable_hashjoin;
 set client_min_messages='warning'; -- silence drop-cascade NOTICEs
 drop schema pred cascade;
+reset search_path;
+
+-- github issue 5370 cases
+drop table if exists t5370;
+drop table if exists t5370_2;
+create table t5370(id int,name text) distributed by(id);
+insert into t5370 select i,i from  generate_series(1,1000) i;
+create table t5370_2 as select * from t5370 distributed by (id);
+analyze t5370_2;
+analyze t5370;
+explain select * from t5370 a , t5370_2 b where a.name=b.name;
+
+drop table t5370;
+drop table t5370_2;
+
+-- github issue 6215 cases
+-- When executing the following plan
+-- ```
+--  Gather Motion 1:1  (slice1; segments: 1)
+--    ->  Merge Full Join
+--         ->  Seq Scan on int4_tbl a
+--         ->  Seq Scan on int4_tbl b
+--```
+-- Greenplum will raise an Assert Fail.
+-- We force adding a material node for
+-- merge full join on true.
+drop table if exists t6215;
+create table t6215(f1 int4) distributed replicated;
+insert into t6215(f1) values (1), (2), (3);
+
+set enable_material = off;
+-- The plan still have Material operator
+explain (costs off) select * from t6215 a full join t6215 b on true;
+select * from t6215 a full join t6215 b on true;
+
+drop table t6215;
+
+
+--
+-- This tripped an assertion while deciding the locus for the joins.
+-- The code was failing to handle join between SingleQE and Hash correctly,
+-- when there were join order restricitions. (see
+-- https://github.com/greenplum-db/gpdb/issues/6643
+--
+select a.f1, b.f1, t.thousand, t.tenthous from
+  (select sum(f1) as f1 from int4_tbl i4b) b
+   left outer join
+     (select sum(f1)+1 as f1 from int4_tbl i4a) a ON a.f1 = b.f1
+      left outer join
+        tenk1 t ON b.f1 = t.thousand and (a.f1+b.f1+999) = t.tenthous;
+
+
+-- tests to ensure that join reordering of LOJs and inner joins produces the
+-- correct join predicates & residual filters
+drop table if exists t1, t2, t3;
+CREATE TABLE t1 (a int, b int, c int);
+CREATE TABLE t2 (a int, b int, c int);
+CREATE TABLE t3 (a int, b int, c int);
+INSERT INTO t1 SELECT i, i, i FROM generate_series(1, 1000) i;
+INSERT INTO t2 SELECT i, i, i FROM generate_series(2, 1000) i; -- start from 2 so that one row from t1 doesn't match
+INSERT INTO t3 VALUES (1, 2, 3), (NULL, 2, 2);
+ANALYZE t1;
+ANALYZE t2;
+ANALYZE t3;
+
+-- ensure plan has a filter over left outer join
+explain (costs off) select * from t1 left join t2 on (t1.a = t2.a) join t3 on (t1.b = t3.b) where (t2.a IS NULL OR (t1.c = t3.c));
+select * from t1 left join t2 on (t1.a = t2.a) join t3 on (t1.b = t3.b) where (t2.a IS NULL OR (t1.c = t3.c));
+
+-- ensure plan has two inner joins with the where clause & join predicates ANDed
+explain (costs off) select * from t1 left join t2 on (t1.a = t2.a) join t3 on (t1.b = t3.b) where (t2.a = t3.a);
+select * from t1 left join t2 on (t1.a = t2.a) join t3 on (t1.b = t3.b) where (t2.a = t3.a);
+
+-- ensure plan has a filter over left outer join
+explain (costs off) select * from t1 left join t2 on (t1.a = t2.a) join t3 on (t1.b = t3.b) where (t2.a is distinct from t3.a);
+select * from t1 left join t2 on (t1.a = t2.a) join t3 on (t1.b = t3.b) where (t2.a is distinct from t3.a);
+
+-- ensure plan has a filter over left outer join
+explain select * from t3 join (select t1.a t1a, t1.b t1b, t1.c t1c, t2.a t2a, t2.b t2b, t2.c t2c from t1 left join t2 on (t1.a = t2.a)) t on (t1a = t3.a) WHERE (t2a IS NULL OR (t1c = t3.a));
+select * from t3 join (select t1.a t1a, t1.b t1b, t1.c t1c, t2.a t2a, t2.b t2b, t2.c t2c from t1 left join t2 on (t1.a = t2.a)) t on (t1a = t3.a) WHERE (t2a IS NULL OR (t1c = t3.a));
+
+-- ensure plan has a filter over left outer join
+explain select * from (select t1.a t1a, t1.b t1b, t2.a t2a, t2.b t2b from t1 left join t2 on t1.a = t2.a) tt 
+  join t3 on tt.t1b = t3.b 
+  join (select t1.a t1a, t1.b t1b, t2.a t2a, t2.b t2b from t1 left join t2 on t1.a = t2.a) tt1 on tt1.t1b = t3.b 
+  join t3 t3_1 on tt1.t1b = t3_1.b and (tt1.t2a is NULL OR tt1.t1b = t3.b);
+
+select * from (select t1.a t1a, t1.b t1b, t2.a t2a, t2.b t2b from t1 left join t2 on t1.a = t2.a) tt 
+  join t3 on tt.t1b = t3.b 
+  join (select t1.a t1a, t1.b t1b, t2.a t2a, t2.b t2b from t1 left join t2 on t1.a = t2.a) tt1 on tt1.t1b = t3.b 
+  join t3 t3_1 on tt1.t1b = t3_1.b and (tt1.t2a is NULL OR tt1.t1b = t3.b);
+
+-- test different join order enumeration methods
+set optimizer_join_order = query;
+select * from t1 join t2 on t1.a = t2.a join t3 on t1.b = t3.b;
+set optimizer_join_order = greedy;
+select * from t1 join t2 on t1.a = t2.a join t3 on t1.b = t3.b;
+set optimizer_join_order = exhaustive;
+select * from t1 join t2 on t1.a = t2.a join t3 on t1.b = t3.b;
+set optimizer_join_order = exhaustive2;
+select * from t1 join t2 on t1.a = t2.a join t3 on t1.b = t3.b;
+reset optimizer_join_order;
+select * from t1 join t2 on t1.a = t2.a join t3 on t1.b = t3.b;
+
+drop table t1, t2, t3;
+
+--
+-- Test a bug that nestloop path previously can not generate motion above
+-- index path, which sometimes is wrong (this test case is an example).
+-- We now depend on parameterized path related variables to judge instead.
+-- We conservatively disallow motion when there is parameter requirement
+-- for either outer or inner at this moment though there could be room
+-- for further improvement (e.g. referring subplan code to do broadcast
+-- for base rel if needed, which needs much effort and does not seem to
+-- be deserved given we will probably refactor related code for the lateral
+-- support in the near future). For the query and guc settings below, Postgres
+-- planner can not generate a plan.
+set enable_nestloop = 1;
+set enable_material = 0;
+set enable_seqscan = 0;
+set enable_bitmapscan = 0;
+explain select tenk1.unique2 >= 0 from tenk1 left join tenk2 on true limit 1;
+select tenk1.unique2 >= 0 from tenk1 left join tenk2 on true limit 1;
+reset enable_nestloop;
+reset enable_material;
+reset enable_seqscan;
+reset enable_bitmapscan;
+
+-- Below test cases are for planner's cdbpath_motion_for_join, so we close
+-- ORCA temporarily.
+set optimizer = off;
+-- test outer join for general locus
+-- replicated table's locus is SegmentGeneral
+create table trep_join_gp (c1 int, c2 int) distributed replicated;
+-- hash distributed table's locus is Hash
+create table thash_join_gp (c1 int, c2 int) distributed by (c1);
+-- randomly distributed table's locus is Strewn
+create table trand_join_gp (c1 int, c2 int) distributed randomly;
+-- start_ignore
+create extension if not exists gp_debug_numsegments;
+select gp_debug_set_create_table_default_numsegments(1);
+-- end_ignore
+-- the following replicated table's numsegments is 1
+create table trep1_join_gp (c1 int, c2 int) distributed replicated;
+
+insert into trep_join_gp values (1, 1), (2, 2);
+insert into thash_join_gp values (1, 1), (2, 2);
+insert into trep1_join_gp values (1, 1), (2, 2);
+
+analyze trep_join_gp;
+analyze thash_join_gp;
+analyze trep1_join_gp;
+analyze trand_join_gp;
+
+-- This test is to check that: general left join segmentGeneral --> segmentGeneral
+-- And segmentGeneral join hash does not need motion.
+explain select * from generate_series(1, 5) g left join trep_join_gp on g = trep_join_gp.c1 join thash_join_gp on true;
+select * from generate_series(1, 5) g left join trep_join_gp on g = trep_join_gp.c1 join thash_join_gp on true;
+
+-- The following 4 tests are to check that general left join partition, we could redistribute the
+-- general-locus relation when the filter condition is suitable. If we can redistributed
+-- general-locus relation, we should not gather them to singleQE.
+explain select * from generate_series(1, 5) g left join thash_join_gp on g = thash_join_gp.c1;
+select * from generate_series(1, 5) g left join thash_join_gp on g = thash_join_gp.c1;
+
+explain select * from generate_series(1, 5) g left join thash_join_gp on g = thash_join_gp.c2;
+select * from generate_series(1, 5) g left join thash_join_gp on g = thash_join_gp.c2;
+
+explain select * from generate_series(1, 5) g left join trand_join_gp on g = trand_join_gp.c1;
+select * from generate_series(1, 5) g left join trand_join_gp on g = trand_join_gp.c1;
+
+explain select * from generate_series(1, 5) g full join trand_join_gp on g = trand_join_gp.c1;
+select * from generate_series(1, 5) g full join trand_join_gp on g = trand_join_gp.c1;
+
+-- The following 3 tests are to check that segmentGeneral left join partition
+-- we could redistribute the segment general-locus relation when the filter condition
+-- is suitable. If we can redistributed general-locus relation, we should not
+-- gather them to singleQE.
+explain select * from trep_join_gp left join thash_join_gp using (c1);
+select * from trep_join_gp left join thash_join_gp using (c1);
+
+explain select * from trep_join_gp left join trand_join_gp using (c1);
+select * from trep_join_gp left join trand_join_gp using (c1);
+
+explain select * from trep1_join_gp join thash_join_gp using (c1);
+select * from trep1_join_gp join thash_join_gp using (c1);
+
+drop table trep_join_gp;
+drop table thash_join_gp;
+drop table trand_join_gp;
+drop table trep1_join_gp;

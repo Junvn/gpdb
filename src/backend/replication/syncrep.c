@@ -2,6 +2,8 @@
  *
  * syncrep.c
  *
+ * Synchronous replication is new as of PostgreSQL 9.1.
+ *
  * If requested, transaction commits wait until their commit LSN is
  * acknowledged by the sync standby.
  *
@@ -10,19 +12,30 @@
  * replication transport remains within WALreceiver/WALsender modules.
  *
  * The essence of this design is that it isolates all logic about
- * waiting/releasing onto the primary. The primary looks for an active and
- * a sync-requesting standby and then based on that makes the backends wait
- * for completion of replication.
+ * waiting/releasing onto the primary. The primary defines which standbys
+ * it wishes to wait for. The standby is completely unaware of the
+ * durability requirements of transactions on the primary, reducing the
+ * complexity of the code and streamlining both standby operations and
+ * network bandwidth because there is no requirement to ship
+ * per-transaction state information.
  *
  * Replication is either synchronous or not synchronous (async). If it is
  * async, we just fastpath out of here. If it is sync, then we wait for
- * the write or flush location on the standby before releasing the waiting backend.
+ * the write or flush location on the standby before releasing the waiting
+ * backend. Further complexity in that interaction is expected in later
+ * releases.
  *
  * The best performing way to manage the waiting backends is to have a
  * single ordered queue of waiting backends, so that we can avoid
- * searching them through all waiters each time we receive a reply.
+ * searching the through all waiters each time we receive a reply.
  *
- * Portions Copyright (c) 2010-2012, PostgreSQL Global Development Group
+ * In 9.1 we support only a single synchronous standby, chosen from a
+ * priority list of synchronous_standby_names. Before it can become the
+ * synchronous standby it must have caught up with the primary; that may
+ * take some time. Once caught up, the current highest priority standby
+ * will release waiters from the queue.
+ *
+ * Portions Copyright (c) 2010-2014, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/syncrep.c
@@ -44,8 +57,10 @@
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/ps_status.h"
+#include "utils/faultinjector.h"
 #include "pgstat.h"
 #include "cdb/cdbvars.h"
+
 /* User-settable parameters for sync rep */
 char	   *SyncRepStandbyNames;
 
@@ -54,7 +69,7 @@ char	   *SyncRepStandbyNames;
 
 static bool announce_next_takeover = true;
 
-static int	SyncRepWaitMode = SYNC_REP_WAIT_FLUSH;
+static int	SyncRepWaitMode = SYNC_REP_NO_WAIT;
 
 static void SyncRepQueueInsert(int mode);
 static void SyncRepCancelWait(void);
@@ -83,9 +98,8 @@ static bool SyncRepQueueIsOrderedByLSN(int mode);
 void
 SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 {
-	const char	*old_status;
-	char		*old_status_saved = NULL;
-	int			len=0;
+	char	   *new_status = NULL;
+	const char *old_status;
 	int			mode = SyncRepWaitMode;
 	bool		syncStandbyPresent = false;
 	int			i = 0;
@@ -98,44 +112,14 @@ SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 	{
 		return;
 	}
-
+	Assert(!am_walsender);
 	elogif(debug_walrepl_syncrep, LOG,
 			"syncrep wait -- This backend's commit LSN for syncrep is %X/%X.",
-			XactCommitLSN.xlogid,XactCommitLSN.xrecoff);
+		   (uint32) (XactCommitLSN >> 32), (uint32) XactCommitLSN);
 
-	/*
-	 * Walsenders are not supposed to call this function, but currently
-	 * basebackup needs to access catalog, hence open/close transaction.
-	 * It doesn't make sense to wait for myself anyway.
-	 */
-	if (am_walsender)
-	{
-		elogif(debug_walrepl_syncrep, LOG,
-				"syncrep wait -- Not waiting for syncrep as this process is a walsender.");
+	/* Fast exit if user has not requested sync replication. */
+	if (!SyncRepRequested())
 		return;
-	}
-
-	/*
-	 * XXX: Some processes (e.g. auxiliary processes) don't need even
-	 * check the walsenders.  We just stay away from any of the shared
-	 * memory values.  When we move to fully-synchronous replication,
-	 * any xlog change needs to be considered to be synchronous,
-	 * but for now this is acceptable.
-	 */
-	if (MyProc->syncRepState == SYNC_REP_DISABLED)
-	{
-		elogif(debug_walrepl_syncrep, LOG,
-				"syncrep wait -- Not waiting for syncrep as synrep state for this process is disabled.");
-
-		return;
-	}
-
-	if (GpIdentity.segindex != MASTER_CONTENT_ID)
-	{
-		/* Fast exit if user has not requested sync replication. */
-		if (!SyncRepRequested())
-			return;
-	}
 
 	Assert(SHMQueueIsDetached(&(MyProc->syncRepLinks)));
 	Assert(WalSndCtl != NULL);
@@ -143,7 +127,7 @@ SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 	LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
 	Assert(MyProc->syncRepState == SYNC_REP_NOT_WAITING);
 
-	if (GpIdentity.segindex == MASTER_CONTENT_ID)
+	if (IS_QUERY_DISPATCHER())
 	{
 		/*
 		 * There could be a better way to figure out if there is any active
@@ -158,7 +142,6 @@ SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 
 			SpinLockAcquire(&walsnd->mutex);
 			syncStandbyPresent = (walsnd->pid != 0)
-				&& (walsnd->synchronous)
 				&& ((walsnd->state == WALSNDSTATE_STREAMING)
 					|| (walsnd->state == WALSNDSTATE_CATCHUP &&
 						walsnd->caughtup_within_range));
@@ -185,18 +168,18 @@ SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 	 * set.  See SyncRepUpdateSyncStandbysDefined.
 	 *
 	 * Also check that the standby hasn't already replied. Unlikely race
-	 * condition but we'll be fetching that cache line anyway so its likely to
-	 * be a low cost check.
+	 * condition but we'll be fetching that cache line anyway so it's likely
+	 * to be a low cost check.
 	 */
-	if (((GpIdentity.segindex != MASTER_CONTENT_ID) && !WalSndCtl->sync_standbys_defined) ||
-		XLByteLE(XactCommitLSN, WalSndCtl->lsn[mode]))
+	if (((!IS_QUERY_DISPATCHER()) && !WalSndCtl->sync_standbys_defined) ||
+		XactCommitLSN <= WalSndCtl->lsn[mode])
 	{
 		elogif(debug_walrepl_syncrep, LOG,
 				"syncrep wait -- Not waiting for syncrep because xlog upto LSN (%X/%X) which is "
 				"greater than this backend's commit LSN (%X/%X) has already "
 				"been replicated.",
-				WalSndCtl->lsn[mode].xlogid, WalSndCtl->lsn[mode].xrecoff,
-				XactCommitLSN.xlogid, XactCommitLSN.xrecoff);
+			   (uint32) (WalSndCtl->lsn[mode] >> 32), (uint32) WalSndCtl->lsn[mode],
+			   (uint32) (XactCommitLSN >> 32), (uint32) XactCommitLSN);
 
 		LWLockRelease(SyncRepLock);
 		return;
@@ -218,20 +201,23 @@ SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 	/* Alter ps display to show waiting for sync rep. */
 	if (update_process_title)
 	{
-		char		activitymsg[35];
+		int			len;
 
-		snprintf(activitymsg, sizeof(activitymsg), " waiting for %X/%X replication",
-				XactCommitLSN.xlogid, XactCommitLSN.xrecoff);
-
-		old_status = get_ps_display(&len);
-		old_status_saved = (char *) palloc(len + 1);
-		Assert (old_status_saved);
-		memcpy(old_status_saved, old_status, len);
-		set_ps_display(activitymsg, false);
+		old_status = get_real_act_ps_display(&len);
+		/*
+		 * The 32 represents the bytes in the string " waiting for %X/%X", as
+		 * in upstream.  The 12 represents GPDB specific " replication" suffix.
+		 */
+		new_status = (char *) palloc(len + 32 + 12 + 1);
+		memcpy(new_status, old_status, len);
+		sprintf(new_status + len, " waiting for %X/%X replication",
+				(uint32) (XactCommitLSN >> 32), (uint32) XactCommitLSN);
+		set_ps_display(new_status, false);
+		new_status[len] = '\0'; /* truncate off " waiting ..." */
 	}
 
 	/* Inform this backend is waiting for replication to pg_stat_activity */
-	pgstat_report_waiting(PGBE_WAITING_REPLICATION);
+	gpstat_report_waiting(PGBE_WAITING_REPLICATION);
 
 	/*
 	 * Wait for specified LSN to be confirmed.
@@ -289,7 +275,11 @@ SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 		 */
 		if (ProcDiePending)
 		{
-			ereport(WARNING,
+			/*
+			 * FATAL only for QE's which use 2PC and hence can handle the
+			 * FATAL and retry.
+			 */
+			ereport(IS_QUERY_DISPATCHER() ? WARNING:FATAL,
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
 					 errmsg("canceling the wait for synchronous replication and terminating connection due to administrator command"),
 					 errdetail("The transaction has already committed locally, but might not have been replicated to the standby.")));
@@ -299,19 +289,25 @@ SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 		}
 
 		/*
-		 * It's unclear what to do if a query cancel interrupt arrives.  We
-		 * can't actually abort at this point, but ignoring the interrupt
-		 * altogether is not helpful, so we just terminate the wait with a
-		 * suitable warning.
+		 * GPDB: There are multiple code paths going through this function,
+		 * e.g. prepare, commit, and abort. To ensure MPP cluster consistency,
+		 * if primary already changed, then this backend has to wait for the
+		 * xlog record replicate to the mirror to avoid inconsistency between
+		 * the primary and the mirror, since they are under synced replication.
+		 *
+		 * If the mirror is indeed offline and prevents xlog to be synced, FTS
+		 * will detect the mirror goes down, and failure handling will kick-in
+		 * and mark the mirror down and out-of-sync with the primary to prevent
+		 * failover. Then the syncrep will be turned off by the FTS to unblock
+		 * backends waiting here.
 		 */
 		if (QueryCancelPending)
 		{
 			QueryCancelPending = false;
 			ereport(WARNING,
-					(errmsg("canceling wait for synchronous replication due to user request"),
-					 errdetail("The transaction has already committed locally, but might not have been replicated to the standby.")));
-			SyncRepCancelWait();
-			break;
+					(errmsg("ignoring query cancel request for synchronous replication to ensure cluster consistency"),
+					 errdetail("The transaction has already changed locally, it has to be replicated to standby.")));
+			SIMPLE_FAULT_INJECTOR("sync_rep_query_cancel");
 		}
 
 		/*
@@ -319,7 +315,7 @@ SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 		 * acknowledgement, because all the wal sender processes will exit. So
 		 * just bail out.
 		 */
-		if (!PostmasterIsAlive(true))
+		if (!PostmasterIsAlive())
 		{
 			ProcDiePending = true;
 			whereToSendOutput = DestNone;
@@ -345,18 +341,17 @@ SyncRepWaitForLSN(XLogRecPtr XactCommitLSN)
 	 */
 	Assert(SHMQueueIsDetached(&(MyProc->syncRepLinks)));
 	MyProc->syncRepState = SYNC_REP_NOT_WAITING;
-	MyProc->waitLSN.xlogid = 0;
-	MyProc->waitLSN.xrecoff = 0;
+	MyProc->waitLSN = 0;
 
-	if (update_process_title)
+	if (new_status)
 	{
-		Assert(old_status_saved);
-		set_ps_display(old_status_saved, false);
-		pfree(old_status_saved);
+		/* Reset ps display */
+		set_ps_display(new_status, false);
+		pfree(new_status);
 	}
 
 	/* Now inform no more waiting for replication */
-	pgstat_report_waiting(PGBE_WAITING_NONE);
+	gpstat_report_waiting(PGBE_WAITING_NONE);
 }
 
 /*
@@ -381,7 +376,7 @@ SyncRepQueueInsert(int mode)
 		 * Stop at the queue element that we should after to ensure the queue
 		 * is ordered by LSN.
 		 */
-		if (XLByteLT(proc->waitLSN, MyProc->waitLSN))
+		if (proc->waitLSN < MyProc->waitLSN)
 			break;
 
 		proc = (PGPROC *) SHMQueuePrev(&(WalSndCtl->SyncRepQueue[mode]),
@@ -444,8 +439,9 @@ SyncRepInitConfig(void)
 		LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
 		MyWalSnd->sync_standby_priority = priority;
 		LWLockRelease(SyncRepLock);
-		ereport(LOG,
-			(errmsg("standby now has synchronous standby priority %u", priority)));
+		ereport(DEBUG1,
+			(errmsg("standby \"%s\" now has synchronous standby priority %u",
+					application_name, priority)));
 	}
 }
 
@@ -467,12 +463,15 @@ SyncRepReleaseWaiters(void)
 	int			i;
 
 	/*
-	 * If this WALSender doesn't have any priority then we have nothing to do.
-	 * If we are still starting up, still running base backup or the current
-	 * flush position is still invalid, then leave quickly also.
+	 * If this WALSender is serving a standby that is not on the list of
+	 * potential sync standbys then we have nothing to do. If we are still
+	 * starting up, still running base backup or the current flush position
+	 * is still invalid, then leave quickly also. Streaming or stopping WAL
+	 * senders are allowed to release waiters.
 	 */
 	if (MyWalSnd->sync_standby_priority == 0 ||
-		MyWalSnd->state < WALSNDSTATE_STREAMING ||
+		(MyWalSnd->state != WALSNDSTATE_STREAMING &&
+		 MyWalSnd->state != WALSNDSTATE_STOPPING) ||
 		XLogRecPtrIsInvalid(MyWalSnd->flush))
 		return;
 
@@ -490,11 +489,12 @@ SyncRepReleaseWaiters(void)
 		volatile WalSnd *walsnd = &walsndctl->walsnds[i];
 
 		if (walsnd->pid != 0 &&
-			walsnd->state == WALSNDSTATE_STREAMING &&
+			(walsnd->state == WALSNDSTATE_STREAMING ||
+			 walsnd->state == WALSNDSTATE_STOPPING) &&
 			walsnd->sync_standby_priority > 0 &&
 			(priority == 0 ||
 			 priority > walsnd->sync_standby_priority) &&
-			(!XLogRecPtrIsInvalid(walsnd->flush)))
+			!XLogRecPtrIsInvalid(walsnd->flush))
 		{
 			priority = walsnd->sync_standby_priority;
 			syncWalSnd = walsnd;
@@ -520,12 +520,12 @@ SyncRepReleaseWaiters(void)
 	 * Set the lsn first so that when we wake backends they will release up to
 	 * this location.
 	 */
-	if (XLByteLT(walsndctl->lsn[SYNC_REP_WAIT_WRITE], MyWalSnd->write))
+	if (walsndctl->lsn[SYNC_REP_WAIT_WRITE] < MyWalSnd->write)
 	{
 		walsndctl->lsn[SYNC_REP_WAIT_WRITE] = MyWalSnd->write;
 		numwrite = SyncRepWakeQueue(false, SYNC_REP_WAIT_WRITE);
 	}
-	if (XLByteLT(walsndctl->lsn[SYNC_REP_WAIT_FLUSH], MyWalSnd->flush))
+	if (walsndctl->lsn[SYNC_REP_WAIT_FLUSH] < MyWalSnd->flush)
 	{
 		walsndctl->lsn[SYNC_REP_WAIT_FLUSH] = MyWalSnd->flush;
 		numflush = SyncRepWakeQueue(false, SYNC_REP_WAIT_FLUSH);
@@ -534,13 +534,9 @@ SyncRepReleaseWaiters(void)
 	LWLockRelease(SyncRepLock);
 
 	elogif(debug_walrepl_syncrep, LOG,
-		"syncrep release -- Released %d processe(s) up to write %X/%X, %d processe(s) up to flush %X/%X",
-		 numwrite,
-		 MyWalSnd->write.xlogid,
-		 MyWalSnd->write.xrecoff,
-		 numflush,
-		 MyWalSnd->flush.xlogid,
-		 MyWalSnd->flush.xrecoff);
+		 "released %d procs up to write %X/%X, %d procs up to flush %X/%X",
+		 numwrite, (uint32) (MyWalSnd->write >> 32), (uint32) MyWalSnd->write,
+		 numflush, (uint32) (MyWalSnd->flush >> 32), (uint32) MyWalSnd->flush);
 
 	/*
 	 * If we are managing the highest priority standby, though we weren't
@@ -549,9 +545,9 @@ SyncRepReleaseWaiters(void)
 	if (announce_next_takeover)
 	{
 		announce_next_takeover = false;
-		elogif(debug_walrepl_syncrep, LOG,
-			   "syncrep release -- standby is now the synchronous standby with priority %u",
-			   MyWalSnd->sync_standby_priority);
+		ereport(LOG,
+				(errmsg("standby \"%s\" is now the synchronous standby with priority %u",
+						application_name, MyWalSnd->sync_standby_priority)));
 	}
 }
 
@@ -599,7 +595,7 @@ SyncRepWakeQueue(bool all, int mode)
 		/*
 		 * Assume the queue is ordered by LSN
 		 */
-		if (!all && XLByteLT(walsndctl->lsn[mode], proc->waitLSN))
+		if (!all && walsndctl->lsn[mode] < proc->waitLSN)
 			return numprocs;
 
 		/*
@@ -612,15 +608,15 @@ SyncRepWakeQueue(bool all, int mode)
 									   offsetof(PGPROC, syncRepLinks));
 
 		/*
+		 * Remove thisproc from queue.
+		 */
+		SHMQueueDelete(&(thisproc->syncRepLinks));
+
+		/*
 		 * Set state to complete; see SyncRepWaitForLSN() for discussion of
 		 * the various states.
 		 */
 		thisproc->syncRepState = SYNC_REP_WAIT_COMPLETE;
-
-		/*
-		 * Remove thisproc from queue.
-		 */
-		SHMQueueDelete(&(thisproc->syncRepLinks));
 
 		/*
 		 * Wake only when we have set state and removed from queue.
@@ -690,8 +686,7 @@ SyncRepQueueIsOrderedByLSN(int mode)
 
 	Assert(mode >= 0 && mode < NUM_SYNC_REP_WAIT_MODE);
 
-	lastLSN.xlogid = 0;
-	lastLSN.xrecoff = 0;
+	lastLSN = 0;
 
 	proc = (PGPROC *) SHMQueueNext(&(WalSndCtl->SyncRepQueue[mode]),
 								   &(WalSndCtl->SyncRepQueue[mode]),
@@ -700,10 +695,21 @@ SyncRepQueueIsOrderedByLSN(int mode)
 	while (proc)
 	{
 		/*
-		 * Check the queue is ordered by LSN and that multiple procs don't
-		 * have matching LSNs
+		 * Check the queue is ordered by LSN.
+		 *
+		 * In upstream this check also validates that multiple procs don't
+		 * have matching LSNs. This restriction is lifted in GPDB as for
+		 * commit-prepared retry case since we don't know the exact lsn of
+		 * commit-prepared record, need to wait for latest flush point
+		 * lsn. So, its possible due to concurrency multiple backends register
+		 * in queue with same lsn value. The check here anyways seems little
+		 * restrictive as actual queue usage only needs it in sorted order and
+		 * not really relies on having unique entries. It just happens to be
+		 * that if all usage of SyncRepWaitForLSN() feed unique lsn value
+		 * upstream and in GPDB except from FinishPreparedTransaction(), but
+		 * not required for correct functioning of the code.
 		 */
-		if (XLByteLE(proc->waitLSN, lastLSN))
+		if (proc->waitLSN < lastLSN)
 			return false;
 
 		lastLSN = proc->waitLSN;
@@ -717,34 +723,29 @@ SyncRepQueueIsOrderedByLSN(int mode)
 }
 #endif
 
-const char *
-check_synchronous_standby_names(const char *newval, bool doit, GucSource source)
+/*
+ * ===========================================================
+ * Synchronous Replication functions executed by any process
+ * ===========================================================
+ */
+
+bool
+check_synchronous_standby_names(char **newval, void **extra, GucSource source)
 {
 	char	   *rawstring;
 	List	   *elemlist;
 
 	/* Need a modifiable copy of string */
-	rawstring = strdup(newval);
-	if (rawstring == NULL)
-	{
-		ereport(GUC_complaint_elevel(source),
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of memory")));
-		return NULL;
-	}
+	rawstring = pstrdup(*newval);
 
 	/* Parse string into list of identifiers */
 	if (!SplitIdentifierString(rawstring, ',', &elemlist))
 	{
-		free(rawstring);
-		list_free(elemlist);
-
 		/* syntax error in list */
-		ereport(GUC_complaint_elevel(source),
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid list syntax for parameter \"synchronous_standby_names\"")));
-
-		return NULL;
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
 	}
 
 	/*
@@ -754,8 +755,26 @@ check_synchronous_standby_names(const char *newval, bool doit, GucSource source)
 	 * postmaster at startup, not WALSender, so the application_name is not
 	 * yet correctly set.
 	 */
-	free(rawstring);
+
+	pfree(rawstring);
 	list_free(elemlist);
 
-	return newval;
+	return true;
+}
+
+void
+assign_synchronous_commit(int newval, void *extra)
+{
+	switch (newval)
+	{
+		case SYNCHRONOUS_COMMIT_REMOTE_WRITE:
+			SyncRepWaitMode = SYNC_REP_WAIT_WRITE;
+			break;
+		case SYNCHRONOUS_COMMIT_REMOTE_FLUSH:
+			SyncRepWaitMode = SYNC_REP_WAIT_FLUSH;
+			break;
+		default:
+			SyncRepWaitMode = SYNC_REP_NO_WAIT;
+			break;
+	}
 }

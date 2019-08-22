@@ -5,12 +5,12 @@
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/view.c,v 1.110 2008/12/16 00:56:12 tgl Exp $
+ *	  src/backend/commands/view.c
  *
  *-------------------------------------------------------------------------
  */
@@ -31,11 +31,13 @@
 #include "parser/parse_relation.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteManip.h"
+#include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteSupport.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 
 #include "cdb/cdbdisp_query.h"
@@ -43,72 +45,38 @@
 
 
 static void checkViewTupleDesc(TupleDesc newdesc, TupleDesc olddesc);
-static bool isViewOnTempTable_walker(Node *node, void *context);
 
 /*---------------------------------------------------------------------
- * isViewOnTempTable
- *
- * Returns true iff any of the relations underlying this view are
- * temporary tables.
- *---------------------------------------------------------------------
+ * Validator for "check_option" reloption on views. The allowed values
+ * are "local" and "cascaded".
  */
-static bool
-isViewOnTempTable(Query *viewParse)
+void
+validateWithCheckOption(char *value)
 {
-	return isViewOnTempTable_walker((Node *) viewParse, NULL);
-}
-
-static bool
-isViewOnTempTable_walker(Node *node, void *context)
-{
-	if (node == NULL)
-		return false;
-
-	if (IsA(node, Query))
+	if (value == NULL ||
+		(pg_strcasecmp(value, "local") != 0 &&
+		 pg_strcasecmp(value, "cascaded") != 0))
 	{
-		Query	   *query = (Query *) node;
-		ListCell   *rtable;
-
-		foreach(rtable, query->rtable)
-		{
-			RangeTblEntry *rte = lfirst(rtable);
-
-			if (rte->rtekind == RTE_RELATION)
-			{
-				Relation	rel = heap_open(rte->relid, AccessShareLock);
-				bool		istemp = rel->rd_istemp;
-
-				heap_close(rel, AccessShareLock);
-				if (istemp)
-					return true;
-			}
-		}
-
-		return query_tree_walker(query,
-								 isViewOnTempTable_walker,
-								 context,
-								 QTW_IGNORE_JOINALIASES);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid value for \"check_option\" option"),
+				 errdetail("Valid values are \"local\" and \"cascaded\".")));
 	}
-
-	return expression_tree_walker(node,
-								  isViewOnTempTable_walker,
-								  context);
 }
 
 /*---------------------------------------------------------------------
  * DefineVirtualRelation
  *
- * Create the "view" relation. `DefineRelation' does all the work,
- * we just provide the correct arguments ... at least when we're
- * creating a view.  If we're updating an existing view, we have to
- * work harder.
+ * Create a view relation and use the rules system to store the query
+ * for the view.
  *---------------------------------------------------------------------
  */
 static Oid
-DefineVirtualRelation(const RangeVar *relation, List *tlist, bool replace)
+DefineVirtualRelation(RangeVar *relation, List *tlist, bool replace,
+					  List *options, Query *viewParse)
 {
-	Oid			viewOid,
-				namespaceId;
+	Oid			viewOid;
+	LOCKMODE	lockmode;
 	CreateStmt *createStmt = makeNode(CreateStmt);
 	List	   *attrList;
 	ListCell   *t;
@@ -122,21 +90,30 @@ DefineVirtualRelation(const RangeVar *relation, List *tlist, bool replace)
 	attrList = NIL;
 	foreach(t, tlist)
 	{
-		TargetEntry *tle = lfirst(t);
+		TargetEntry *tle = (TargetEntry *) lfirst(t);
 
 		if (!tle->resjunk)
 		{
-			ColumnDef  *def = makeNode(ColumnDef);
+			ColumnDef  *def = makeColumnDef(tle->resname,
+											exprType((Node *) tle->expr),
+											exprTypmod((Node *) tle->expr),
+										  exprCollation((Node *) tle->expr));
 
-			def->colname = pstrdup(tle->resname);
-			def->typeName = makeTypeNameFromOid(exprType((Node *) tle->expr),
-											 exprTypmod((Node *) tle->expr));
-			def->inhcount = 0;
-			def->is_local = true;
-			def->is_not_null = false;
-			def->raw_default = NULL;
-			def->cooked_default = NULL;
-			def->constraints = NIL;
+			/*
+			 * It's possible that the column is of a collatable type but the
+			 * collation could not be resolved, so double-check.
+			 */
+			if (type_is_collatable(exprType((Node *) tle->expr)))
+			{
+				if (!OidIsValid(def->collOid))
+					ereport(ERROR,
+							(errcode(ERRCODE_INDETERMINATE_COLLATION),
+							 errmsg("could not determine which collation to use for view column \"%s\"",
+									def->colname),
+							 errhint("Use the COLLATE clause to set the collation explicitly.")));
+			}
+			else
+				Assert(!OidIsValid(def->collOid));
 
 			attrList = lappend(attrList, def);
 		}
@@ -148,33 +125,30 @@ DefineVirtualRelation(const RangeVar *relation, List *tlist, bool replace)
 				 errmsg("view must have at least one column")));
 
 	/*
-	 * Check to see if we want to replace an existing view.
+	 * Look up, check permissions on, and lock the creation namespace; also
+	 * check for a preexisting view with the same name.  This will also set
+	 * relation->relpersistence to RELPERSISTENCE_TEMP if the selected
+	 * namespace is temporary.
 	 */
-	namespaceId = RangeVarGetCreationNamespace(relation);
-	viewOid = get_relname_relid(relation->relname, namespaceId);
+	lockmode = replace ? AccessExclusiveLock : NoLock;
+	(void) RangeVarGetAndCheckCreationNamespace(relation, lockmode, &viewOid);
 
 	if (OidIsValid(viewOid) && replace)
 	{
 		Relation	rel;
 		TupleDesc	descriptor;
+		List	   *atcmds = NIL;
+		AlterTableCmd *atcmd;
 
-		/*
-		 * Yes.  Get exclusive lock on the existing view ...
-		 */
-		rel = relation_open(viewOid, AccessExclusiveLock);
+		/* Relation is already locked, but we must build a relcache entry. */
+		rel = relation_open(viewOid, NoLock);
 
-		/*
-		 * Make sure it *is* a view, and do permissions checks.
-		 */
+		/* Make sure it *is* a view. */
 		if (rel->rd_rel->relkind != RELKIND_VIEW)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("\"%s\" is not a view",
 							RelationGetRelationName(rel))));
-
-		if (!pg_class_ownercheck(viewOid, GetUserId()))
-			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CLASS,
-						   RelationGetRelationName(rel));
 
 		/* Also check it's not in use already */
 		CheckTableNotInUse(rel, "CREATE OR REPLACE VIEW");
@@ -182,9 +156,9 @@ DefineVirtualRelation(const RangeVar *relation, List *tlist, bool replace)
 		/*
 		 * Due to the namespace visibility rules for temporary objects, we
 		 * should only end up replacing a temporary view with another
-		 * temporary view, and vice versa.
+		 * temporary view, and similarly for permanent views.
 		 */
-		Assert(relation->istemp == rel->rd_istemp);
+		Assert(relation->relpersistence == rel->rd_rel->relpersistence);
 
 		/*
 		 * Create a tuple descriptor to compare against the existing view, and
@@ -195,20 +169,21 @@ DefineVirtualRelation(const RangeVar *relation, List *tlist, bool replace)
 		checkViewTupleDesc(descriptor, rel->rd_att);
 
 		/*
- 		 * If new attributes have been added, we must add pg_attribute entries
+		 * If new attributes have been added, we must add pg_attribute entries
 		 * for them.  It is convenient (although overkill) to use the ALTER
 		 * TABLE ADD COLUMN infrastructure for this.
+		 *
+		 * Note that we must do this before updating the query for the view,
+		 * since the rules system requires that the correct view columns be in
+		 * place when defining the new rules.
 		 */
 		if (list_length(attrList) > rel->rd_att->natts)
 		{
-			List		*atcmds = NIL;
-			ListCell 	*c;
+			ListCell   *c;
 			int			skip = rel->rd_att->natts;
 
 			foreach(c, attrList)
 			{
-				AlterTableCmd *atcmd;
-
 				if (skip > 0)
 				{
 					skip--;
@@ -219,8 +194,39 @@ DefineVirtualRelation(const RangeVar *relation, List *tlist, bool replace)
 				atcmd->def = (Node *) lfirst(c);
 				atcmds = lappend(atcmds, atcmd);
 			}
+
 			AlterTableInternal(viewOid, atcmds, true);
+
+			/* Make the new view columns visible */
+			CommandCounterIncrement();
 		}
+
+		/*
+		 * Update the query for the view.
+		 *
+		 * Note that we must do this before updating the view options, because
+		 * the new options may not be compatible with the old view query (for
+		 * example if we attempt to add the WITH CHECK OPTION, we require that
+		 * the new view be automatically updatable, but the old view may not
+		 * have been).
+		 */
+		StoreViewQuery(viewOid, viewParse, replace);
+
+		/* Make the new view query visible */
+		CommandCounterIncrement();
+
+		/*
+		 * Finally update the view options.
+		 *
+		 * The new options list replaces the existing options list, even if
+		 * it's empty.
+		 */
+		atcmd = makeNode(AlterTableCmd);
+		atcmd->subtype = AT_ReplaceRelOptions;
+		atcmd->def = (Node *) options;
+		atcmds = list_make1(atcmd);
+
+		AlterTableInternal(viewOid, atcmds, true);
 
 		/*
 		 * Seems okay, so return the OID of the pre-existing view.
@@ -231,27 +237,39 @@ DefineVirtualRelation(const RangeVar *relation, List *tlist, bool replace)
 	}
 	else
 	{
+		Oid			relid;
+
 		/*
-		 * now set the parameters for keys/inheritance etc. All of these are
+		 * Set the parameters for keys/inheritance etc. All of these are
 		 * uninteresting for views...
 		 */
-		createStmt->relation = (RangeVar *) relation;
+		createStmt->relation = relation;
 		createStmt->tableElts = attrList;
 		createStmt->inhRelations = NIL;
 		createStmt->inhOids = NIL;
 		createStmt->parentOidCount = 0;
 		createStmt->constraints = NIL;
-		createStmt->options = list_make1(defWithOids(false));
+		createStmt->options = options;
 		createStmt->oncommit = ONCOMMIT_NOOP;
 		createStmt->tablespacename = NULL;
 		createStmt->relKind = RELKIND_VIEW;
+		createStmt->if_not_exists = false;
 
 		/*
-		 * finally create the relation (this will error out if there's an
-		 * existing view, so we don't need more code to complain if "replace"
-		 * is false).
+		 * Create the relation (this will error out if there's an existing
+		 * view, so we don't need more code to complain if "replace" is
+		 * false).
 		 */
-		return DefineRelation(createStmt, RELKIND_VIEW, RELSTORAGE_VIRTUAL, false);
+		relid = DefineRelation(createStmt, RELKIND_VIEW, InvalidOid, RELSTORAGE_VIRTUAL, false, true, NULL);
+		Assert(relid != InvalidOid);
+
+		/* Make the new view relation visible */
+		CommandCounterIncrement();
+
+		/* Store the query for the view */
+		StoreViewQuery(relid, viewParse, replace);
+
+		return relid;
 	}
 }
 
@@ -286,9 +304,9 @@ checkViewTupleDesc(TupleDesc newdesc, TupleDesc olddesc)
 		if (strcmp(NameStr(newattr->attname), NameStr(oldattr->attname)) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-					 errmsg("cannot change name of view column \"%s\" to \"%s\"",
-							NameStr(oldattr->attname),
-							NameStr(newattr->attname))));
+				 errmsg("cannot change name of view column \"%s\" to \"%s\"",
+						NameStr(oldattr->attname),
+						NameStr(newattr->attname))));
 		/* XXX would it be safe to allow atttypmod to change?  Not sure */
 		if (newattr->atttypid != oldattr->atttypid ||
 			newattr->atttypmod != oldattr->atttypmod)
@@ -356,11 +374,11 @@ UpdateRangeTableOfViewParse(Oid viewOid, Query *viewParse)
 			   *rt_entry2;
 
 	/*
-	 * Make a copy of the given parsetree.	It's not so much that we don't
+	 * Make a copy of the given parsetree.  It's not so much that we don't
 	 * want to scribble on our input, it's that the parser has a bad habit of
 	 * outputting multiple links to the same subtree for constructs like
 	 * BETWEEN, and we mustn't have OffsetVarNodes increment the varno of a
-	 * Var node twice.	copyObject will expand any multiply-referenced subtree
+	 * Var node twice.  copyObject will expand any multiply-referenced subtree
 	 * into multiple copies.
 	 */
 	viewParse = (Query *) copyObject(viewParse);
@@ -373,10 +391,10 @@ UpdateRangeTableOfViewParse(Oid viewOid, Query *viewParse)
 	 * OLD first, then NEW....
 	 */
 	rt_entry1 = addRangeTableEntryForRelation(NULL, viewRel,
-											  makeAlias("*OLD*", NIL),
+											  makeAlias("old", NIL),
 											  false, false);
 	rt_entry2 = addRangeTableEntryForRelation(NULL, viewRel,
-											  makeAlias("*NEW*", NIL),
+											  makeAlias("new", NIL),
 											  false, false);
 	/* Must override addRangeTableEntry's default access-check flags */
 	rt_entry1->requiredPerms = 0;
@@ -400,13 +418,15 @@ UpdateRangeTableOfViewParse(Oid viewOid, Query *viewParse)
  * DefineView
  *		Execute a CREATE VIEW command.
  */
-void
+Oid
 DefineView(ViewStmt *stmt, const char *queryString)
 {
 	Query	   *viewParse_orig;
 	Query	   *viewParse;
 	Oid			viewOid;
 	RangeVar   *view;
+	ListCell   *cell;
+	bool		check_option;
 
 	/*
 	 * Run parse analysis to convert the raw parse tree to a Query.  Note this
@@ -427,10 +447,28 @@ DefineView(ViewStmt *stmt, const char *queryString)
 
 	/*
 	 * The grammar should ensure that the result is a single SELECT Query.
+	 * However, it doesn't forbid SELECT INTO, so we have to check for that.
 	 */
-	if (!IsA(viewParse, Query) ||
-		viewParse->commandType != CMD_SELECT)
+	if (!IsA(viewParse, Query))
 		elog(ERROR, "unexpected parse analysis result");
+	if (viewParse->utilityStmt != NULL &&
+		IsA(viewParse->utilityStmt, CreateTableAsStmt))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("views must not contain SELECT INTO")));
+	if (viewParse->commandType != CMD_SELECT ||
+		viewParse->utilityStmt != NULL)
+		elog(ERROR, "unexpected parse analysis result");
+
+	/*
+	 * Check for unsupported cases.  These tests are redundant with ones in
+	 * DefineQueryRewrite(), but that function will complain about a bogus ON
+	 * SELECT rule, and we'd rather the message complain about a view.
+	 */
+	if (viewParse->hasModifyingCTE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		errmsg("views must not contain data-modifying statements in WITH")));
 
 	/*
 	 * Don't allow creating a view that contains dynamically typed functions.
@@ -442,6 +480,49 @@ DefineView(ViewStmt *stmt, const char *queryString)
 				(errcode(ERRCODE_INDETERMINATE_DATATYPE),
 				 errmsg("CREATE VIEW statements cannot include calls to "
 						"dynamically typed function")));
+
+	/*
+	 * If the user specified the WITH CHECK OPTION, add it to the list of
+	 * reloptions.
+	 */
+	if (stmt->withCheckOption == LOCAL_CHECK_OPTION)
+		stmt->options = lappend(stmt->options,
+								makeDefElem("check_option",
+											(Node *) makeString("local")));
+	else if (stmt->withCheckOption == CASCADED_CHECK_OPTION)
+		stmt->options = lappend(stmt->options,
+								makeDefElem("check_option",
+											(Node *) makeString("cascaded")));
+
+	/*
+	 * Check that the view is auto-updatable if WITH CHECK OPTION was
+	 * specified.
+	 */
+	check_option = false;
+
+	foreach(cell, stmt->options)
+	{
+		DefElem    *defel = (DefElem *) lfirst(cell);
+
+		if (pg_strcasecmp(defel->defname, "check_option") == 0)
+			check_option = true;
+	}
+
+	/*
+	 * If the check option is specified, look to see if the view is actually
+	 * auto-updatable or not.
+	 */
+	if (check_option)
+	{
+		const char *view_updatable_error =
+		view_query_is_auto_updatable(viewParse, true);
+
+		if (view_updatable_error)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("WITH CHECK OPTION is supported only on automatically updatable views"),
+					 errhint("%s", _(view_updatable_error))));
+	}
 
 	/*
 	 * If a list of column names was given, run through and insert these into
@@ -473,17 +554,23 @@ DefineView(ViewStmt *stmt, const char *queryString)
 							"names than columns")));
 	}
 
+	/* Unlogged views are not sensible. */
+	if (stmt->view->relpersistence == RELPERSISTENCE_UNLOGGED)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+		errmsg("views cannot be unlogged because they do not have storage")));
+
 	/*
 	 * If the user didn't explicitly ask for a temporary view, check whether
-	 * we need one implicitly.	We allow TEMP to be inserted automatically as
+	 * we need one implicitly.  We allow TEMP to be inserted automatically as
 	 * long as the CREATE command is consistent with that --- no explicit
 	 * schema name.
 	 */
-	view = stmt->view;
-	if (!view->istemp && isViewOnTempTable(viewParse))
+	view = copyObject(stmt->view);		/* don't corrupt original command */
+	if (view->relpersistence == RELPERSISTENCE_PERMANENT
+		&& isQueryUsingTempRelation(viewParse))
 	{
-		view = copyObject(view);	/* don't corrupt original command */
-		view->istemp = true;
+		view->relpersistence = RELPERSISTENCE_TEMP;
 		if (Gp_role != GP_ROLE_EXECUTE)
 			ereport(NOTICE,
 					(errmsg("view \"%s\" will be a temporary view",
@@ -497,25 +584,7 @@ DefineView(ViewStmt *stmt, const char *queryString)
 	 * aborted.
 	 */
 	viewOid = DefineVirtualRelation(view, viewParse->targetList,
-									stmt->replace);
-
-	/*
-	 * The relation we have just created is not visible to any other commands
-	 * running with the same transaction & command id. So, increment the
-	 * command id counter (but do NOT pfree any memory!!!!)
-	 */
-	CommandCounterIncrement();
-
-	/*
-	 * The range table of 'viewParse' does not contain entries for the "OLD"
-	 * and "NEW" relations. So... add them!
-	 */
-	viewParse = UpdateRangeTableOfViewParse(viewOid, viewParse);
-
-	/*
-	 * Now create the rules associated with the view.
-	 */
-	DefineViewRules(viewOid, viewParse, stmt->replace);
+									stmt->replace, stmt->options, viewParse);
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
@@ -528,4 +597,24 @@ DefineView(ViewStmt *stmt, const char *queryString)
 									GetAssignedOidsForDispatch(),
 									NULL);
 	}
+
+	return viewOid;
+}
+
+/*
+ * Use the rules system to store the query for the view.
+ */
+void
+StoreViewQuery(Oid viewOid, Query *viewParse, bool replace)
+{
+	/*
+	 * The range table of 'viewParse' does not contain entries for the "OLD"
+	 * and "NEW" relations. So... add them!
+	 */
+	viewParse = UpdateRangeTableOfViewParse(viewOid, viewParse);
+
+	/*
+	 * Now create the rules associated with the view.
+	 */
+	DefineViewRules(viewOid, viewParse, replace);
 }

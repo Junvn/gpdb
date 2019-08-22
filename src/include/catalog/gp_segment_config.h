@@ -35,10 +35,6 @@
 #define GP_SEGMENT_CONFIGURATION_MODE_INSYNC 's'
 #define GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC 'n'
 
-#define GP_SEGMENT_CONFIGURATION_MODE_CHANGETRACKING 'c'
-#define GP_SEGMENT_CONFIGURATION_MODE_RESYNC 'r'
-
-
 /* ----------------
  *		gp_segment_configuration definition.  cpp turns this into
  *		typedef struct FormData_gp_segment_configuration
@@ -48,19 +44,21 @@
 
 CATALOG(gp_segment_configuration,5036) BKI_SHARED_RELATION BKI_WITHOUT_OIDS
 {
-	int2		dbid;				/* up to 32767 segment databases */
-	int2		content;			/* up to 32767 contents -- only 16384 usable with mirroring (see dbid) */
+	int16		dbid;				/* up to 32767 segment databases */
+	int16		content;			/* up to 32767 contents -- only 16384 usable with mirroring (see dbid) */
 
-	char		role;				
-	char		preferred_role;		
-	char		mode;				
-	char		status;				
-	int4		port;				
+	char		role;
+	char		preferred_role;
+	char		mode;
+	char		status;
+	int32		port;
 
-	text		hostname;			
-	text		address;			
+#ifdef CATALOG_VARLEN
+	text		hostname;
+	text		address;
 
-	int4		replication_port;	
+	text		datadir;
+#endif
 } FormData_gp_segment_configuration;
 
 /* no foreign keys */
@@ -87,7 +85,7 @@ typedef FormData_gp_segment_configuration *Form_gp_segment_configuration;
 #define Anum_gp_segment_configuration_port				7
 #define Anum_gp_segment_configuration_hostname			8
 #define Anum_gp_segment_configuration_address			9
-#define Anum_gp_segment_configuration_replication_port	10
+#define Anum_gp_segment_configuration_datadir			10
 
 extern bool gp_segment_config_has_mirrors(void);
 

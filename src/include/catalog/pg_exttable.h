@@ -39,16 +39,15 @@ CATALOG(pg_exttable,6040) BKI_WITHOUT_OIDS
 	text	fmtopts;			/* the data format options */
 	text	options[1];			/* the array of external table options */
 	text	command;			/* the command string to EXECUTE */
-	int4	rejectlimit;		/* error count reject limit per segment */
+	int32	rejectlimit;		/* error count reject limit per segment */
 	char	rejectlimittype;	/* 'r' (rows) or 'p' (percent) */
-	Oid		fmterrtbl;			/* the data format error table oid in pg_class */
-	int4	encoding;			/* character encoding of this external table */
+	bool	logerrors;			/* 't' to log errors into file */
+	int32	encoding;			/* character encoding of this external table */
 	bool	writable;			/* 't' if writable, 'f' if readable */
 } FormData_pg_exttable;
 
 /* GPDB added foreign key definitions for gpcheckcat. */
 FOREIGN_KEY(reloid REFERENCES pg_class(oid));
-FOREIGN_KEY(fmterrtbl REFERENCES pg_class(oid));
 
 /* ----------------
  *		Form_pg_exttable corresponds to a pointer to a tuple with
@@ -72,7 +71,7 @@ typedef FormData_pg_exttable *Form_pg_exttable;
 #define Anum_pg_exttable_command			7
 #define Anum_pg_exttable_rejectlimit		8
 #define Anum_pg_exttable_rejectlimittype	9
-#define Anum_pg_exttable_fmterrtbl			10
+#define Anum_pg_exttable_logerrors			10
 #define Anum_pg_exttable_encoding			11
 #define Anum_pg_exttable_writable			12
 
@@ -91,7 +90,7 @@ typedef struct ExtTableEntry
 	char*	command;
 	int		rejectlimit;
 	char	rejectlimittype;
-	Oid		fmterrtbl;
+	bool	logerrors;
     int		encoding;
     bool	iswritable;
     bool	isweb;		/* extra state, not cataloged */
@@ -101,13 +100,12 @@ typedef struct ExtTableEntry
 
 extern void InsertExtTableEntry(Oid 	tbloid,
 					bool 	iswritable,
-					bool 	isweb,
 					bool	issreh,
 					char	formattype,
 					char	rejectlimittype,
 					char*	commandString,
 					int		rejectlimit,
-					Oid		fmtErrTblOid,
+					bool	logerrors,
 					int		encoding,
 					Datum	formatOptStr,
 					Datum	optionsStr,
@@ -119,9 +117,7 @@ extern ExtTableEntry *GetExtTableEntryIfExists(Oid relid);
 
 extern void RemoveExtTableEntry(Oid relid);
 
-#define fmttype_is_custom(c) (c == 'b' || c == 'a' || c == 'p')
-#define fmttype_is_avro(c) (c == 'a')
-#define fmttype_is_parquet(c) (c == 'p')
+#define fmttype_is_custom(c) (c == 'b')
 #define fmttype_is_text(c)   (c == 't')
 #define fmttype_is_csv(c)    (c == 'c')
 

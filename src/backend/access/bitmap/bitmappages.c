@@ -58,8 +58,6 @@ _bitmap_getbuf(Relation rel, BlockNumber blkno, int access)
 {
 	Buffer buf;
 
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
-
 	if (blkno != P_NEW)
 	{
 		buf = ReadBuffer(rel, blkno);
@@ -110,8 +108,6 @@ _bitmap_getbuf(Relation rel, BlockNumber blkno, int access)
 void
 _bitmap_wrtbuf(Buffer buf)
 {
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
-
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
 }
@@ -122,8 +118,6 @@ _bitmap_wrtbuf(Buffer buf)
 void
 _bitmap_relbuf(Buffer buf)
 {
-	MIRROREDLOCK_BUFMGR_MUST_ALREADY_BE_HELD;
-
 	UnlockReleaseBuffer(buf);
 }
 
@@ -145,15 +139,11 @@ _bitmap_init_lovpage(Relation rel __attribute__((unused)), Buffer buf)
  * _bitmap_init_bitmappage() -- initialize a new page to store the bitmap.
  */
 void
-_bitmap_init_bitmappage(Relation rel __attribute__((unused)), Buffer buf)
+_bitmap_init_bitmappage(Page page)
 {
-	Page			page;
 	BMBitmapOpaque	opaque;
 
-	page = (Page) BufferGetPage(buf);
-
-	if(PageIsNew(page))
-		PageInit(page, BufferGetPageSize(buf), sizeof(BMBitmapOpaqueData));
+	PageInit(page, BLCKSZ, sizeof(BMBitmapOpaqueData));
 
 	/* even though page may not be new, reset all values */
 	opaque = (BMBitmapOpaque) PageGetSpecialPointer(page);
@@ -169,8 +159,6 @@ _bitmap_init_bitmappage(Relation rel __attribute__((unused)), Buffer buf)
 void
 _bitmap_init_buildstate(Relation index, BMBuildState *bmstate)
 {
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
 	BMMetaPage	mp;
 	HASHCTL		hash_ctl;
 	int			hash_flags;
@@ -185,10 +173,7 @@ _bitmap_init_buildstate(Relation index, BMBuildState *bmstate)
 	bmstate->bm_tidLocsBuffer->byte_size = 0;
 	bmstate->bm_tidLocsBuffer->lov_blocks = NIL;
 	bmstate->bm_tidLocsBuffer->max_lov_block = InvalidBlockNumber;
-	
-	// -------- MirroredLock ----------
-	MIRROREDLOCK_BUFMGR_LOCK;
-	
+
 	metabuf = _bitmap_getbuf(index, BM_METAPAGE, BM_READ);
 	mp = _bitmap_get_metapage_data(index, metabuf);
 	_bitmap_open_lov_heapandindex(index, mp, &(bmstate->bm_lov_heap),
@@ -196,9 +181,6 @@ _bitmap_init_buildstate(Relation index, BMBuildState *bmstate)
 								  RowExclusiveLock);
 
 	_bitmap_relbuf(metabuf);
-	
-	MIRROREDLOCK_BUFMGR_UNLOCK;
-	// -------- MirroredLock ----------
 	
 	cur_bmbuild = (BMBuildHashData *)palloc(sizeof(BMBuildHashData));
 	cur_bmbuild->hash_funcs = (FmgrInfo *)
@@ -215,21 +197,23 @@ _bitmap_init_buildstate(Relation index, BMBuildState *bmstate)
 		Oid			eq_function;
 		Oid			left_hash_function;
 		Oid			right_hash_function;
+		bool		hashable;
 
 		get_sort_group_operators(typid,
 								 false, true, false,
-								 NULL, &eq_opr, NULL);
-
-		eq_function = get_opcode(eq_opr);
-
-		if (!get_op_hash_functions(eq_opr,
-								   &left_hash_function,
-								   &right_hash_function))
+								 NULL, &eq_opr, NULL, &hashable);
+		if (!hashable)
 		{
 			pfree(cur_bmbuild);
 			cur_bmbuild = NULL;
 			break;
 		}
+
+		eq_function = get_opcode(eq_opr);
+		if (!get_op_hash_functions(eq_opr,
+								   &left_hash_function,
+								   &right_hash_function))
+			elog(ERROR, "could not find hash functions for operator %u", eq_opr);
 
 		Assert(left_hash_function == right_hash_function);
 		fmgr_info(eq_function, &cur_bmbuild->eq_funcs[i]);
@@ -291,18 +275,25 @@ _bitmap_init_buildstate(Relation index, BMBuildState *bmstate)
 
 			get_sort_group_operators(atttypid,
 									 false, true, false,
-									 NULL, &eq_opr, NULL);
+									 NULL, &eq_opr, NULL, NULL);
 			opfuncid = get_opcode(eq_opr);
 
-			ScanKeyEntryInitialize(&(bmstate->bm_lov_scanKeys[attno]), SK_ISNULL, 
-							   attno + 1, BTEqualStrategyNumber, InvalidOid, 
-							   opfuncid, 0);
+			ScanKeyEntryInitialize(&(bmstate->bm_lov_scanKeys[attno]),
+								   SK_ISNULL,
+								   attno + 1,
+								   BTEqualStrategyNumber,
+								   InvalidOid,
+								   bmstate->bm_lov_index->rd_indcollation[attno],
+								   opfuncid, 0);
 		}
 
 		bmstate->bm_lov_scanDesc = index_beginscan(bmstate->bm_lov_heap,
 							 bmstate->bm_lov_index, GetActiveSnapshot(), 
 							 bmstate->bm_tupDesc->natts,
-							 bmstate->bm_lov_scanKeys);
+							 0);
+		index_rescan(bmstate->bm_lov_scanDesc,
+					 bmstate->bm_lov_scanKeys, bmstate->bm_tupDesc->natts,
+					 NULL, 0);
 	}
 
 	/*
@@ -311,7 +302,7 @@ _bitmap_init_buildstate(Relation index, BMBuildState *bmstate)
 	 * writes page to the shared buffer, we can't disable WAL archiving.
 	 * We will add this shortly.
 	 */	
-	bmstate->use_wal = !index->rd_istemp;
+	bmstate->use_wal = RelationNeedsWAL(index);
 }
 
 /*
@@ -357,12 +348,16 @@ _bitmap_cleanup_buildstate(Relation index, BMBuildState *bmstate)
  * Create the meta page, a new heap which stores the distinct values for
  * the attributes to be indexed, a btree index on this new heap for searching
  * those distinct values, and the first LOV page.
+ *
+ * for_empty: true means build for '_init' file.
+ * Create bitmap index for a 'unlogged' table will call bmbuildempty(), which
+ * initialize the meta page and first LOV page for INIT_FORKNUM (the '_init' file).
+ * As bmbuildempty() is called after bmbuild(), it's safe to get the OIDs of the
+ * new heap and its index from meta page through GetBitmapIndexAuxOids().
  */
 void
-_bitmap_init(Relation indexrel, bool use_wal)
+_bitmap_init(Relation indexrel, bool use_wal, bool for_empty)
 {
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
 	BMMetaPage		metapage;
 	Buffer			metabuf;
 	Page			page;
@@ -373,25 +368,28 @@ _bitmap_init(Relation indexrel, bool use_wal)
 	OffsetNumber	o;
 	Oid			lovHeapOid;
 	Oid			lovIndexOid;
+	ForkNumber	fork;
+
+	fork = for_empty ?  INIT_FORKNUM : MAIN_FORKNUM;
 
 	/* sanity check */
-	if (RelationGetNumberOfBlocks(indexrel) != 0)
+	if (RelationGetNumberOfBlocksInFork(indexrel, fork) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				errmsg("cannot initialize non-empty bitmap index \"%s\"",
-				RelationGetRelationName(indexrel)),
-				errSendAlert(true)));
-	
-	// -------- MirroredLock ----------
-	MIRROREDLOCK_BUFMGR_LOCK;
-	
+				RelationGetRelationName(indexrel))));
+
 	/* create the metapage */
-	metabuf = _bitmap_getbuf(indexrel, P_NEW, BM_WRITE);
+	metabuf = ReadBufferExtended(indexrel, fork, P_NEW, RBM_NORMAL, NULL);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(metabuf);
 	Assert(PageIsNew(page));
 
 	/* initialize the LOV metadata */
-	_bitmap_create_lov_heapandindex(indexrel, &lovHeapOid, &lovIndexOid);
+	if (for_empty)
+		GetBitmapIndexAuxOids(indexrel, &lovHeapOid, &lovIndexOid);
+	else
+		_bitmap_create_lov_heapandindex(indexrel, &lovHeapOid, &lovIndexOid);
 
 	START_CRIT_SECTION();
 
@@ -407,10 +405,11 @@ _bitmap_init(Relation indexrel, bool use_wal)
 	metapage->bm_lov_indexId = lovIndexOid;
 
 	if (use_wal)
-		_bitmap_log_metapage(indexrel, page);
+		_bitmap_log_metapage(indexrel, fork, page);
 
 	/* allocate the first LOV page. */
-	buf = _bitmap_getbuf(indexrel, P_NEW, BM_WRITE);
+	buf = ReadBufferExtended(indexrel, fork, P_NEW, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	_bitmap_init_lovpage(indexrel, buf);
 
 	MarkBufferDirty(buf);
@@ -437,16 +436,13 @@ _bitmap_init(Relation indexrel, bool use_wal)
 	metapage->bm_lov_lastpage = BufferGetBlockNumber(buf);
 
 	if(use_wal)
-		_bitmap_log_lovitem(indexrel, buf, newOffset, lovItem, metabuf, true);
+		_bitmap_log_lovitem(indexrel, fork, buf, newOffset, lovItem, metabuf, true);
 
 	END_CRIT_SECTION();
 
 	_bitmap_wrtbuf(buf);
 	_bitmap_wrtbuf(metabuf);
-	
-	MIRROREDLOCK_BUFMGR_UNLOCK;
-	// -------- MirroredLock ----------
-	
+
 	pfree(lovItem);
 }
 

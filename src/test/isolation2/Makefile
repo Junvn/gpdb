@@ -20,7 +20,10 @@ endif
 override CPPFLAGS := -I$(srcdir) -I$(libpq_srcdir) -I$(srcdir)/../regress $(CPPFLAGS)
 override LDLIBS := $(libpq_pgport) $(LDLIBS)
 
-all: pg_isolation2_regress$(X) all-lib
+all: test_python pg_isolation2_regress$(X) all-lib
+
+test_python:
+	python helpers_test.py
 
 pg_regress.o:
 	$(MAKE) -C $(top_builddir)/src/test/regress pg_regress.o
@@ -50,11 +53,10 @@ clean distclean:
 	rm -f gpstringsubs.pl gpdiff.pl atmsort.pm explain.pm
 	rm -rf $(pg_regress_clean_files)
 
-installcheck: all gpdiff.pl gpstringsubs.pl
-	./pg_isolation2_regress --init-file=$(top_builddir)/src/test/regress/init_file --init-file=./init_file_isolation2 --psqldir='$(PSQLDIR)' --inputdir=$(srcdir) --ao-dir=uao --schedule=$(srcdir)/isolation2_schedule
+install: all gpdiff.pl gpstringsubs.pl
 
-installcheck-resgroup: all gpdiff.pl gpstringsubs.pl prepare_dblink_sql
-	./pg_isolation2_regress --init-file=$(top_builddir)/src/test/regress/init_file --init-file=./init_file_resgroup --psqldir='$(PSQLDIR)' --inputdir=$(srcdir) --resgroup-dir=resgroup --dbname=isolation2resgrouptest --schedule=$(srcdir)/isolation2_resgroup_schedule
+installcheck: install
+	./pg_isolation2_regress $(EXTRA_REGRESS_OPTS) --init-file=$(top_builddir)/src/test/regress/init_file --init-file=./init_file_isolation2 --psqldir='$(PSQLDIR)' --inputdir=$(srcdir) --ao-dir=uao --load-extension=gp_inject_fault --schedule=$(srcdir)/isolation2_schedule
 
-prepare_dblink_sql:
-	cp $(GPHOME)/share/postgresql/contrib/dblink.sql ./sql/resgroup/dblink.sql
+installcheck-resgroup: install
+	./pg_isolation2_regress $(EXTRA_REGRESS_OPTS) --init-file=$(top_builddir)/src/test/regress/init_file --init-file=./init_file_resgroup --psqldir='$(PSQLDIR)' --inputdir=$(srcdir) --dbname=isolation2resgrouptest --load-extension=gp_inject_fault --schedule=$(srcdir)/isolation2_resgroup_schedule

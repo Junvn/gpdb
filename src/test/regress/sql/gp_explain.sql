@@ -15,13 +15,13 @@ begin
 end;
 $$ language plpgsql;
 
--- Same, for EXPLAIN ANALYZE
+-- Same, for EXPLAIN ANALYZE VERBOSE
 create or replace function get_explain_analyze_output(explain_query text) returns setof text as
 $$
 declare
   explainrow text;
 begin
-  for explainrow in execute 'EXPLAIN ANALYZE ' || explain_query
+  for explainrow in execute 'EXPLAIN (ANALYZE, VERBOSE) ' || explain_query
   loop
     return next explainrow;
   end loop;
@@ -48,6 +48,17 @@ SELECT COUNT(*) from
 WHERE et like '%Memory: %';
 
 reset explain_memory_verbosity;
+
+EXPLAIN ANALYZE SELECT id FROM 
+( SELECT id 
+	FROM explaintest
+	WHERE id > (
+		SELECT avg(id)
+		FROM explaintest
+	)
+) as foo
+ORDER BY id
+LIMIT 1;
 
 
 -- Verify that the column references are OK. This tests for an old ORCA bug,
@@ -96,12 +107,49 @@ WHERE et like '%Filter: %';
 --
 create table foo (a int) distributed randomly;
 -- "outer", "inner" prefix must also be prefixed to variable name as length of rtable > 1
-SELECT * from
+SELECT trim(et) et from
 get_explain_output($$ 
 	select * from (values (1)) as f(a) join (values(2)) b(b) on a = b join foo on true join foo as foo2 on true $$) as et
-WHERE et like '%Hash Cond:%';
+WHERE et like '%Join Filter:%' or et like '%Hash Cond:%';
 
-SELECT * from
+SELECT trim(et) et from
 get_explain_output($$
 	select * from (values (1)) as f(a) join (values(2)) b(b) on a = b$$) as et
 WHERE et like '%Hash Cond:%';
+
+--
+-- Test EXPLAINing of the Partition By in a window function. (PostgreSQL
+-- doesn't print it at all.)
+--
+explain (costs off) select count(*) over (partition by g) from generate_series(1, 10) g;
+
+
+--
+-- Test non-text format with a few queries that contain GPDB-specific node types.
+--
+
+-- The default init_file rules contain a line to mask this out in normal
+-- text-format EXPLAIN output, but it doesn't catch these alternative formats.
+-- start_matchignore
+-- m/Optimizer.*Pivotal Optimizer \(GPORCA\) version .*/
+-- end_matchignore
+
+CREATE EXTERNAL WEB TABLE dummy_ext_tab (x text) EXECUTE 'echo foo' FORMAT 'text';
+
+-- External Table Scan
+explain (format json, costs off) SELECT * FROM dummy_ext_tab;
+
+-- Seq Scan on an append-only table
+CREATE TEMP TABLE dummy_aotab (x int4) WITH (appendonly=true);
+explain (format yaml, costs off) SELECT * FROM dummy_aotab;
+
+-- DML node (with ORCA)
+explain (format xml, costs off) insert into dummy_aotab values (1);
+
+-- github issues 5795. explain fails previously.
+explain SELECT * from information_schema.key_column_usage;
+
+-- github issue 5794.
+set gp_enable_explain_allstat=on;
+explain analyze SELECT * FROM explaintest;
+set gp_enable_explain_allstat=DEFAULT;

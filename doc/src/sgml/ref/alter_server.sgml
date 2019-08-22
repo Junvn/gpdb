@@ -1,11 +1,16 @@
 <!--
-$PostgreSQL: pgsql/doc/src/sgml/ref/alter_server.sgml,v 1.1 2008/12/19 16:25:16 petere Exp $
+doc/src/sgml/ref/alter_server.sgml
 PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERSERVER">
+ <indexterm zone="sql-alterserver">
+  <primary>ALTER SERVER</primary>
+ </indexterm>
+
  <refmeta>
-  <refentrytitle id="sql-alterserver-title">ALTER SERVER</refentrytitle>
+  <refentrytitle>ALTER SERVER</refentrytitle>
+  <manvolnum>7</manvolnum>
   <refmiscinfo>SQL - Language Statements</refmiscinfo>
  </refmeta>
 
@@ -14,15 +19,12 @@ PostgreSQL documentation
   <refpurpose>change the definition of a foreign server</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-alterserver">
-  <primary>ALTER SERVER</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-ALTER SERVER <replaceable class="parameter">servername</replaceable> [ VERSION 'newversion' ]
+ALTER SERVER <replaceable class="parameter">name</replaceable> [ VERSION '<replaceable class="parameter">new_version</replaceable>' ]
     [ OPTIONS ( [ ADD | SET | DROP ] <replaceable class="PARAMETER">option</replaceable> ['<replaceable class="PARAMETER">value</replaceable>'] [, ... ] ) ]
-ALTER SERVER <replaceable class="PARAMETER">servername</replaceable> OWNER TO <replaceable>new_owner</replaceable>
+ALTER SERVER <replaceable class="PARAMETER">name</replaceable> OWNER TO <replaceable>new_owner</replaceable>
+ALTER SERVER <replaceable class="PARAMETER">name</replaceable> RENAME TO <replaceable>new_name</replaceable>
 </synopsis>
  </refsynopsisdiv>
 
@@ -51,7 +53,7 @@ ALTER SERVER <replaceable class="PARAMETER">servername</replaceable> OWNER TO <r
 
   <variablelist>
    <varlistentry>
-    <term><replaceable class="parameter">servername</replaceable></term>
+    <term><replaceable class="parameter">name</replaceable></term>
     <listitem>
      <para>
       The name of an existing server.
@@ -60,7 +62,7 @@ ALTER SERVER <replaceable class="PARAMETER">servername</replaceable> OWNER TO <r
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">serverversion</replaceable></term>
+    <term><replaceable class="parameter">new_version</replaceable></term>
     <listitem>
      <para>
       New server version.
@@ -78,6 +80,24 @@ ALTER SERVER <replaceable class="PARAMETER">servername</replaceable> OWNER TO <r
       if no operation is explicitly specified.  Option names must be
       unique; names and values are also validated using the server's
       foreign-data wrapper library.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="PARAMETER">new_owner</replaceable></term>
+    <listitem>
+     <para>
+      The user name of the new owner of the foreign server.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">new_name</replaceable></term>
+    <listitem>
+     <para>
+      The new name for the foreign server.
      </para>
     </listitem>
    </varlistentry>
@@ -99,8 +119,7 @@ ALTER SERVER foo OPTIONS (host 'foo', dbname 'foodb');
    change <literal>host</> option:
 <programlisting>
 ALTER SERVER foo VERSION '8.4' OPTIONS (SET host 'baz');
-</programlisting>
-  </para>
+</programlisting></para>
  </refsect1>
 
  <refsect1>
@@ -108,6 +127,8 @@ ALTER SERVER foo VERSION '8.4' OPTIONS (SET host 'baz');
 
   <para>
    <command>ALTER SERVER</command> conforms to ISO/IEC 9075-9 (SQL/MED).
+   The <literal>OWNER TO</literal> and <literal>RENAME</literal> forms are
+   PostgreSQL extensions.
   </para>
  </refsect1>
 
@@ -115,8 +136,8 @@ ALTER SERVER foo VERSION '8.4' OPTIONS (SET host 'baz');
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-createserver" endterm="sql-createserver-title"></member>
-   <member><xref linkend="sql-dropserver" endterm="sql-dropserver-title"></member>
+   <member><xref linkend="sql-createserver"></member>
+   <member><xref linkend="sql-dropserver"></member>
   </simplelist>
  </refsect1>
 

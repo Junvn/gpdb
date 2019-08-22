@@ -4,18 +4,17 @@
  *	 Cleanup query from NOT values and/or stopword
  *	 Utility functions to correct work.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/tsquery_cleanup.c,v 1.10 2008/01/01 19:45:53 momjian Exp $
+ *	  src/backend/utils/adt/tsquery_cleanup.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
-#include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
 #include "miscadmin.h"
 
@@ -34,13 +33,16 @@ maketree(QueryItem *in)
 {
 	NODE	   *node = (NODE *) palloc(sizeof(NODE));
 
+	/* since this function recurses, it could be driven to stack overflow. */
+	check_stack_depth();
+
 	node->valnode = in;
 	node->right = node->left = NULL;
 	if (in->type == QI_OPR)
 	{
 		node->right = maketree(in + 1);
-		if (in->operator.oper != OP_NOT)
-			node->left = maketree(in + in->operator.left);
+		if (in->qoperator.oper != OP_NOT)
+			node->left = maketree(in + in->qoperator.left);
 	}
 	return node;
 }
@@ -69,9 +71,9 @@ plainnode(PLAINTREE *state, NODE *node)
 	memcpy((void *) &(state->ptr[state->cur]), (void *) node->valnode, sizeof(QueryItem));
 	if (node->valnode->type == QI_VAL)
 		state->cur++;
-	else if (node->valnode->operator.oper == OP_NOT)
+	else if (node->valnode->qoperator.oper == OP_NOT)
 	{
-		state->ptr[state->cur].operator.left = 1;
+		state->ptr[state->cur].qoperator.left = 1;
 		state->cur++;
 		plainnode(state, node->right);
 	}
@@ -81,7 +83,7 @@ plainnode(PLAINTREE *state, NODE *node)
 
 		state->cur++;
 		plainnode(state, node->right);
-		state->ptr[cur].operator.left = state->cur - cur;
+		state->ptr[cur].qoperator.left = state->cur - cur;
 		plainnode(state, node->left);
 	}
 	pfree(node);
@@ -125,7 +127,7 @@ freetree(NODE *node)
 
 /*
  * clean tree for ! operator.
- * It's usefull for debug, but in
+ * It's useful for debug, but in
  * other case, such view is used with search in index.
  * Operator ! always return TRUE
  */
@@ -138,14 +140,14 @@ clean_NOT_intree(NODE *node)
 	if (node->valnode->type == QI_VAL)
 		return node;
 
-	if (node->valnode->operator.oper == OP_NOT)
+	if (node->valnode->qoperator.oper == OP_NOT)
 	{
 		freetree(node);
 		return NULL;
 	}
 
 	/* operator & or | */
-	if (node->valnode->operator.oper == OP_OR)
+	if (node->valnode->qoperator.oper == OP_OR)
 	{
 		if ((node->left = clean_NOT_intree(node->left)) == NULL ||
 			(node->right = clean_NOT_intree(node->right)) == NULL)
@@ -158,7 +160,7 @@ clean_NOT_intree(NODE *node)
 	{
 		NODE	   *res = node;
 
-		Assert(node->valnode->operator.oper == OP_AND);
+		Assert(node->valnode->qoperator.oper == OP_AND);
 
 		node->left = clean_NOT_intree(node->left);
 		node->right = clean_NOT_intree(node->right);
@@ -233,7 +235,7 @@ clean_fakeval_intree(NODE *node, char *result)
 
 	Assert(node->valnode->type == QI_OPR);
 
-	if (node->valnode->operator.oper == OP_NOT)
+	if (node->valnode->qoperator.oper == OP_NOT)
 	{
 		node->right = clean_fakeval_intree(node->right, &rresult);
 		if (!node->right)

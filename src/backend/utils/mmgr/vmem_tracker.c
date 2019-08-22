@@ -22,6 +22,7 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "utils/faultinjection.h"
+#include "utils/guc.h"
 #include "utils/vmem_tracker.h"
 #include "utils/resource_manager.h"
 #include "utils/session_state.h"
@@ -105,7 +106,7 @@ VmemTracker_ShmemInit()
 
 	if(!IsUnderPostmaster)
 	{
-		Assert(chunkSizeInBits == BITS_IN_MB);
+		chunkSizeInBits = BITS_IN_MB;
 
 		vmemChunksQuota = gp_vmem_protect_limit;
 		/*
@@ -368,6 +369,13 @@ int64
 VmemTracker_ConvertVmemChunksToBytes(int chunks)
 {
 	return CHUNKS_TO_BYTES(chunks);
+}
+
+/* Converts bytes to chunks */
+int32
+VmemTracker_ConvertVmemBytesToChunks(int64 bytes)
+{
+	return BYTES_TO_CHUNKS(bytes);
 }
 
 /*

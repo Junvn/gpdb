@@ -3,12 +3,12 @@
  * xid.c
  *	  POSTGRES transaction identifier and command identifier datatypes.
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/xid.c,v 1.12 2009/01/01 17:23:50 momjian Exp $
+ *	  src/backend/utils/adt/xid.c
  *
  *-------------------------------------------------------------------------
  */
@@ -40,13 +40,10 @@ Datum
 xidout(PG_FUNCTION_ARGS)
 {
 	TransactionId transactionId = PG_GETARG_TRANSACTIONID(0);
+	char	   *result = (char *) palloc(16);
 
-	/* maximum 32 bit unsigned integer representation takes 10 chars */
-	char	   *str = palloc(11);
-
-	snprintf(str, 11, "%lu", (unsigned long) transactionId);
-
-	PG_RETURN_CSTRING(str);
+	snprintf(result, 16, "%lu", (unsigned long) transactionId);
+	PG_RETURN_CSTRING(result);
 }
 
 /*
@@ -167,6 +164,25 @@ xid_age(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32((int32) (now - xid));
 }
 
+/*
+ * xidComparator
+ *		qsort comparison function for XIDs
+ *
+ * We can't use wraparound comparison for XIDs because that does not respect
+ * the triangle inequality!  Any old sort order will do.
+ */
+int
+xidComparator(const void *arg1, const void *arg2)
+{
+	TransactionId xid1 = *(const TransactionId *) arg1;
+	TransactionId xid2 = *(const TransactionId *) arg2;
+
+	if (xid1 > xid2)
+		return 1;
+	if (xid1 < xid2)
+		return -1;
+	return 0;
+}
 
 /*****************************************************************************
  *	 COMMAND IDENTIFIER ROUTINES											 *
@@ -178,12 +194,9 @@ xid_age(PG_FUNCTION_ARGS)
 Datum
 cidin(PG_FUNCTION_ARGS)
 {
-	char	   *s = PG_GETARG_CSTRING(0);
-	CommandId	c;
+	char	   *str = PG_GETARG_CSTRING(0);
 
-	c = atoi(s);
-
-	PG_RETURN_COMMANDID(c);
+	PG_RETURN_COMMANDID((CommandId) strtoul(str, NULL, 0));
 }
 
 /*
@@ -195,7 +208,7 @@ cidout(PG_FUNCTION_ARGS)
 	CommandId	c = PG_GETARG_COMMANDID(0);
 	char	   *result = (char *) palloc(16);
 
-	snprintf(result, 16, "%u", (unsigned int) c);
+	snprintf(result, 16, "%lu", (unsigned long) c);
 	PG_RETURN_CSTRING(result);
 }
 

@@ -1,5 +1,8 @@
-set enable_partition_rules = false;
 
+drop table if exists d;
+drop table if exists c;
+drop table if exists b;
+drop table if exists a;
 -- Check multi level partition COPY
 create table region
 (
@@ -24,6 +27,10 @@ subpartition by list (r_name) subpartition template
 	partition region2 start (3),
 	partition region3 start (5) end (8)
 );
+
+-- root and internal parent partitions should have relfrozenxid as 0
+select relname from pg_class where relkind = 'r' and relname like 'region%' and relfrozenxid=0;
+select gp_segment_id, relname from gp_dist_random('pg_class') where relkind = 'r' and relname like 'region%' and relfrozenxid=0;
 
 create unique index region_pkey on region(r_regionkey);
 
@@ -60,55 +67,34 @@ drop table region;
 -- exchange
 -- 1) test all sanity checking
 
--- policies are different
 create table foo_p (i int, j int) distributed by (i)
 partition by range(j)
 (start(1) end(10) every(1));
-create table bar_p (i int, j int) distributed by (j);
+
+-- policies are different
+create table bar_p_diff_pol (i int, j int) distributed by (j);
 -- should fail
-alter table foo_p exchange partition for(rank(6)) with table bar_p;
-drop table foo_p;
-drop table bar_p;
+alter table foo_p exchange partition for(rank(6)) with table bar_p_diff_pol;
 
 -- random policy vs. hash policy
-create table foo_p (i int, j int) distributed by (i)
-partition by range(j)
-(start(1) end(10) every(1));
-create table bar_p (i int, j int) distributed randomly;
+create table bar_p_rand_pol (i int, j int) distributed randomly;
 -- should fail
-alter table foo_p exchange partition for(rank(6)) with table bar_p;
-drop table foo_p;
-drop table bar_p;
+alter table foo_p exchange partition for(rank(6)) with table bar_p_rand_pol;
 
 -- different number of columns
-create table foo_p (i int, j int, k text) distributed by (i)
-partition by range(j)
-(start(1) end(10) every(1));
-create table bar_p (i int, j int) distributed by (i);
+create table bar_p_diff_col (i int, j int, k int) distributed by (i);
 -- should fail
-alter table foo_p exchange partition for(rank(6)) with table bar_p;
-drop table foo_p;
-drop table bar_p;
+alter table foo_p exchange partition for(rank(6)) with table bar_p_diff_col;
 
 -- different types
-create table foo_p (i int, j int) distributed by (i)
-partition by range(j)
-(start(1) end(10) every(1));
-create table bar_p (i int, j int8) distributed by (i);
+create table bar_p_diff_typ (i int, j int8) distributed by (i);
 -- should fail
-alter table foo_p exchange partition for(rank(6)) with table bar_p;
-drop table foo_p;
-drop table bar_p;
+alter table foo_p exchange partition for(rank(6)) with table bar_p_diff_typ;
 
 -- different column names
-create table foo_p (i int, j int) distributed by (i)
-partition by range(j)
-(start(1) end(10) every(1));
-create table bar_p (i int, m int) distributed by (i);
+create table bar_p_diff_colnam (i int, m int) distributed by (i);
 -- should fail
-alter table foo_p exchange partition for(rank(6)) with table bar_p;
-drop table foo_p;
-drop table bar_p;
+alter table foo_p exchange partition for(rank(6)) with table bar_p_diff_colnam;
 
 -- still different schema, but more than one level partitioning
 CREATE TABLE two_level_pt(a int, b int, c int)
@@ -128,9 +114,6 @@ ALTER TABLE two_level_pt ALTER PARTITION FOR (1)
 
 -- different owner 
 create role part_role;
-create table foo_p (i int, j int) distributed by (i)
-partition by range(j)
-(start(1) end(10) every(1));
 create table bar_p (i int, j int) distributed by (i);
 set session authorization part_role;
 -- should fail
@@ -184,27 +167,18 @@ create table barparent(i int, j int) distributed by (i);
 create table bar_p () inherits(barparent);
 -- should fail
 alter table foo_p exchange partition for(rank(6)) with table bar_p;
-drop table foo_p;
 drop table bar_p;
 drop table barparent;
 
 -- non-partition table involved in inheritance
-create table foo_p (i int, j int) distributed by (i)
-partition by range(j)
-(start(1) end(10) every(1));
-
 create table bar_p(i int, j int) distributed by (i);
 create table barchild () inherits(bar_p);
 -- should fail
 alter table foo_p exchange partition for(rank(6)) with table bar_p;
-drop table foo_p;
 drop table barchild;
 drop table bar_p;
--- rules on non-partition table
-create table foo_p (i int, j int) distributed by (i)
-partition by range(j)
-(start(1) end(10) every(1));
 
+-- rules on non-partition table
 create table bar_p(i int, j int) distributed by (i);
 create table baz_p(i int, j int) distributed by (i);
 create rule bar_baz as on insert to bar_p do instead insert into baz_p
@@ -400,6 +374,30 @@ Create table sto_ao_ao
  subpartition template ( default subpartition subothers, subpartition sub1 values ('one'), subpartition sub2 values ('two'))
  (default partition others, start(date '2008-01-01') end(date '2008-04-30') every(interval '1 month'));
 
+-- Non-leaf (empty) partitions along with their auxiliary tables
+-- should have relfrozenxid = 0.  Select the names of those tables
+-- within this partition hierarchy whose aoseg auxiliary tables have
+-- relfrozenxid = 0.
+select c1.relname from pg_appendonly a, pg_class c1, pg_class c2 where
+c1.oid = a.relid and c1.relname like 'sto_ao_ao%' and c2.relfrozenxid = 0 and a.segrelid = c2.oid;
+-- Same query as above but obtain relnames from segments.
+select c2.gp_segment_id, c1.relname from pg_appendonly a, pg_class c1,
+gp_dist_random('pg_class') c2 where
+c1.oid = a.relid and c1.relname like 'sto_ao_ao%' and c2.relfrozenxid = 0 and a.segrelid = c2.oid;
+-- Same two queries as above but for visimap auxiliary table.
+select c1.relname from pg_appendonly a, pg_class c1, pg_class c2 where
+c1.oid = a.relid and c1.relname like 'sto_ao_ao%' and c2.relfrozenxid = 0 and a.visimaprelid = c2.oid;
+-- Obtain relnames from segments whose visimap tables have relfrozenxid = 0.
+select c2.gp_segment_id, c1.relname from pg_appendonly a, pg_class c1,
+gp_dist_random('pg_class') c2 where
+c1.oid = a.relid and c1.relname like 'sto_ao_ao%' and c2.relfrozenxid = 0 and a.visimaprelid = c2.oid;
+-- Same validation toast - select all relnames whose toast tables have relfrozenxid = 0.
+select c1.relname from pg_class c1, pg_class c2 where c1.relname like 'sto_ao_ao%' and
+c2.relfrozenxid = 0 and c1.reltoastrelid = c2.oid;
+-- Obtain relnames from segments whose toast tables have relfrozenxid = 0.
+select c2.gp_segment_id, c1.relname from pg_class c1, gp_dist_random('pg_class') c2 where
+c1.relname like 'sto_ao_ao%' and c2.relfrozenxid = 0 and c1.reltoastrelid = c2.oid;
+
 create table exh_ao_ao (like sto_ao_ao) with (appendonly=true);
 
 -- Exchange default sub-partition, should fail
@@ -414,10 +412,32 @@ alter table sto_ao_ao alter default partition exchange partition for ('one') wit
 -- Exchange a partition that has sub partitions, should fail.
 alter table sto_ao_ao exchange partition for ('2008-01-01') with table exh_ao_ao;
 
-drop table sto_ao_ao;
-drop table exh_ao_ao;
+-- Alter table that causes rewrite.  Then validate that auxiliary
+-- tables of non-leaf partitions still have relfrozenxid = 0.
+alter table sto_ao_ao alter column col4 type bigint;
+-- aoseg
+select c1.relname from pg_appendonly a, pg_class c1, pg_class c2 where
+c1.oid = a.relid and c1.relname like 'sto_ao_ao%' and c2.relfrozenxid = 0 and a.segrelid = c2.oid;
+select c2.gp_segment_id, c1.relname from pg_appendonly a, pg_class c1,
+gp_dist_random('pg_class') c2 where
+c1.oid = a.relid and c1.relname like 'sto_ao_ao%' and c2.relfrozenxid = 0 and a.segrelid = c2.oid;
+-- toast
+select c1.relname from pg_class c1, pg_class c2 where c1.relname like 'sto_ao_ao%' and
+c2.relfrozenxid = 0 and c1.reltoastrelid = c2.oid;
+select c2.gp_segment_id, c1.relname from pg_class c1, gp_dist_random('pg_class') c2 where
+c1.relname like 'sto_ao_ao%' and c2.relfrozenxid = 0 and c1.reltoastrelid = c2.oid;
+
 -- XXX: not yet: VALIDATE parameter
 
+-- Exchange a partition with an external table; ensure that we require to use
+-- WITHOUT VALIDATION and that the new partition won't be included in TRUNCATE
+create table foo_p (i int, j int) distributed by (i) partition by range(j) (start(1) end(10) every(2));
+create readable external table bar_p(i int, j int) location ('gpfdist://host.invalid:8000/file') format 'text';
+alter table foo_p exchange partition for(rank(3)) with table bar_p;
+alter table foo_p exchange partition for(rank(3)) with table bar_p without validation;
+truncate foo_p;
+drop table foo_p;
+drop table bar_p;
 
 -- Check for overflow of circular data types like time
 -- Should fail
@@ -621,6 +641,34 @@ select * from foo_p;
 select * from foo_p_1_prt_p1;
 select * from foo_p_1_prt_p2;
 drop table foo_p;
+
+-- Same as above, but the input is ordered so that the inserts to the heap
+-- partition happen first. Had a bug related flushing the multi-insert
+-- buffers in that scenario at one point.
+-- (https://github.com/greenplum-db/gpdb/issues/6678
+create table mixed_ao_part(distkey int, partkey int)
+with (appendonly=true) distributed by(distkey)
+partition by range(partkey) (
+  partition p1 start(0) end(100) with (appendonly = false),
+   partition p2 start(100) end(199)
+);
+copy mixed_ao_part from stdin;
+1	95
+2	96
+3	97
+4	98
+5	99
+1	100
+2	101
+3	102
+4	103
+5	104
+\.
+select * from mixed_ao_part;
+
+-- Don't drop the table, so that we leave behind a mixed table in the
+-- regression database for pg_dump/restore testing.
+
 -- MPP-3283
 CREATE TABLE PARTSUPP (
 PS_PARTKEY INTEGER,
@@ -631,7 +679,7 @@ PS_COMMENT VARCHAR(199)
 )
 partition by range (ps_suppkey)
 subpartition by range (ps_partkey)
-,subpartition by range (ps_supplycost) subpartition template (start('1')
+subpartition by range (ps_supplycost) subpartition template (start('1')
 end('1001') every(500))
 (
 partition p1 start('1') end('10001') every(5000)
@@ -713,7 +761,7 @@ PS_COMMENT VARCHAR(199)
 )
 partition by range (ps_suppkey)
 subpartition by range (ps_partkey)
-,subpartition by range (ps_supplycost) subpartition template (start('1')
+subpartition by range (ps_supplycost) subpartition template (start('1')
 end('1001') every(500))
 (
 partition p1 start('1') end('10001') every(5000)
@@ -741,7 +789,7 @@ subpartition jan02 start (date '2002-01-01'),
 subpartition jan03 start (date '2003-01-01'),
 subpartition jan04 start (date '2004-01-01'),
 subpartition jan05 start (date '2005-01-01')
-),
+)
 subpartition by list (usstate)
 subpartition template (
 subpartition mass values ('MA'),
@@ -759,7 +807,7 @@ year date, gender char(1),
 usstate char(2))
 DISTRIBUTED BY (id, gender, year, usstate)
 partition by list (gender)
-subpartition by range (year),
+subpartition by range (year)
 subpartition by list (usstate)
 (
   partition boys values ('M') 
@@ -794,8 +842,8 @@ subpartition mass values ('MA'),
 subpartition cali values ('CA'),
 subpartition ohio values ('OH')
 )
-)
-,
+),
+
   partition girls values ('F')
 (
 subpartition jan01 start (date '2001-01-01')
@@ -1002,44 +1050,60 @@ create table granttest (i int, j int) partition by range(i)
 subpartition by list(j) subpartition template (values(1, 2, 3))
 (start(1) end(4) every(1));
 
-select has_table_privilege('part_role', 'granttest'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_1'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_2'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_3'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_1_2_prt_1'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_2_2_prt_1'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_3_2_prt_1'::regclass,'select');
+select relname, has_table_privilege('part_role', oid,'select') as tabpriv,
+       has_column_privilege('part_role', oid, 'i', 'select') as i_priv,
+       has_column_privilege('part_role', oid, 'j', 'select') as j_priv
+from pg_class where relname like 'granttest%';
+
+grant select (i) on granttest to part_role;
+select relname, has_table_privilege('part_role', oid,'select') as tabpriv,
+       has_column_privilege('part_role', oid, 'i', 'select') as i_priv,
+       has_column_privilege('part_role', oid, 'j', 'select') as j_priv
+from pg_class where relname like 'granttest%';
+
 grant select on granttest to part_role;
-select has_table_privilege('part_role', 'granttest'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_1'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_2'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_3'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_1_2_prt_1'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_2_2_prt_1'::regclass,'select');
-select has_table_privilege('part_role', 'granttest_1_prt_3_2_prt_1'::regclass,'select');
+select relname, has_table_privilege('part_role', oid,'select') as tabpriv,
+       has_column_privilege('part_role', oid, 'i', 'select') as i_priv,
+       has_column_privilege('part_role', oid, 'j', 'select') as j_priv
+from pg_class where relname like 'granttest%';
+
 grant insert on granttest to part_role;
-select has_table_privilege('part_role', 'granttest'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_1'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_2'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_3'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_1_2_prt_1'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_2_2_prt_1'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_3_2_prt_1'::regclass,'insert');
+select relname, has_table_privilege('part_role', oid, 'insert') as tabpriv,
+       has_column_privilege('part_role', oid, 'i', 'insert') as i_priv,
+       has_column_privilege('part_role', oid, 'j', 'insert') as j_priv
+from pg_class where relname like 'granttest%';
+
+revoke insert on granttest from part_role;
+grant insert (j) on granttest to part_role;
+select relname, has_table_privilege('part_role', oid, 'insert') as tabpriv,
+       has_column_privilege('part_role', oid, 'i', 'insert') as i_priv,
+       has_column_privilege('part_role', oid, 'j', 'insert') as j_priv
+from pg_class where relname like 'granttest%';
+
+-- Check that when a new partition is created, it inherits the permissions
+-- from the parent.
+alter table granttest add partition newpart start(100) end (101);
+
+select relname, has_table_privilege('part_role', oid, 'select') as tabpriv,
+       has_column_privilege('part_role', oid, 'i', 'select') as i_priv,
+       has_column_privilege('part_role', oid, 'j', 'select') as j_priv
+from pg_class where relname like 'granttest%';
+select relname, has_table_privilege('part_role', oid, 'insert') as tabpriv,
+       has_column_privilege('part_role', oid, 'i', 'insert') as i_priv,
+       has_column_privilege('part_role', oid, 'j', 'insert') as j_priv
+from pg_class where relname like 'granttest%';
 
 revoke all on granttest from part_role;
-select has_table_privilege('part_role', 'granttest'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_1'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_2'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_3'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_1_2_prt_1'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_2_2_prt_1'::regclass,'insert');
-select has_table_privilege('part_role', 'granttest_1_prt_3_2_prt_1'::regclass,'insert');
+select relname, has_table_privilege('part_role', oid, 'insert') as tabpriv,
+       has_column_privilege('part_role', oid, 'i', 'insert') as i_priv,
+       has_column_privilege('part_role', oid, 'j', 'insert') as j_priv
+from pg_class where relname like 'granttest%';
 
 drop table granttest;
 drop role part_role;
 
 -- deep inline + optional subpartition comma:
-CREATE TABLE partsupp (
+CREATE TABLE partsupp_1 (
     ps_partkey integer,
     ps_suppkey integer,
     ps_availqty integer,
@@ -1102,7 +1166,6 @@ CREATE TABLE partsupp (
                           )
                   )
           );
-drop table partsupp;
 
 -- Accept negative values trivially:
 create table partition_g (i int) partition by range(i) (start((-1)) end(10));
@@ -1211,7 +1274,6 @@ WITH (appendonly=true, checksum=true, blocksize=368640, compresslevel=9) PARTITI
                           )
                   )
           );
-drop table orders;
 
 -- grammar bug: MPP-3361
 create table i2 (i int) partition by range(i) (start(-2::int) end(20));
@@ -1332,58 +1394,18 @@ update v set j = 2;
 update v set j = 3;
 drop table v;
 
--- test AO seg totals
---
--- Note: ignore partition tablenames due to endianness issues
---
-create  or replace function ao_ptotal(relname text) returns float8 as $$
-declare
-  aosegname text;
-  tupcount float8 := 0;
-  rc int := 0;
-begin
-
-  execute 'select relname from pg_class where oid=(select segrelid from pg_class, pg_appendonly where relname=''' || relname || ''' and relid = pg_class.oid)' into aosegname;
-  if aosegname > 0 then
-	  execute 'select tupcount from pg_aoseg.' || aosegname into tupcount;
-  end if;
-  return tupcount;
-end; $$ language plpgsql volatile READS SQL DATA;
-
+-- try SREH on a partitioned table.
 create table ao_p (i int) with (appendonly = true)
  partition by range(i)
- (start(1) end(10) every(1));
+ (start(1) end(5) every(1));
 
-insert into ao_p values(1), (2), (3);
--- start_ignore
-select partitiontablename, ao_ptotal(partitiontablename)
-from pg_partitions where tablename = 'ao_p';
--- end_ignore
-truncate ao_p;
--- start_ignore
-select partitiontablename, ao_ptotal(partitiontablename)
-from pg_partitions where tablename = 'ao_p';
--- end_ignore
-copy ao_p from stdin;
-4
-5
-6
-\.
--- start_ignore
-select partitiontablename, ao_ptotal(partitiontablename)
-from pg_partitions where tablename = 'ao_p';
--- end_ignore
--- try SREH
 copy ao_p from stdin log errors segment reject limit 100;
-6
-7
+2
+3
 10000
 f
 \.
--- start_ignore
-select partitiontablename, ao_ptotal(partitiontablename)
-from pg_partitions where tablename = 'ao_p';
--- end_ignore
+select * from ao_p;
 drop table ao_p;
 
 -- MPP-3591: make sure we get inclusive/exclusive right with every().
@@ -1501,11 +1523,16 @@ alter table mpp3621 add partition a9 start ('2007-06-01') end ('2007-07-01');
 
 drop table mpp3621;
 
--- Check for MPP-3679
-create table list_test (a text, b text) partition by list (a) (partition foo
-values ('foo'), partition bar values ('bar'), default partition baz);
-alter table list_test split default partition at ('baz') into (partition bing,
-default partition);
+-- Check for MPP-3679 and MPP-3692
+create table list_test (a text, b text) partition by list (a) (
+  partition foo values ('foo'),
+  partition bar values ('bar'),
+  default partition baz);
+insert into list_test values ('foo', 'blah');
+insert into list_test values ('bar', 'blah');
+insert into list_test values ('baz', 'blah');
+alter table list_test split default partition at ('baz')
+  into (partition bing, default partition);
 drop table list_test;
 
 -- MPP-3816: cannot drop column  which is the subject of partition config
@@ -1659,7 +1686,7 @@ partition a start('a') end('f'),
 partition b start('e') end('g')
 );
 
--- MPP-5159
+-- MPP-5159 MPP-26829
 -- Should fail -- missing partition spec and subpartition template follows the
 -- partition declaration.
 CREATE TABLE list_sales (trans_id int, date date, amount
@@ -1672,7 +1699,7 @@ SUBPARTITION TEMPLATE
   SUBPARTITION europe VALUES ('europe')
 );
 
--- MPP-5185
+-- MPP-5185 MPP-26829
 -- Should work
 CREATE TABLE rank_settemp (id int, rank int, year date, gender
 char(1)) DISTRIBUTED BY (id, gender, year)
@@ -1738,11 +1765,11 @@ drop table mpp_5397;
 
 -- MPP-4987 -- make sure we can't damage a partitioning configuration
 -- MPP-8405: disallow OIDS on partitioned tables 
-create table rank_damage (i int, j int) with oids partition by range(j) (start(1) end(10)
-every(1));
+create table rank_damage (i int, j int) with oids
+partition by range(j) (start(1) end(5) every(1));
 -- this works
-create table rank_damage (i int, j int)  partition by range(j) (start(1) end(10)
-every(1));
+create table rank_damage (i int, j int)
+partition by range(j) (start(1) end(5) every(1));
 -- should all fail
 alter table rank_damage_1_prt_1 no inherit rank_damage;
 create table rank2_damage(like rank_damage);
@@ -1826,8 +1853,6 @@ values (('e','f'),('g','h'))
 select tablename, partitionlistvalues from pg_partitions where tablename like 'mpp5878%';
 select tablename, partitionboundary from pg_partitions where tablename like 'mpp5878%';
 
-drop table mpp5878, mpp5878a;
-
 -- MPP-5941: work with many levels of templates
 
 CREATE TABLE mpp5941 (a int, b date, c char, 
@@ -1836,11 +1861,11 @@ partition by range (b)
 subpartition by list (a) 
 subpartition template ( 
 subpartition l1 values (1,2,3,4,5), 
-subpartition l2 values (6,7,8,9,10) ),
+subpartition l2 values (6,7,8,9,10) )
 subpartition by list (e) 
 subpartition template ( 
 subpartition ll1 values ('Engineering'), 
-subpartition ll2 values ('QA') ),
+subpartition ll2 values ('QA') )
 subpartition by list (c) 
 subpartition template ( 
 subpartition lll1 values ('M'), 
@@ -2002,6 +2027,23 @@ partition nnull start (300) end (400)
 alter table partsupp add partition foo start(500) end(NULL);
 drop table partsupp;
 
+-- Test for an old bug, where we used to crash on NULLs, because the code
+-- to order the partitions by their start/end boundaries did not anticipate
+-- NULLs. NULLs in boundaries are not accepted, but because we check for
+-- them only after ordering the partitions, the sorting code needs to
+-- handle them. (This test needs at least two partitions, so that there
+-- is something to sort.)
+create table partnulltest (
+  col1 int,
+  col2 numeric
+)
+distributed by (col1)
+partition by range(col2)
+(
+  partition part2 start(1) end(10) ,
+  partition part1 start (NULL)
+);
+
 --MPP-6240
 CREATE TABLE supplier_hybrid_part(
                 S_SUPPKEY INTEGER,
@@ -2076,7 +2118,20 @@ create index ti_j_idx on ti using bitmap(j);
 select * from pg_indexes where schemaname = 'public' and tablename like 'ti%';
 alter table ti add partition p3 start(3) end(10);
 select * from pg_indexes where schemaname = 'public' and tablename like 'ti%';
+-- Should not be able to drop child indexes added implicitly via ADD PARTITION
+drop index ti_1_prt_p3_i_idx;
+drop index ti_1_prt_p3_j_idx;
 alter table ti split partition p3 at (7) into (partition pnew1, partition pnew2);
+select * from pg_indexes where schemaname = 'public' and tablename like 'ti%';
+-- Should not be able to drop child indexes added implicitly via SPLIT PARTITION
+drop index ti_1_prt_pnew1_i_idx;
+drop index ti_1_prt_pnew1_j_idx;
+drop index ti_1_prt_pnew2_i_idx;
+drop index ti_1_prt_pnew2_j_idx;
+-- Index drop should cascade to all partitions- including those later added via
+-- ADD PARTITION or SPLIT PARTITION
+drop index ti_pkey;
+drop index ti_j_idx;
 select * from pg_indexes where schemaname = 'public' and tablename like 'ti%';
 drop table ti;
 
@@ -2359,8 +2414,6 @@ INTO( PARTITION p20090309, PARTITION p20090312_tmp);
 
 select pg_get_partition_def('mpp6589a'::regclass,true);
 
-drop table mpp6589a;
-
 CREATE TABLE mpp6589i(a int, b int) 
 partition by range (b) (start (1) end (3));
 select pg_get_partition_def('mpp6589i'::regclass,true);
@@ -2373,8 +2426,6 @@ ALTER TABLE mpp6589i ADD PARTITION start (3) exclusive;
 -- should work - make sure can add an open-ended final partition
 ALTER TABLE mpp6589i ADD PARTITION start (3);
 select pg_get_partition_def('mpp6589i'::regclass,true);
-
-DROP TABLE mpp6589i;
 
 -- test open-ended SPLIT
 CREATE TABLE mpp6589b
@@ -2397,8 +2448,6 @@ INTO( PARTITION p20090309, PARTITION p20090312_tmp);
 
 select pg_get_partition_def('mpp6589b'::regclass,true);
 
-drop table mpp6589b;
-
 -- MPP-7191, MPP-7193: partitioned tables - fully-qualify storage type
 -- if not specified (and not a template)
 CREATE TABLE mpp5992 (a int, b date, c char,
@@ -2408,11 +2457,11 @@ partition by range (b)
 subpartition by list (a)
 subpartition template (
 subpartition l1 values (1,2,3,4,5),
-subpartition l2 values (6,7,8,9,10) ),
+subpartition l2 values (6,7,8,9,10) )
 subpartition by list (e)
 subpartition template (
 subpartition ll1 values ('Engineering'),
-subpartition ll2 values ('QA') ),
+subpartition ll2 values ('QA') )
 subpartition by list (c)
 subpartition template (
 subpartition lll1 values ('M'),
@@ -2465,8 +2514,6 @@ add partition foo3
 start (date '2013-01-01') end (date '2014-01-01') WITH (appendonly=true);
 
 select pg_get_partition_def('mpp5992'::regclass,true, true);
-
-drop table mpp5992;
 
 -- MPP-10223: split subpartitions
 CREATE TABLE MPP10223pk
@@ -2528,9 +2575,7 @@ ALTER TABLE MPP10223pk
  ALTER PARTITION min15part 
 SPLIT PARTITION  P_FUTURE AT ('2010-06-25') 
 INTO (PARTITION P20010101, PARTITION P_FUTURE);
-
 drop table mpp10223pk;
-
 -- rebuild the table without a primary key
 CREATE TABLE MPP10223
 (
@@ -2590,8 +2635,6 @@ INTO (PARTITION P20010101, PARTITION P_FUTURE2);
 
 select pg_get_partition_def('mpp10223'::regclass,true);
 
-drop table mpp10223;
-
 -- simpler version
 create table mpp10223b (a int, b int , d int)
 partition by range (b)
@@ -2610,8 +2653,6 @@ select partitiontablename,partitionposition,partitionrangestart,
 
 select pg_get_partition_def('mpp10223b'::regclass,true);
 
-drop table mpp10223b;
-
 -- MPP-10480: dump templates (but don't use "foo")
 create table MPP10480 (a int, b int, d int)
 partition by range (b)
@@ -2620,8 +2661,6 @@ subpartition template (start (1) end (10) every (1))
 (start (20) end (30) every (1));
 
 select pg_get_partition_template_def('MPP10480'::regclass, true, true);
-
-drop table MPP10480;
 
 -- MPP-10421: fix SPLIT of partitions with PRIMARY KEY constraint/indexes
 CREATE TABLE mpp10321a
@@ -2793,7 +2832,7 @@ select * from test_table; -- expected, no rows
 insert into test_table values(1,2,3); -- reinsert data
 
 -- all partitions should have same distribution policy
-select relname, attrnums as distribution_attributes from
+select relname, distkey as distribution_attributes from
 gp_distribution_policy p, pg_class c
 where p.localoid = c.oid and relname like 'test_table%' order by p.localoid;
 
@@ -2803,7 +2842,7 @@ alter table test_table split default partition
 	into (partition p2, partition default_partition);
 
 
-select relname, attrnums as distribution_attributes from
+select relname, distkey as distribution_attributes from
 gp_distribution_policy p, pg_class c where p.localoid = c.oid and 
 relname like 'test_table%' order by p.localoid;
 
@@ -2815,7 +2854,7 @@ alter table test_table drop partition default_partition;
 
 alter table test_table add partition foo start(10) end(20);
 
-select relname, attrnums as distribution_attributes from
+select relname, distkey as distribution_attributes from
 gp_distribution_policy p, pg_class c where p.localoid = c.oid and
 relname like 'test_table%' order by p.localoid;
 
@@ -3538,7 +3577,6 @@ reset optimizer_nestloop_factor;
 
 -- Sub-partition insertion with checking if the user provided correct leaf part
 set dml_ignore_target_partition_check=false;
-drop table if exists part_tab;
 create table part_tab ( i int, j int) distributed by (i) partition by range(j) (start(0) end(10) every(2));
 -- Wrong part
 insert into part_tab_1_prt_1 values(5,5);
@@ -3588,7 +3626,6 @@ insert into part_tab select i1.x, i2.y from input1 as i1 join input2 as i2 on i1
 select * from part_tab;
 
 -- Multi-level partitioning
-drop table if exists deep_part;
 create table deep_part ( i int, j int, k int, s char(5)) 
 distributed by (i) 
 partition by list(s)
@@ -3729,8 +3766,6 @@ select * from deep_part;
 
 drop table input2;
 drop table input1;
-drop table part_tab;
-drop table deep_part;
 
 -- Avoid TupleDesc leak when COPY partition table from files
 -- This also covers the bug reported in MPP-9548 where insertion
@@ -3769,21 +3804,58 @@ select * from pt_td_leak where col3 = 1;
 drop table pt_td_leak;
 drop table pt_td_leak_exchange;
 
+
+--
+-- Test COPY, when distribution keys have different attribute numbers,
+-- because of dropped columns
+--
+CREATE TABLE pt_dropped_col_distkey (i int, to_be_dropped text, t text)
+DISTRIBUTED BY (t) PARTITION BY RANGE (i) (START (1) END(10) EVERY (5));
+INSERT INTO pt_dropped_col_distkey SELECT g, 'dropped' || g, 'before drop ' || g FROM generate_series(1, 7) g;
+
+ALTER TABLE pt_dropped_col_distkey DROP COLUMN to_be_dropped;
+
+-- This new partition won't have the dropped column. Because the distribution
+-- key was after the dropped column, the attribute number of the distribution
+-- key column will be different in this partition and the parent.
+ALTER TABLE pt_dropped_col_distkey ADD PARTITION pt_dropped_col_distkey_new_part START (10) END (100);
+
+INSERT INTO pt_dropped_col_distkey SELECT g, 'after drop ' || g FROM generate_series(8, 15) g;
+SELECT * FROM pt_dropped_col_distkey ORDER BY i;
+COPY pt_dropped_col_distkey TO '/tmp/pt_dropped_col_distkey.out';
+
+DELETE FROM pt_dropped_col_distkey;
+
+COPY pt_dropped_col_distkey FROM '/tmp/pt_dropped_col_distkey.out';
+
+SELECT * FROM pt_dropped_col_distkey ORDER BY i;
+
+-- don't drop the table, so that we have a partitioned table like this still
+-- in the database, when we test pg_upgrade later.
+
+
+--
 -- Test split default partition while per tuple memory context is reset
+--
 drop table if exists test_split_part cascade;
 
 CREATE TABLE test_split_part ( log_id int NOT NULL, f_array int[] NOT NULL)
 DISTRIBUTED BY (log_id)
 PARTITION BY RANGE(log_id)
 (
-	START (1::int) END (100::int) EVERY (5) WITH (appendonly=false),
-	PARTITION "Old" START (101::int) END (201::int) WITH (appendonly=false),
-	DEFAULT PARTITION other_log_ids  WITH (appendonly=false)
+    START (1::int) END (100::int) EVERY (5) WITH (appendonly=false),
+    PARTITION "Old" START (101::int) END (201::int) WITH (appendonly=false),
+    DEFAULT PARTITION other_log_ids  WITH (appendonly=false)
 );
 
 insert into test_split_part (log_id , f_array) select id, '{10}' from generate_series(1,1000) id;
 
 ALTER TABLE test_split_part SPLIT DEFAULT PARTITION START (201) INCLUSIVE END (301) EXCLUSIVE INTO (PARTITION "New", DEFAULT PARTITION);
+
+-- Only the root partition should have automatically created an array type
+select typname, typtype, typcategory from pg_type where typname like '%test_split_part%' and typcategory = 'A';
+select array_agg(test_split_part) from test_split_part where log_id = 500;
+select array_agg(test_split_part_1_prt_other_log_ids) from test_split_part_1_prt_other_log_ids where log_id = 500;
 
 -- Test that pg_get_partition_def() correctly dumps the renamed names for
 -- partitions. Originally reported in MPP-7232
@@ -3822,17 +3894,25 @@ distributed by (pkid) partition by range (option3)
 	partition cc start(201) end (300)
 );
 
+-- root partition (and only root) should have relfrozenxid as 0
+select relname from pg_class where relkind = 'r' and relname like 'sales%' and relfrozenxid=0;
+select gp_segment_id, relname from gp_dist_random('pg_class') where relkind = 'r' and relname like 'sales%' and relfrozenxid=0;
+
 alter table sales add column tax float;
+-- root partition (and only root) continues to have relfrozenxid as 0
+select relname from pg_class where relkind = 'r' and relname like 'sales%' and relfrozenxid=0;
+select gp_segment_id, relname from gp_dist_random('pg_class') where relkind = 'r' and relname like 'sales%' and relfrozenxid=0;
+
 alter table sales drop column tax;
 
 create table newpart(like sales);
-alter table newpart add constraint partable_pkey primary key(pkid, option3);
+alter table newpart add constraint newpart_pkey primary key(pkid, option3);
 alter table sales split partition for(1) at (50) into (partition aa1, partition aa2);
 
 select table_schema, table_name, constraint_name, constraint_type
 	from information_schema.table_constraints
 	where table_name in ('sales', 'newpart')
-	and constraint_name = 'partable_pkey'
+	and constraint_name in ('partable_pkey', 'newpart_pkey')
 	order by table_name desc;
 
 alter table sales exchange partition for (101) with table newpart;
@@ -3848,6 +3928,42 @@ alter table sales exchange partition for (101) with table newpart2;
 select * from sales order by pkid;
 drop table sales cascade;
 
+-- Exchage partiton table with a table having dropped column
+create table exchange_part(a int, b int) partition by range(b) (start (0) end (10) every (5));
+create table exchange1(a int, c int, b int);
+alter table exchange1 drop column c;
+alter table exchange_part exchange partition for (1) with table exchange1;
+copy exchange_part from STDIN DELIMITER as '|';
+9794 | 1
+9795 | 2
+9797 | 3
+9799 | 4
+9801 | 5
+9802 | 6
+9803 | 7
+9806 | 8
+9807 | 9
+9808 | 1
+9810 | 2
+9814 | 3
+9815 | 4
+9817 | 5
+9818 | 6
+9822 | 7
+9824 | 8
+9825 | 9
+9827 | 1
+9828 | 2
+9831 | 3
+9832 | 4
+9836 | 5
+9840 | 6
+9843 | 7
+9844 | 8
+\.
+select * from exchange_part;
+drop table exchange_part;
+drop table exchange1;
 -- Ensure that new partitions get the correct attributes (MPP17110)
 CREATE TABLE pt_tab_encode (a int, b text)
 with (appendonly=true, orientation=column, compresstype=zlib, compresslevel=1)
@@ -3866,3 +3982,35 @@ select gp_segment_id, attrelid::regclass, attnum, attoptions from gp_dist_random
 
 select oid::regclass, relkind, relstorage, reloptions from pg_class where oid = 'pt_tab_encode_1_prt_s_abc'::regclass;
 select oid::regclass, relkind, relstorage, reloptions from pg_class where oid = 'pt_tab_encode_1_prt_s_xyz'::regclass;
+
+-- Ensure that only the correct type of partitions can be added
+create table at_range (a int) partition by range (a) (start(1) end(5));
+create table at_list (i int) partition by list(i) (partition p1 values(1));
+
+alter table at_list add partition foo2 start(6) end (10);
+alter table at_range add partition test values(5);
+
+-- Ensure array type for the non-partition table is there after partition exchange.
+CREATE TABLE pt_xchg(a int) PARTITION BY RANGE(a) (START(1) END(4) EVERY (2));
+create table xchg_tab1(a int);
+CREATE SCHEMA xchg_schema;
+create table xchg_schema.xchg_tab2(a int);
+alter table pt_xchg exchange partition for (1) with table xchg_tab1;
+alter table pt_xchg exchange partition for (3) with table xchg_schema.xchg_tab2;
+
+select a.typowner=b.typowner from pg_type a join pg_type b on true where a.typname = 'xchg_tab1' and b.typname = '_xchg_tab1';
+
+select nspname from pg_namespace join pg_type on pg_namespace.oid = pg_type.typnamespace where pg_type.typname = 'xchg_tab1' or pg_type.typname = '_xchg_tab1';
+select nspname from pg_namespace join pg_type on pg_namespace.oid = pg_type.typnamespace where pg_type.typname = 'xchg_tab2' or pg_type.typname = '_xchg_tab2';
+
+select typname from pg_type where typelem = 'xchg_tab1'::regtype;
+select typname from pg_type where typelem = 'xchg_schema.xchg_tab2'::regtype;
+
+select typname from pg_type where typarray = '_xchg_tab1'::regtype;
+select typname from pg_type where typarray = 'xchg_schema._xchg_tab2'::regtype;
+
+alter table pt_xchg exchange partition for (1) with table xchg_tab1;
+select a.typowner=b.typowner from pg_type a join pg_type b on true where a.typname = 'xchg_tab1' and b.typname = '_xchg_tab1';
+select nspname from pg_namespace join pg_type on pg_namespace.oid = pg_type.typnamespace where pg_type.typname = 'xchg_tab1' or pg_type.typname = '_xchg_tab1';
+select typname from pg_type where typelem = 'xchg_tab1'::regtype;
+select typname from pg_type where typarray = '_xchg_tab1'::regtype;

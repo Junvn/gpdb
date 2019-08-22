@@ -1,5 +1,6 @@
 -- Currently this tests polymorphic aggregates and indirectly does some
 -- testing of polymorphic SQL functions.  It ought to be extended.
+-- Tests for other features related to function-calling have snuck in, too.
 
 
 -- In GPDB, rows can be returned from segments in any order. Normally, we
@@ -34,7 +35,7 @@ $$ language sql;
 -- !> = not allowed
 -- E  = exists
 -- NE = not-exists
--- 
+--
 -- Possible states:
 -- ----------------
 -- B = (A || P || N)
@@ -82,7 +83,7 @@ CREATE FUNCTION ffnp(int[]) returns int[] as
 'select $1' LANGUAGE SQL;
 
 -- Try to cover all the possible states:
--- 
+--
 -- Note: in Cases 1 & 2, we are trying to return P. Therefore, if the transfn
 -- is stfnp, tfnp, or tf2p, we must use ffp as finalfn, because stfnp, tfnp,
 -- and tf2p do not return P. Conversely, in Cases 3 & 4, we are trying to
@@ -363,29 +364,29 @@ insert into t values(3,array[3],'a');
 insert into t values(3,array[3],'b');
 
 -- test the successfully created polymorphic aggregates
-select f3, myaggp01a(*) from t group by f3;
-select f3, myaggp03a(*) from t group by f3;
-select f3, myaggp03b(*) from t group by f3;
-select f3, array_sort(myaggp05a(f1)) as myaggp05a from t group by f3;
-select f3, myaggp06a(f1) from t group by f3;
-select f3, myaggp08a(f1) from t group by f3;
-select f3, myaggp09a(f1) from t group by f3;
-select f3, myaggp09b(f1) from t group by f3;
-select f3, array_sort(myaggp10a(f1)) as myaggp10a from t group by f3;
-select f3, array_sort(myaggp10b(f1)) as myaggp10b from t group by f3;
-select f3, array_sort(myaggp20a(f1)) as myaggp20a from t group by f3;
-select f3, array_sort(myaggp20b(f1)) as myaggp20b from t group by f3;
-select f3, myaggn01a(*) from t group by f3;
-select f3, myaggn01b(*) from t group by f3;
-select f3, myaggn03a(*) from t group by f3;
-select f3, array_sort(myaggn05a(f1)) as myaggn05a from t group by f3;
-select f3, array_sort(myaggn05b(f1)) as myaggn05b from t group by f3;
-select f3, myaggn06a(f1) from t group by f3;
-select f3, myaggn06b(f1) from t group by f3;
-select f3, myaggn08a(f1) from t group by f3;
-select f3, myaggn08b(f1) from t group by f3;
-select f3, myaggn09a(f1) from t group by f3;
-select f3, array_sort(myaggn10a(f1)) as myaggn10a from t group by f3;
+select f3, myaggp01a(*) from t group by f3 order by f3;
+select f3, myaggp03a(*) from t group by f3 order by f3;
+select f3, myaggp03b(*) from t group by f3 order by f3;
+select f3, array_sort(myaggp05a(f1)) as myaggp05a from t group by f3 order by f3;
+select f3, myaggp06a(f1) from t group by f3 order by f3;
+select f3, myaggp08a(f1) from t group by f3 order by f3;
+select f3, myaggp09a(f1) from t group by f3 order by f3;
+select f3, myaggp09b(f1) from t group by f3 order by f3;
+select f3, array_sort(myaggp10a(f1)) as myaggp10a from t group by f3 order by f3;
+select f3, array_sort(myaggp10b(f1)) as myaggp10b from t group by f3 order by f3;
+select f3, array_sort(myaggp20a(f1)) as myaggp20a from t group by f3 order by f3;
+select f3, array_sort(myaggp20b(f1)) as myaggp20b from t group by f3 order by f3;
+select f3, myaggn01a(*) from t group by f3 order by f3;
+select f3, myaggn01b(*) from t group by f3 order by f3;
+select f3, myaggn03a(*) from t group by f3 order by f3;
+select f3, array_sort(myaggn05a(f1)) as myaggn05a from t group by f3 order by f3;
+select f3, array_sort(myaggn05b(f1)) as myaggn05b from t group by f3 order by f3;
+select f3, myaggn06a(f1) from t group by f3 order by f3;
+select f3, myaggn06b(f1) from t group by f3 order by f3;
+select f3, myaggn08a(f1) from t group by f3 order by f3;
+select f3, myaggn08b(f1) from t group by f3 order by f3;
+select f3, myaggn09a(f1) from t group by f3 order by f3;
+select f3, array_sort(myaggn10a(f1)) as myaggn10a from t group by f3 order by f3;
 select mysum2(f1, f1 + 1) from t;
 
 -- test inlining of polymorphic SQL functions
@@ -410,6 +411,21 @@ insert into int4_tbl_new values(1, 0), (1, 123456), (1, -123456), (1, 2147483647
 select f1, sql_if(f1 > 0, bleat(f1), bleat(f1 + 1)) from int4_tbl_new;
 
 select q2, sql_if(q2 > 0, q2, q2 + 1) from int8_tbl;
+
+-- another sort of polymorphic aggregate
+
+CREATE AGGREGATE array_cat_accum (anyarray)
+(
+    sfunc = array_cat,
+    stype = anyarray,
+    initcond = '{}'
+);
+
+SELECT array_cat_accum(i)
+FROM (VALUES (ARRAY[1,2]), (ARRAY[3,4])) as t(i);
+
+SELECT array_cat_accum(i)
+FROM (VALUES (ARRAY[row(1,2),row(3,4)]), (ARRAY[row(5,6),row(7,8)])) as t(i);
 
 -- another kind of polymorphic aggregate
 
@@ -452,7 +468,8 @@ select distinct array_ndims(histogram_bounds) from pg_stats
 where histogram_bounds is not null;
 
 -- such functions must protect themselves if varying element type isn't OK
-select max(histogram_bounds) from pg_stats;
+-- (WHERE clause here is to avoid possibly getting a collation error instead)
+select max(histogram_bounds) from pg_stats where tablename = 'pg_am';
 
 -- test variadic polymorphic functions
 
@@ -644,3 +661,123 @@ select dfunc('Hi');
 drop function dfunc(int, int, int);
 drop function dfunc(int, int);
 drop function dfunc(text);
+
+--
+-- Tests for named- and mixed-notation function calling
+--
+
+create function dfunc(a int, b int, c int = 0, d int = 0)
+  returns table (a int, b int, c int, d int) as $$
+  select $1, $2, $3, $4;
+$$ language sql;
+
+select (dfunc(10,20,30)).*;
+select (dfunc(a := 10, b := 20, c := 30)).*;
+select * from dfunc(a := 10, b := 20);
+select * from dfunc(b := 10, a := 20);
+select * from dfunc(0);  -- fail
+select * from dfunc(1,2);
+select * from dfunc(1,2,c := 3);
+select * from dfunc(1,2,d := 3);
+
+select * from dfunc(x := 20, b := 10, x := 30);  -- fail, duplicate name
+select * from dfunc(10, b := 20, 30);  -- fail, named args must be last
+select * from dfunc(x := 10, b := 20, c := 30);  -- fail, unknown param
+select * from dfunc(10, 10, a := 20);  -- fail, a overlaps positional parameter
+select * from dfunc(1,c := 2,d := 3); -- fail, no value for b
+
+drop function dfunc(int, int, int, int);
+
+-- test with different parameter types
+create function dfunc(a varchar, b numeric, c date = current_date)
+  returns table (a varchar, b numeric, c date) as $$
+  select $1, $2, $3;
+$$ language sql;
+
+select (dfunc('Hello World', 20, '2009-07-25'::date)).*;
+select * from dfunc('Hello World', 20, '2009-07-25'::date);
+select * from dfunc(c := '2009-07-25'::date, a := 'Hello World', b := 20);
+select * from dfunc('Hello World', b := 20, c := '2009-07-25'::date);
+select * from dfunc('Hello World', c := '2009-07-25'::date, b := 20);
+select * from dfunc('Hello World', c := 20, b := '2009-07-25'::date);  -- fail
+
+drop function dfunc(varchar, numeric, date);
+
+-- test out parameters with named params
+create function dfunc(a varchar = 'def a', out _a varchar, c numeric = NULL, out _c numeric)
+returns record as $$
+  select $1, $2;
+$$ language sql;
+
+select (dfunc()).*;
+select * from dfunc();
+select * from dfunc('Hello', 100);
+select * from dfunc(a := 'Hello', c := 100);
+select * from dfunc(c := 100, a := 'Hello');
+select * from dfunc('Hello');
+select * from dfunc('Hello', c := 100);
+select * from dfunc(c := 100);
+
+-- fail, can no longer change an input parameter's name
+create or replace function dfunc(a varchar = 'def a', out _a varchar, x numeric = NULL, out _c numeric)
+returns record as $$
+  select $1, $2;
+$$ language sql;
+
+create or replace function dfunc(a varchar = 'def a', out _a varchar, numeric = NULL, out _c numeric)
+returns record as $$
+  select $1, $2;
+$$ language sql;
+
+drop function dfunc(varchar, numeric);
+
+--fail, named parameters are not unique
+create function testfoo(a int, a int) returns int as $$ select 1;$$ language sql;
+create function testfoo(int, out a int, out a int) returns int as $$ select 1;$$ language sql;
+create function testfoo(out a int, inout a int) returns int as $$ select 1;$$ language sql;
+create function testfoo(a int, inout a int) returns int as $$ select 1;$$ language sql;
+
+-- valid
+create function testfoo(a int, out a int) returns int as $$ select $1;$$ language sql;
+select testfoo(37);
+drop function testfoo(int);
+create function testfoo(a int) returns table(a int) as $$ select $1;$$ language sql;
+select * from testfoo(37);
+drop function testfoo(int);
+
+-- test polymorphic params and defaults
+create function dfunc(a anyelement, b anyelement = null, flag bool = true)
+returns anyelement as $$
+  select case when $3 then $1 else $2 end;
+$$ language sql;
+
+select dfunc(1,2);
+select dfunc('a'::text, 'b'); -- positional notation with default
+
+select dfunc(a := 1, b := 2);
+select dfunc(a := 'a'::text, b := 'b');
+select dfunc(a := 'a'::text, b := 'b', flag := false); -- named notation
+
+select dfunc(b := 'b'::text, a := 'a'); -- named notation with default
+select dfunc(a := 'a'::text, flag := true); -- named notation with default
+select dfunc(a := 'a'::text, flag := false); -- named notation with default
+select dfunc(b := 'b'::text, a := 'a', flag := true); -- named notation
+
+select dfunc('a'::text, 'b', false); -- full positional notation
+select dfunc('a'::text, 'b', flag := false); -- mixed notation
+select dfunc('a'::text, 'b', true); -- full positional notation
+select dfunc('a'::text, 'b', flag := true); -- mixed notation
+
+-- check reverse-listing of named-arg calls
+CREATE VIEW dfview AS
+   SELECT q1, q2,
+     dfunc(q1,q2, flag := q1>q2) as c3,
+     dfunc(q1, flag := q1<q2, b := q2) as c4
+     FROM int8_tbl;
+
+select * from dfview;
+
+\d+ dfview
+
+drop view dfview;
+drop function dfunc(anyelement, anyelement, bool);

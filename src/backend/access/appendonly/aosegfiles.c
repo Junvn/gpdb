@@ -25,6 +25,7 @@
 #include "access/aocssegfiles.h"
 #include "access/aosegfiles.h"
 #include "access/appendonlytid.h"
+#include "access/appendonlywriter.h"
 #include "catalog/pg_appendonly_fn.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_proc.h"
@@ -38,13 +39,16 @@
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/int8.h"
+#include "utils/lsyscache.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/fmgroids.h"
 #include "utils/numeric.h"
 #include "utils/visibility_summary.h"
 
-static Datum ao_compression_ratio_internal(Oid relid);
+static float8 aorow_compression_ratio_internal(Relation parentrel);
 static void UpdateFileSegInfo_internal(Relation parentrel,
 						   int segno,
 						   int64 eof,
@@ -53,15 +57,8 @@ static void UpdateFileSegInfo_internal(Relation parentrel,
 						   int64 varblocks_added,
 						   int64 modcount_added,
 						   FileSegInfoState newState);
+static FileSegInfo **GetAllFileSegInfo_pg_aoseg_rel(char *relationName, Relation pg_aoseg_rel, Snapshot appendOnlyMetaDataSnapshot, int *totalsegs);
 
-static void PrintPgaosegAndGprelationNodeEntries(FileSegInfo **allseginfo,
-									 int totalsegs,
-									 bool *segmentFileNumMap);
-
-static void CheckAOConsistencyWithGpRelationNode(Snapshot snapshot,
-									 Relation rel,
-									 int totalsegs,
-									 FileSegInfo **allseginfo);
 
 /* ------------------------------------------------------------------------
  *
@@ -84,6 +81,13 @@ NewFileSegInfo(int segno)
 	return fsinfo;
 }
 
+void
+ValidateAppendonlySegmentDataBeforeStorage(int segno)
+{
+	if (segno >= MAX_AOREL_CONCURRENCY || segno < 0)
+		ereport(ERROR, (errmsg("expected segment number to be between zero and the maximum number of concurrent writers, actually %d", segno)));
+}
+
 /*
  * InsertFileSegInfo
  *
@@ -103,6 +107,8 @@ InsertInitialSegnoEntry(Relation parentrel, int segno)
 	bool	   *nulls;
 	Datum	   *values;
 	int16		formatVersion;
+
+	ValidateAppendonlySegmentDataBeforeStorage(segno);
 
 	/* New segments are always created in the latest format */
 	formatVersion = AORelationVersion_GetLatest();
@@ -191,9 +197,9 @@ GetFileSegInfo(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot, int segn
 			if (fstuple != NULL)
 				ereport(ERROR,
 						(errcode(ERRCODE_INTERNAL_ERROR),
-						 errmsg("found two entries in pg_aoseg.%s with segno %d: "
+						 errmsg("found two entries in \"%s\" with segno %d: "
 								"(ctid %s with eof " INT64_FORMAT ") and (ctid %s with eof " INT64_FORMAT ")",
-								pg_aoseg_rel->rd_rel->relname.data,
+								RelationGetRelationName(pg_aoseg_rel),
 								segno,
 								ItemPointerToString(&fstuple->t_self),
 								DatumGetInt64(
@@ -227,8 +233,8 @@ GetFileSegInfo(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot, int segn
 
 	if (fsinfo->eof < 0)
 		ereport(ERROR,
-				(errcode(ERRCODE_GP_INTERNAL_ERROR),
-				 errmsg("Invalid eof " INT64_FORMAT " for relation %s",
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("invalid eof " INT64_FORMAT " for relation %s",
 						fsinfo->eof, RelationGetRelationName(parentrel))));
 
 	/* get the tupcount */
@@ -266,6 +272,7 @@ GetFileSegInfo(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot, int segn
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("got invalid formatversion value: NULL")));
+	AORelationVersion_CheckValid(fsinfo->formatversion);
 
 	/* get the state */
 	fsinfo->state = DatumGetInt16(
@@ -328,11 +335,6 @@ GetAllFileSegInfo(Relation parentrel,
 
 	heap_close(pg_aoseg_rel, AccessShareLock);
 
-	CheckAOConsistencyWithGpRelationNode(appendOnlyMetaDataSnapshot,
-										 parentrel,
-										 *totalsegs,
-										 result);
-
 	return result;
 }
 
@@ -355,7 +357,7 @@ aoFileSegInfoCmp(const void *left, const void *right)
 	return 0;
 }
 
-FileSegInfo **
+static FileSegInfo **
 GetAllFileSegInfo_pg_aoseg_rel(char *relationName,
 							   Relation pg_aoseg_rel,
 							   Snapshot appendOnlyMetaDataSnapshot,
@@ -450,9 +452,13 @@ GetAllFileSegInfo_pg_aoseg_rel(char *relationName,
 
 		/* get the file format version number */
 		formatversion = fastgetattr(tuple, Anum_pg_aoseg_formatversion, pg_aoseg_dsc, &isNull);
-		Assert(!isNull || appendOnlyMetaDataSnapshot == SnapshotAny);
-		if (!isNull)
-			oneseginfo->formatversion = (int64) DatumGetInt16(formatversion);
+		if (isNull)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("got invalid formatversion value: NULL")));
+
+		AORelationVersion_CheckValid(formatversion);
+		oneseginfo->formatversion = DatumGetInt16(formatversion);
 
 		/* get the state */
 		state = fastgetattr(tuple, Anum_pg_aoseg_state, pg_aoseg_dsc, &isNull);
@@ -462,7 +468,7 @@ GetAllFileSegInfo_pg_aoseg_rel(char *relationName,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("got invalid state value: NULL")));
 		else
-			oneseginfo->state = (int64) DatumGetInt16(state);
+			oneseginfo->state = DatumGetInt16(state);
 
 		/* get the uncompressed eof */
 		eof_uncompressed = fastgetattr(tuple, Anum_pg_aoseg_eofuncompressed, pg_aoseg_dsc, &isNull);
@@ -576,7 +582,7 @@ ClearFileSegInfo(Relation parentrel,
 	pg_aoseg_rel = heap_open(parentrel->rd_appendonly->segrelid, RowExclusiveLock);
 	pg_aoseg_dsc = RelationGetDescr(pg_aoseg_rel);
 
-	aoscan = heap_beginscan(pg_aoseg_rel, SnapshotNow, 0, NULL);
+	aoscan = heap_beginscan_catalog(pg_aoseg_rel, 0, NULL);
 	while (segno != tuple_segno && (tuple = heap_getnext(aoscan, ForwardScanDirection)) != NULL)
 	{
 		tuple_segno = DatumGetInt32(fastgetattr(tuple, Anum_pg_aoseg_segno, pg_aoseg_dsc, &isNull));
@@ -726,7 +732,7 @@ UpdateFileSegInfo_internal(Relation parentrel,
 	pg_aoseg_rel = heap_open(parentrel->rd_appendonly->segrelid, RowExclusiveLock);
 	pg_aoseg_dsc = RelationGetDescr(pg_aoseg_rel);
 
-	aoscan = heap_beginscan(pg_aoseg_rel, SnapshotNow, 0, NULL);
+	aoscan = heap_beginscan_catalog(pg_aoseg_rel, 0, NULL);
 	while (segno != tuple_segno && (tuple = heap_getnext(aoscan, ForwardScanDirection)) != NULL)
 	{
 		tuple_segno = DatumGetInt32(fastgetattr(tuple, Anum_pg_aoseg_segno, pg_aoseg_dsc, &isNull));
@@ -762,7 +768,7 @@ UpdateFileSegInfo_internal(Relation parentrel,
 	 * recorded in aoseg table has to be greater than currently stored EOF
 	 * value, as new writes must move it forward only. If new end-of-file
 	 * value is less than currently stored end-of-file something is incorrect
-	 * and updating the same will yeild incorrect result during reads. Hence
+	 * and updating the same will yield incorrect result during reads. Hence
 	 * abort the write transaction trying to update the incorrect EOF value.
 	 */
 	if (eof < 0)
@@ -1158,14 +1164,13 @@ gp_aoseg_history(PG_FUNCTION_ARGS)
 	SRF_RETURN_DONE(funcctx);
 }
 
-static Datum
+static int64
 gp_update_aorow_master_stats_internal(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot)
 {
 	StringInfoData sqlstmt;
 	Relation	aosegrel;
 	bool		connected = false;
-	char		aoseg_relname[NAMEDATALEN];
-	int			proc;
+	int			proc;	/* 32 bit, only holds number of segments */
 	int			ret;
 	int64		total_count = 0;
 	MemoryContext oldcontext = CurrentMemoryContext;
@@ -1173,34 +1178,34 @@ gp_update_aorow_master_stats_internal(Relation parentrel, Snapshot appendOnlyMet
 	Assert(RelationIsAoRows(parentrel));
 
 	/*
-	 * get the name of the aoseg relation
-	 */
-	aosegrel = heap_open(parentrel->rd_appendonly->segrelid, AccessShareLock);
-	snprintf(aoseg_relname, NAMEDATALEN, "%s", RelationGetRelationName(aosegrel));
-	heap_close(aosegrel, AccessShareLock);
-
-	/*
 	 * assemble our query string
 	 */
+	aosegrel = heap_open(parentrel->rd_appendonly->segrelid, AccessShareLock);
+
 	initStringInfo(&sqlstmt);
 	appendStringInfo(&sqlstmt, "select segno,sum(tupcount) "
-					 "from gp_dist_random('pg_aoseg.%s') "
-					 "group by (segno)", aoseg_relname);
+					 "from gp_dist_random('%s.%s') "
+					 "group by (segno)",
+					 get_namespace_name(RelationGetNamespace(aosegrel)),
+					 RelationGetRelationName(aosegrel));
+
+	heap_close(aosegrel, AccessShareLock);
 
 	PG_TRY();
 	{
 
 		if (SPI_OK_CONNECT != SPI_connect())
 		{
-			ereport(ERROR, (errcode(ERRCODE_CDB_INTERNAL_ERROR),
-							errmsg("Unable to obtain AO relation information from segment databases."),
-							errdetail("SPI_connect failed in gp_update_ao_master_stats")));
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("unable to obtain AO relation information from segment databases"),
+					 errdetail("SPI_connect failed in gp_update_ao_master_stats")));
 		}
 		connected = true;
 
 		/* Do the query. */
 		ret = SPI_execute(sqlstmt.data, false, 0);
-		proc = SPI_processed;
+		proc = (int) SPI_processed;
 
 
 		if (ret > 0 && SPI_tuptable != NULL)
@@ -1319,25 +1324,20 @@ gp_update_aorow_master_stats_internal(Relation parentrel, Snapshot appendOnlyMet
 
 	pfree(sqlstmt.data);
 
-	PG_RETURN_INT64(total_count);
+	return total_count;
 }
 
-PG_FUNCTION_INFO_V1(gp_aoseg_name);
+PG_FUNCTION_INFO_V1(gp_aoseg);
 
-extern Datum gp_aoseg_name(PG_FUNCTION_ARGS);
+extern Datum gp_aoseg(PG_FUNCTION_ARGS);
 
 /*
- * UDF to get aoseg information by relation name
+ * UDF to get aoseg information by relation OID/name
  */
 Datum
-gp_aoseg_name(PG_FUNCTION_ARGS)
+gp_aoseg(PG_FUNCTION_ARGS)
 {
-	int			aoRelOid;
-	RangeVar   *parentrv;
-	text	   *relname = PG_GETARG_TEXT_P(0);
-
-	parentrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
-	aoRelOid = RangeVarGetRelid(parentrv, false);
+	Oid			aoRelOid = PG_GETARG_OID(0);
 
 	typedef struct Context
 	{
@@ -1407,11 +1407,14 @@ gp_aoseg_name(PG_FUNCTION_ARGS)
 
 		pg_aoseg_rel = heap_open(aocsRel->rd_appendonly->segrelid, NoLock);
 
+		Snapshot	snapshot;
+		snapshot = RegisterSnapshot(GetLatestSnapshot());
 		context->aoSegfileArray =
 			GetAllFileSegInfo_pg_aoseg_rel(RelationGetRelationName(aocsRel),
 										   pg_aoseg_rel,
-										   SnapshotNow,
+										   snapshot,
 										   &context->totalAoSegFiles);
+		UnregisterSnapshot(snapshot);
 
 		heap_close(pg_aoseg_rel, NoLock);
 		heap_close(aocsRel, NoLock);
@@ -1492,98 +1495,66 @@ gp_aoseg_name(PG_FUNCTION_ARGS)
  * segment. An example for this scenario is gp_restore. running this function
  * puts the QD aoseg table back in sync.
  */
-static Datum
-gp_update_ao_master_stats_internal(Oid relid, Snapshot appendOnlyMetaDataSnapshot)
+Datum
+gp_update_ao_master_stats(PG_FUNCTION_ARGS)
 {
+	Oid			relid = PG_GETARG_OID(0);
 	Relation	parentrel;
-	Datum		returnDatum;
+	int64		result;
+	Snapshot	appendOnlyMetaDataSnapshot;
+
+	Assert(Gp_role == GP_ROLE_DISPATCH);
 
 	/* open the parent (main) relation */
 	parentrel = heap_open(relid, RowExclusiveLock);
 
-	if (!RelationIsAoRows(parentrel) && !RelationIsAoCols(parentrel))
+	if (!RelationIsAppendOptimized(parentrel))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("'%s' is not an append-only relation",
 						RelationGetRelationName(parentrel))));
 
+	appendOnlyMetaDataSnapshot = RegisterSnapshot(GetLatestSnapshot());
 	if (RelationIsAoRows(parentrel))
-	{
-		returnDatum = gp_update_aorow_master_stats_internal(parentrel, appendOnlyMetaDataSnapshot);
-	}
+		result = gp_update_aorow_master_stats_internal(parentrel, appendOnlyMetaDataSnapshot);
 	else
 	{
-		returnDatum = gp_update_aocol_master_stats_internal(parentrel, appendOnlyMetaDataSnapshot);
+		result = gp_update_aocol_master_stats_internal(parentrel, appendOnlyMetaDataSnapshot);
 	}
+	UnregisterSnapshot(appendOnlyMetaDataSnapshot);
 
 	heap_close(parentrel, RowExclusiveLock);
 
-	return returnDatum;
-}
-
-Datum
-gp_update_ao_master_stats_name(PG_FUNCTION_ARGS)
-{
-	RangeVar   *parentrv;
-	text	   *relname = PG_GETARG_TEXT_P(0);
-	Oid			relid;
-
-	Assert(Gp_role == GP_ROLE_DISPATCH);
-
-	parentrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
-	relid = RangeVarGetRelid(parentrv, false);
-
-	return gp_update_ao_master_stats_internal(relid, SnapshotNow);
-}
-
-
-/*
- * get_ao_compression_ratio_oid
- *
- * same as get_ao_compression_ratio_name, but takes rel oid as argument.
- */
-Datum
-gp_update_ao_master_stats_oid(PG_FUNCTION_ARGS)
-{
-	Oid			relid = PG_GETARG_OID(0);
-
-	Assert(Gp_role == GP_ROLE_DISPATCH);
-
-	return gp_update_ao_master_stats_internal(relid, SnapshotNow);
+	PG_RETURN_INT64(result);
 }
 
 typedef struct
 {
-	int			index;
-	int			rows;
+	uint64 index;
+	/* there is a chance the count will return more than 2^32 rows
+	 * plus SPI_processed is 64 bit anyway */
+	uint64 rows;
 } QueryInfo;
 
 
 /**************************************************************
- * get_ao_distribution_oid
- * get_ao_distribution_name
+ * get_ao_distribution
  *
  * given an AO table name or oid, show the total distribution
  * of rows across all segment databases in the system.
- *
- * TODO: for now these 2 functions are almost completely
- * duplicated. See how to factor out a common internal function
- * such as done in get_ao_compression_ratio below.
  **************************************************************/
-
 Datum
-get_ao_distribution_oid(PG_FUNCTION_ARGS)
+get_ao_distribution(PG_FUNCTION_ARGS)
 {
+	Oid			relid = PG_GETARG_OID(0);
 	FuncCallContext *funcctx;
 	MemoryContext oldcontext;
 	AclResult	aclresult;
 	QueryInfo  *query_block = NULL;
-	StringInfoData sqlstmt;
+	char	   *sqlstmt;
 	Relation	parentrel;
 	Relation	aosegrel;
-	char		aoseg_relname[NAMEDATALEN];
 	int			ret;
-	Oid			relid = PG_GETARG_OID(0);
 
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 
@@ -1617,53 +1588,47 @@ get_ao_distribution_oid(PG_FUNCTION_ARGS)
 		/*
 		 * verify this is an AO relation
 		 */
-		if (!RelationIsAoRows(parentrel) && !RelationIsAoCols(parentrel))
+		if (!RelationIsAppendOptimized(parentrel))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("'%s' is not an append-only relation",
 							RelationGetRelationName(parentrel))));
 
-		GetAppendOnlyEntryAuxOids(RelationGetRelid(parentrel), SnapshotNow,
+		GetAppendOnlyEntryAuxOids(RelationGetRelid(parentrel), NULL,
 								  &segrelid, NULL, NULL, NULL, NULL);
 		Assert(OidIsValid(segrelid));
 
 		/*
-		 * get the name of the aoseg relation
-		 */
-		aosegrel = heap_open(segrelid, AccessShareLock);
-		snprintf(aoseg_relname, NAMEDATALEN, "%s", RelationGetRelationName(aosegrel));
-		heap_close(aosegrel, AccessShareLock);
-
-		/*
 		 * assemble our query string
 		 */
-		initStringInfo(&sqlstmt);
-		if (RelationIsAoRows(parentrel))
-			appendStringInfo(&sqlstmt, "select gp_segment_id,sum(tupcount)::bigint "
-							 "from gp_dist_random('pg_aoseg.%s') "
-							 "group by (gp_segment_id)", aoseg_relname);
-		else
-		{
-			Assert(RelationIsAoCols(parentrel));
+		aosegrel = heap_open(segrelid, AccessShareLock);
 
-			appendStringInfo(&sqlstmt, "select gp_segment_id,sum(tupcount)::bigint "
-							 "from gp_dist_random('pg_aoseg.%s') "
-							 "group by (gp_segment_id)", aoseg_relname);
-		}
+		/*
+		 * NOTE: we don't need quoting here. The aux AO segment heap table's name
+		 * should follow the pattern "pg_asoeg.pg_aoseg_<oid>".
+		 */
+		sqlstmt = psprintf("select gp_segment_id,sum(tupcount)::bigint "
+						   "from gp_dist_random('%s.%s') "
+						   "group by (gp_segment_id)",
+						   get_namespace_name(RelationGetNamespace(aosegrel)),
+						   RelationGetRelationName(aosegrel));
+
+		heap_close(aosegrel, AccessShareLock);
 
 		PG_TRY();
 		{
 
 			if (SPI_OK_CONNECT != SPI_connect())
 			{
-				ereport(ERROR, (errcode(ERRCODE_CDB_INTERNAL_ERROR),
-								errmsg("Unable to obtain AO relation information from segment databases."),
-								errdetail("SPI_connect failed in get_ao_distribution")));
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("unable to obtain AO relation information from segment databases"),
+						 errdetail("SPI_connect failed in get_ao_distribution")));
 			}
 			connected = true;
 
 			/* Do the query. */
-			ret = SPI_execute(sqlstmt.data, false, 0);
+			ret = SPI_execute(sqlstmt, false, 0);
 
 			if (ret > 0 && SPI_tuptable != NULL)
 			{
@@ -1701,187 +1666,7 @@ get_ao_distribution_oid(PG_FUNCTION_ARGS)
 		}
 		PG_END_TRY();
 
-		pfree(sqlstmt.data);
-		heap_close(parentrel, AccessShareLock);
-	}
-
-	/*
-	 * Per-call operations
-	 */
-
-	funcctx = SRF_PERCALL_SETUP();
-
-	query_block = (QueryInfo *) funcctx->user_fctx;
-	if (query_block->index < query_block->rows)
-	{
-		/*
-		 * Get heaptuple from SPI, then deform it, and reform it using our
-		 * tuple desc. If we don't do this, but rather try to pass the tuple
-		 * from SPI directly back, we get an error because the tuple desc that
-		 * is associated with the SPI call has not been blessed.
-		 */
-		HeapTuple	tuple = SPI_tuptable->vals[query_block->index++];
-		TupleDesc	tupleDesc = funcctx->tuple_desc;
-
-		Datum	   *values = (Datum *) palloc(tupleDesc->natts * sizeof(Datum));
-		bool	   *nulls = (bool *) palloc(tupleDesc->natts * sizeof(bool));
-
-		HeapTuple	res = NULL;
-		Datum		result;
-
-		heap_deform_tuple(tuple, tupleDesc, values, nulls);
-
-		res = heap_form_tuple(tupleDesc, values, nulls);
-
-		pfree(values);
-		pfree(nulls);
-
-		/* make the tuple into a datum */
-		result = HeapTupleGetDatum(res);
-
-		SRF_RETURN_NEXT(funcctx, result);
-	}
-
-	/*
-	 * do when there is no more left
-	 */
-	pfree(query_block);
-
-	SPI_finish();
-
-	funcctx->user_fctx = NULL;
-
-	SRF_RETURN_DONE(funcctx);
-}
-
-Datum
-get_ao_distribution_name(PG_FUNCTION_ARGS)
-{
-	FuncCallContext *funcctx;
-	MemoryContext oldcontext;
-	AclResult	aclresult;
-	QueryInfo  *query_block = NULL;
-	StringInfoData sqlstmt;
-	RangeVar   *parentrv;
-	Relation	parentrel;
-	Relation	aosegrel;
-	char		aoseg_relname[NAMEDATALEN];
-	int			ret;
-	text	   *relname = PG_GETARG_TEXT_P(0);
-	Oid			relid;
-
-	Assert(Gp_role == GP_ROLE_DISPATCH);
-
-	/*
-	 * stuff done only on the first call of the function. In here we execute
-	 * the query, gather the result rows and keep them in our context so that
-	 * we could return them in the next calls to this func.
-	 */
-	if (SRF_IS_FIRSTCALL())
-	{
-		bool		connected = false;
-		Oid			segrelid = InvalidOid;
-
-		funcctx = SRF_FIRSTCALL_INIT();
-
-		parentrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
-		relid = RangeVarGetRelid(parentrv, false);
-
-		/* get the relid of the parent (main) relation */
-		parentrel = heap_openrv(parentrv, AccessShareLock);
-
-		/*
-		 * check permission to SELECT from this table (this function is
-		 * effectively a form of COUNT(*) FROM TABLE
-		 */
-		aclresult = pg_class_aclcheck(parentrel->rd_id, GetUserId(),
-									  ACL_SELECT);
-
-		if (aclresult != ACLCHECK_OK)
-			aclcheck_error(aclresult,
-						   ACL_KIND_CLASS,
-						   RelationGetRelationName(parentrel));
-
-		/*
-		 * verify this is an AO relation
-		 */
-		if (!RelationIsAoRows(parentrel) && !RelationIsAoCols(parentrel))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("'%s' is not an append-only relation",
-							RelationGetRelationName(parentrel))));
-
-		GetAppendOnlyEntryAuxOids(RelationGetRelid(parentrel), SnapshotNow,
-								  &segrelid,
-								  NULL, NULL, NULL, NULL);
-		Assert(OidIsValid(segrelid));
-
-		/*
-		 * get the name of the aoseg relation
-		 */
-		aosegrel = heap_open(segrelid, AccessShareLock);
-		snprintf(aoseg_relname, NAMEDATALEN, "%s", RelationGetRelationName(aosegrel));
-		heap_close(aosegrel, AccessShareLock);
-
-		/*
-		 * assemble our query string
-		 */
-		initStringInfo(&sqlstmt);
-		appendStringInfo(&sqlstmt, "select gp_segment_id,sum(tupcount) "
-						 "from gp_dist_random('pg_aoseg.%s') "
-						 "group by (gp_segment_id)", aoseg_relname);
-
-		PG_TRY();
-		{
-
-			if (SPI_OK_CONNECT != SPI_connect())
-			{
-				ereport(ERROR, (errcode(ERRCODE_CDB_INTERNAL_ERROR),
-								errmsg("Unable to obtain AO relation information from segment databases."),
-								errdetail("SPI_connect failed in get_ao_distribution")));
-			}
-			connected = true;
-
-			/* Do the query. */
-			ret = SPI_execute(sqlstmt.data, false, 0);
-
-			if (ret > 0 && SPI_tuptable != NULL)
-			{
-				QueryInfo  *query_block_state = NULL;
-
-				/*
-				 * switch to memory context appropriate for multiple function
-				 * calls
-				 */
-				oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-				funcctx->tuple_desc = BlessTupleDesc(SPI_tuptable->tupdesc);
-
-				/*
-				 * Allocate cross-call state, so that we can keep track of
-				 * where we're at in the processing.
-				 */
-				query_block_state = (QueryInfo *) palloc0(sizeof(QueryInfo));
-				funcctx->user_fctx = (int *) query_block_state;
-
-				query_block_state->index = 0;
-				query_block_state->rows = SPI_processed;
-				MemoryContextSwitchTo(oldcontext);
-			}
-		}
-
-		/* Clean up in case of error. */
-		PG_CATCH();
-		{
-			if (connected)
-				SPI_finish();
-
-			/* Carry on with error handling. */
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-
-		pfree(sqlstmt.data);
+		pfree(sqlstmt);
 		heap_close(parentrel, AccessShareLock);
 	}
 
@@ -1935,98 +1720,87 @@ get_ao_distribution_name(PG_FUNCTION_ARGS)
 }
 
 /**************************************************************
- * get_ao_compression_ratio_oid
- * get_ao_compression_ratio_name
+ * get_ao_compression_ratio
  *
- * Given an append-only table name or oid calculate the effective
+ * Given an append-only table oid or name calculate the effective
  * compression ratio for this append only table stored data.
  * If this info is not available (pre 3.3 created tables) then
  * return -1.
  **************************************************************/
-
 Datum
-get_ao_compression_ratio_name(PG_FUNCTION_ARGS)
-{
-	RangeVar   *parentrv;
-	text	   *relname = PG_GETARG_TEXT_P(0);
-	Oid			relid;
-
-	Assert(Gp_role == GP_ROLE_DISPATCH);
-
-	parentrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
-	relid = RangeVarGetRelid(parentrv, false);
-
-	return ao_compression_ratio_internal(relid);
-}
-
-
-/*
- * get_ao_compression_ratio_oid
- *
- * same as get_ao_compression_ratio_name, but takes rel oid as argument.
- */
-Datum
-get_ao_compression_ratio_oid(PG_FUNCTION_ARGS)
+get_ao_compression_ratio(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
+	Relation	parentrel;
+	float8		result;
 
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 
-	return ao_compression_ratio_internal(relid);
+	/* open the parent (main) relation */
+	parentrel = heap_open(relid, AccessShareLock);
+
+	if (!RelationIsAppendOptimized(parentrel))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("'%s' is not an append-only relation",
+						RelationGetRelationName(parentrel))));
+
+	if (RelationIsAoRows(parentrel))
+		result = aorow_compression_ratio_internal(parentrel);
+	else
+		result = aocol_compression_ratio_internal(parentrel);
+
+	heap_close(parentrel, AccessShareLock);
+
+	PG_RETURN_FLOAT8(result);
 }
 
-static Datum
+static float8
 aorow_compression_ratio_internal(Relation parentrel)
 {
 	StringInfoData sqlstmt;
 	Relation	aosegrel;
 	bool		connected = false;
-	char		aoseg_relname[NAMEDATALEN];
-	int			proc;
+	int			proc;	/* 32 bit, only holds number of segments */
 	int			ret;
 	float8		compress_ratio = -1;	/* the default, meaning "not
 										 * available" */
 	Oid			segrelid = InvalidOid;
 
-	GetAppendOnlyEntryAuxOids(RelationGetRelid(parentrel), SnapshotNow,
+	Assert(Gp_role == GP_ROLE_DISPATCH);
+
+	GetAppendOnlyEntryAuxOids(RelationGetRelid(parentrel), NULL,
 							  &segrelid,
 							  NULL, NULL, NULL, NULL);
 	Assert(OidIsValid(segrelid));
 
 	/*
-	 * get the name of the aoseg relation
-	 */
-	aosegrel = heap_open(segrelid, AccessShareLock);
-	snprintf(aoseg_relname, NAMEDATALEN, "%s", RelationGetRelationName(aosegrel));
-	heap_close(aosegrel, AccessShareLock);
-
-	/*
 	 * assemble our query string
 	 */
+	aosegrel = heap_open(segrelid, AccessShareLock);
 	initStringInfo(&sqlstmt);
-	if (Gp_role == GP_ROLE_DISPATCH)
-		appendStringInfo(&sqlstmt, "select sum(eof), sum(eofuncompressed) "
-						 "from gp_dist_random('pg_aoseg.%s')",
-						 aoseg_relname);
-	else
-		appendStringInfo(&sqlstmt, "select eof, eofuncompressed "
-						 "from pg_aoseg.%s",
-						 aoseg_relname);
+	appendStringInfo(&sqlstmt, "select sum(eof), sum(eofuncompressed) "
+					 "from gp_dist_random('%s.%s')",
+					 get_namespace_name(RelationGetNamespace(aosegrel)),
+					 RelationGetRelationName(aosegrel));
+
+	heap_close(aosegrel, AccessShareLock);
 
 	PG_TRY();
 	{
 
 		if (SPI_OK_CONNECT != SPI_connect())
 		{
-			ereport(ERROR, (errcode(ERRCODE_CDB_INTERNAL_ERROR),
-							errmsg("Unable to obtain AO relation information from segment databases."),
-							errdetail("SPI_connect failed in get_ao_compression_ratio")));
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("unable to obtain AO relation information from segment databases"),
+					 errdetail("SPI_connect failed in get_ao_compression_ratio.")));
 		}
 		connected = true;
 
 		/* Do the query. */
 		ret = SPI_execute(sqlstmt.data, false, 0);
-		proc = SPI_processed;
+		proc = (int) SPI_processed;
 
 		if (ret > 0 && SPI_tuptable != NULL)
 		{
@@ -2050,7 +1824,7 @@ aorow_compression_ratio_internal(Relation parentrel)
 			if (NULL == attr1 || NULL == attr2)
 			{
 				SPI_finish();
-				PG_RETURN_FLOAT8(1);
+				return 1;
 			}
 
 			if (scanint8(attr1, true, &eof) &&
@@ -2086,36 +1860,7 @@ aorow_compression_ratio_internal(Relation parentrel)
 
 	pfree(sqlstmt.data);
 
-	PG_RETURN_FLOAT8(compress_ratio);
-}
-
-static Datum
-ao_compression_ratio_internal(Oid relid)
-{
-	Relation	parentrel;
-	Datum		returnDatum;
-
-	/* open the parent (main) relation */
-	parentrel = heap_open(relid, AccessShareLock);
-
-	if (!RelationIsAoRows(parentrel) && !RelationIsAoCols(parentrel))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("'%s' is not an append-only relation",
-						RelationGetRelationName(parentrel))));
-
-	if (RelationIsAoRows(parentrel))
-	{
-		returnDatum = aorow_compression_ratio_internal(parentrel);
-	}
-	else
-	{
-		returnDatum = aocol_compression_ratio_internal(parentrel);
-	}
-
-	heap_close(parentrel, AccessShareLock);
-
-	return returnDatum;
+	return compress_ratio;
 }
 
 void
@@ -2131,162 +1876,3 @@ FreeAllSegFileInfo(FileSegInfo **allSegInfo, int totalSegFiles)
 	}
 }
 
-
-void
-PrintPgaosegAndGprelationNodeEntries(FileSegInfo **allseginfo, int totalsegs, bool *segmentFileNumMap)
-{
-	char		segnumArray[1000];
-	char		delimiter[5] = " ";
-	char		tmp[10] = {0};
-
-	memset(segnumArray, 0, sizeof(segnumArray));
-
-	char	   *head = segnumArray;
-	const char *tail = segnumArray + sizeof(segnumArray);
-
-	for (int i = 0; i < totalsegs && allseginfo; i++)
-	{
-		snprintf(tmp, sizeof(tmp), "%d:%jd", allseginfo[i]->segno, allseginfo[i]->eof);
-
-		if (strlen(tmp) + strlen(delimiter) >= (tail - head))
-			break;
-
-		head += strlcpy(head, tmp, tail - head);
-		head += strlcpy(head, delimiter, tail - head);
-	}
-	elog(LOG, "pg_aoseg segno:eof entries: %s", segnumArray);
-
-	memset(segnumArray, 0, sizeof(segnumArray));
-	head = segnumArray;
-
-	for (int i = 0; i < AOTupleId_MaxSegmentFileNum; i++)
-	{
-		if (segmentFileNumMap[i] == true)
-		{
-			snprintf(tmp, sizeof(tmp), "%d", i);
-
-			if (strlen(tmp) + strlen(delimiter) >= (tail - head))
-				break;
-
-			head += strlcpy(head, tmp, tail - head);
-			head += strlcpy(head, delimiter, tail - head);
-		}
-	}
-	elog(LOG, "gp_relation_node segno entries: %s", segnumArray);
-}
-
-
-void
-CheckAOConsistencyWithGpRelationNode(Snapshot snapshot, Relation rel, int totalsegs, FileSegInfo **allseginfo)
-{
-	GpRelationNodeScan gpRelationNodeScan;
-	int			segmentFileNum = 0;
-	ItemPointerData persistentTid;
-	int64		persistentSerialNum = 0;
-	int			segmentCount = 0;
-	Relation	gp_relation_node;
-
-	if (!gp_appendonly_verify_eof)
-	{
-		return;
-	}
-
-	/*
-	 * gp_relation_node always has a zero. Hence we use Max segment file
-	 * number plus 1 in order to accomodate the zero
-	 */
-	const int	num_gp_relation_node_entries = AOTupleId_MaxSegmentFileNum + 1;
-	bool	   *segmentFileNumMap = (bool *) palloc0(sizeof(bool) * num_gp_relation_node_entries);
-	int			i = 0;
-	int			j = 0;
-
-	gp_relation_node = heap_open(GpRelationNodeRelationId, AccessShareLock);
-	GpRelationNodeBeginScan(
-							snapshot,
-							gp_relation_node,
-							rel->rd_id,
-							rel->rd_rel->reltablespace,
-							rel->rd_rel->relfilenode,
-							&gpRelationNodeScan);
-	while ((NULL != GpRelationNodeGetNext(
-										  &gpRelationNodeScan,
-										  &segmentFileNum,
-										  &persistentTid,
-										  &persistentSerialNum)))
-	{
-		if (segmentFileNumMap[segmentFileNum] != true)
-		{
-			segmentFileNumMap[segmentFileNum] = true;
-			segmentCount++;
-		}
-
-		if (segmentCount > totalsegs + 1)
-		{
-			PrintPgaosegAndGprelationNodeEntries(allseginfo, totalsegs, segmentFileNumMap);
-			elog(ERROR, "gp_relation_node (%d) has more entries than pg_aoseg (%d) for relation %s",
-				 segmentCount,
-				 totalsegs,
-				 RelationGetRelationName(rel));
-		}
-	}
-
-	GpRelationNodeEndScan(&gpRelationNodeScan);
-	heap_close(gp_relation_node, AccessShareLock);
-
-	if (totalsegs > 0)
-	{
-		if (allseginfo[0]->segno == 0)
-		{
-			i++;
-		}
-	}
-
-	for (j = 1; j < num_gp_relation_node_entries; j++)
-	{
-		if (segmentFileNumMap[j] == true)
-		{
-			while (i < totalsegs && allseginfo[i]->segno != j)
-			{
-
-				if (allseginfo[i]->eof != 0 && segmentFileNumMap[allseginfo[i]->segno] == false)
-				{
-					PrintPgaosegAndGprelationNodeEntries(allseginfo, totalsegs, segmentFileNumMap);
-					elog(ERROR, "Missing pg_aoseg entry %d in gp_relation_node for %s",
-						 allseginfo[i]->segno, RelationGetRelationName(rel));
-				}
-				i++;
-			}
-
-			if (i < totalsegs && allseginfo[i]->segno == j)
-			{
-				i++;
-				continue;
-			}
-
-			if (i == totalsegs)
-			{
-				PrintPgaosegAndGprelationNodeEntries(allseginfo, totalsegs, segmentFileNumMap);
-				elog(ERROR, "Missing gp_relation_node entry %d in pg_aoseg for %s",
-					 j, RelationGetRelationName(rel));
-			}
-		}
-	}
-
-	/*
-	 * Check for any extra entries in pg_aoseg which are not present in
-	 * gp_relation_node
-	 */
-	while (i < totalsegs)
-	{
-		Assert(segmentFileNumMap[allseginfo[i]->segno] == false);
-		if (allseginfo[i]->eof != 0)
-		{
-			PrintPgaosegAndGprelationNodeEntries(allseginfo, totalsegs, segmentFileNumMap);
-			elog(ERROR, "Missing pg_aoseg entry %d in gp_relation_node for %s",
-				 allseginfo[i]->segno, RelationGetRelationName(rel));
-		}
-		i++;
-	}
-
-	pfree(segmentFileNumMap);
-}

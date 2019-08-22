@@ -1,4 +1,4 @@
-# $PostgreSQL: pgsql/config/docbook.m4,v 1.10 2008/11/26 11:26:54 petere Exp $
+# config/docbook.m4
 
 # PGAC_PROG_JADE
 # --------------
@@ -89,40 +89,14 @@ fi])# PGAC_PATH_DOCBOOK_STYLESHEETS
 
 # PGAC_PATH_COLLATEINDEX
 # ----------------------
+# Some DocBook installations provide collateindex.pl in $DOCBOOKSTYLE/bin,
+# but it's not necessarily marked executable, so we can't use AC_PATH_PROG
+# to check for it there.  Other installations just put it in the PATH.
 AC_DEFUN([PGAC_PATH_COLLATEINDEX],
 [AC_REQUIRE([PGAC_PATH_DOCBOOK_STYLESHEETS])dnl
-if test -n "$DOCBOOKSTYLE"; then
-  AC_PATH_PROGS(COLLATEINDEX, collateindex.pl, [],
-                [$DOCBOOKSTYLE/bin $PATH])
+if test -n "$DOCBOOKSTYLE" -a -r "$DOCBOOKSTYLE/bin/collateindex.pl"; then
+  COLLATEINDEX="$DOCBOOKSTYLE/bin/collateindex.pl"
+  AC_SUBST([COLLATEINDEX])
 else
-  AC_PATH_PROGS(COLLATEINDEX, collateindex.pl)
+  AC_PATH_PROG(COLLATEINDEX, collateindex.pl)
 fi])# PGAC_PATH_COLLATEINDEX
-
-
-# PGAC_PATH_DOCBOOK2MAN
-# ---------------------
-# Find docbook2man program from the docbook2X package.  Upstream calls
-# this program docbook2man, but there is also a different docbook2man
-# out there from the docbook-utils package.  Thus, the program we want
-# is called docbook2x-man on Debian and db2x_docbook2man on Fedora.
-#
-# (Consider rewriting this macro using AC_PATH_PROGS_FEATURE_CHECK
-# when switching to Autoconf 2.62+.)
-AC_DEFUN([PGAC_PATH_DOCBOOK2MAN],
-[AC_CACHE_CHECK([for docbook2man], [ac_cv_path_DOCBOOK2MAN],
-[if test -z "$DOCBOOK2MAN"; then
-  _AS_PATH_WALK([],
-  [for ac_prog in docbook2x-man db2x_docbook2man docbook2man; do
-    ac_path="$as_dir/$ac_prog"
-    AS_EXECUTABLE_P(["$ac_path"]) || continue
-    if "$ac_path" --version 2>/dev/null | $GREP docbook2x >/dev/null 2>&1; then
-      ac_cv_path_DOCBOOK2MAN=$ac_path
-      break
-    fi
-  done])
-else
-  ac_cv_path_DOCBOOK2MAN=$DOCBOOK2MAN
-fi])
-DOCBOOK2MAN=$ac_cv_path_DOCBOOK2MAN
-AC_SUBST(DOCBOOK2MAN)
-])# PGAC_PATH_DOCBOOK2MAN

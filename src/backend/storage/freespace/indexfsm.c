@@ -4,19 +4,19 @@
  *	  POSTGRES free space map for quickly finding free pages in relations
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/storage/freespace/indexfsm.c,v 1.3 2008/11/19 10:34:52 heikki Exp $
+ *	  src/backend/storage/freespace/indexfsm.c
  *
  *
  * NOTES:
  *
- *  This is similar to the FSM used for heap, in freespace.c, but instead
- *  of tracking the amount of free space on pages, we only track whether
- *  pages are completely free or in-use. We use the same FSM implementation
- *  as for heaps, using BLCKSZ - 1 to denote used pages, and 0 for unused.
+ *	This is similar to the FSM used for heap, in freespace.c, but instead
+ *	of tracking the amount of free space on pages, we only track whether
+ *	pages are completely free or in-use. We use the same FSM implementation
+ *	as for heaps, using BLCKSZ - 1 to denote used pages, and 0 for unused.
  *
  *-------------------------------------------------------------------------
  */
@@ -24,7 +24,6 @@
 
 #include "storage/freespace.h"
 #include "storage/indexfsm.h"
-#include "storage/smgr.h"
 
 /*
  * Exported routines
@@ -38,7 +37,7 @@
 BlockNumber
 GetFreeIndexPage(Relation rel)
 {
-	BlockNumber blkno = GetPageWithFreeSpace(rel, BLCKSZ/2);
+	BlockNumber blkno = GetPageWithFreeSpace(rel, BLCKSZ / 2);
 
 	if (blkno != InvalidBlockNumber)
 		RecordUsedIndexPage(rel, blkno);

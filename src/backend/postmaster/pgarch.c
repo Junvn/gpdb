@@ -14,12 +14,12 @@
  *
  *	Initial author: Simon Riggs		simon@2ndquadrant.com
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/postmaster/pgarch.c,v 1.38.2.1 2010/05/11 16:42:40 tgl Exp $
+ *	  src/backend/postmaster/pgarch.c
  *
  *-------------------------------------------------------------------------
  */
@@ -32,19 +32,23 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "postmaster/fork_process.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
+#include "storage/dsm.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
 #include "utils/guc.h"
 #include "utils/ps_status.h"
-#include "postmaster/primary_mirror_mode.h"
+
 
 /* ----------
  * Timer definitions.
@@ -55,19 +59,6 @@
 										 * seconds. */
 #define PGARCH_RESTART_INTERVAL 10		/* How often to attempt to restart a
 										 * failed archiver; in seconds. */
-
-/* ----------
- * Archiver control info.
- *
- * We expect that archivable files within pg_xlog will have names between
- * MIN_XFN_CHARS and MAX_XFN_CHARS in length, consisting only of characters
- * appearing in VALID_XFN_CHARS.  The status files in archive_status have
- * corresponding names with ".ready" or ".done" appended.
- * ----------
- */
-#define MIN_XFN_CHARS	16
-#define MAX_XFN_CHARS	40
-#define VALID_XFN_CHARS "0123456789ABCDEF.history.backup"
 
 #define NUM_ARCHIVE_RETRIES 3
 
@@ -87,6 +78,11 @@ static volatile sig_atomic_t got_SIGTERM = false;
 static volatile sig_atomic_t wakened = false;
 static volatile sig_atomic_t ready_to_stop = false;
 
+/*
+ * Latch used by signal handlers to wake up the sleep in the main loop.
+ */
+static Latch mainloop_latch;
+
 /* ----------
  * Local function forward declarations
  * ----------
@@ -95,7 +91,7 @@ static volatile sig_atomic_t ready_to_stop = false;
 static pid_t pgarch_forkexec(void);
 #endif
 
-NON_EXEC_STATIC void PgArchiverMain(int argc, char *argv[]);
+NON_EXEC_STATIC void PgArchiverMain(int argc, char *argv[]) __attribute__((noreturn));
 static void pgarch_exit(SIGNAL_ARGS);
 static void ArchSigHupHandler(SIGNAL_ARGS);
 static void ArchSigTermHandler(SIGNAL_ARGS);
@@ -168,6 +164,7 @@ pgarch_start(void)
 			on_exit_reset();
 
 			/* Drop our connection to postmaster's shared memory, as well */
+			dsm_detach_all();
 			PGSharedMemoryDetach();
 
 			PgArchiverMain(0, NULL);
@@ -227,8 +224,6 @@ PgArchiverMain(int argc, char *argv[])
 	IsUnderPostmaster = true;	/* we are a postmaster subprocess now */
 
 	MyProcPid = getpid();		/* reset MyProcPid */
-	
-	MyStartTime = time(NULL);	/* record Start Time for logging */
 
 	MyStartTime = time(NULL);	/* record Start Time for logging */
 
@@ -240,6 +235,10 @@ PgArchiverMain(int argc, char *argv[])
 	if (setsid() < 0)
 		elog(FATAL, "setsid() failed: %m");
 #endif
+
+	InitializeLatchSupport();	/* needed for latch waits */
+
+	InitLatch(&mainloop_latch); /* initialize latch used in main loop */
 
 	/*
 	 * Ignore all signals usually bound to some action in the postmaster,
@@ -282,14 +281,21 @@ pgarch_exit(SIGNAL_ARGS)
 static void
 ArchSigHupHandler(SIGNAL_ARGS)
 {
+	int			save_errno = errno;
+
 	/* set flag to re-read config file at next convenient time */
 	got_SIGHUP = true;
+	SetLatch(&mainloop_latch);
+
+	errno = save_errno;
 }
 
 /* SIGTERM signal handler for archiver process */
 static void
 ArchSigTermHandler(SIGNAL_ARGS)
 {
+	int			save_errno = errno;
+
 	/*
 	 * The postmaster never sends us SIGTERM, so we assume that this means
 	 * that init is trying to shut down the whole system.  If we hang around
@@ -297,22 +303,35 @@ ArchSigTermHandler(SIGNAL_ARGS)
 	 * archive commands.
 	 */
 	got_SIGTERM = true;
+	SetLatch(&mainloop_latch);
+
+	errno = save_errno;
 }
 
 /* SIGUSR1 signal handler for archiver process */
 static void
 pgarch_waken(SIGNAL_ARGS)
 {
+	int			save_errno = errno;
+
 	/* set flag that there is work to be done */
 	wakened = true;
+	SetLatch(&mainloop_latch);
+
+	errno = save_errno;
 }
 
 /* SIGUSR2 signal handler for archiver process */
 static void
 pgarch_waken_stop(SIGNAL_ARGS)
 {
+	int			save_errno = errno;
+
 	/* set flag to do a final cycle and shut down afterwards */
 	ready_to_stop = true;
+	SetLatch(&mainloop_latch);
+
+	errno = save_errno;
 }
 
 /*
@@ -323,7 +342,7 @@ pgarch_waken_stop(SIGNAL_ARGS)
 static void
 pgarch_MainLoop(void)
 {
-	time_t		last_copy_time = 0;
+	pg_time_t	last_copy_time = 0;
 	bool		time_to_stop;
 
 	/*
@@ -334,8 +353,15 @@ pgarch_MainLoop(void)
 	 */
 	wakened = true;
 
+	/*
+	 * There shouldn't be anything for the archiver to do except to wait for a
+	 * signal ... however, the archiver exists to protect our data, so she
+	 * wakes up occasionally to allow herself to be proactive.
+	 */
 	do
 	{
+		ResetLatch(&mainloop_latch);
+
 		/* When we get SIGUSR2, we do one more archive cycle, then exit */
 		time_to_stop = ready_to_stop;
 
@@ -350,8 +376,8 @@ pgarch_MainLoop(void)
 		 * If we've gotten SIGTERM, we normally just sit and do nothing until
 		 * SIGUSR2 arrives.  However, that means a random SIGTERM would
 		 * disable archiving indefinitely, which doesn't seem like a good
-		 * idea.  If more than 60 seconds pass since SIGTERM, exit anyway,
-		 * so that the postmaster can start a new archiver if needed.
+		 * idea.  If more than 60 seconds pass since SIGTERM, exit anyway, so
+		 * that the postmaster can start a new archiver if needed.
 		 */
 		if (got_SIGTERM)
 		{
@@ -373,24 +399,27 @@ pgarch_MainLoop(void)
 		}
 
 		/*
-		 * There shouldn't be anything for the archiver to do except to wait
-		 * for a signal ... however, the archiver exists to protect our data,
-		 * so she wakes up occasionally to allow herself to be proactive.
-		 *
-		 * On some platforms, signals won't interrupt the sleep.  To ensure we
-		 * respond reasonably promptly when someone signals us, break down the
-		 * sleep into 1-second increments, and check for interrupts after each
-		 * nap.
+		 * Sleep until a signal is received, or until a poll is forced by
+		 * PGARCH_AUTOWAKE_INTERVAL having passed since last_copy_time, or
+		 * until postmaster dies.
 		 */
-		while (!(wakened || ready_to_stop || got_SIGHUP ||
-				 !PostmasterIsAlive(true)))
+		if (!time_to_stop)		/* Don't wait during last iteration */
 		{
-			time_t		curtime;
+			pg_time_t	curtime = (pg_time_t) time(NULL);
+			int			timeout;
 
-			pg_usleep(1000000L);
-			curtime = time(NULL);
-			if ((unsigned int) (curtime - last_copy_time) >=
-				(unsigned int) PGARCH_AUTOWAKE_INTERVAL)
+			timeout = PGARCH_AUTOWAKE_INTERVAL - (curtime - last_copy_time);
+			if (timeout > 0)
+			{
+				int			rc;
+
+				rc = WaitLatch(&mainloop_latch,
+							 WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+							   timeout * 1000L);
+				if (rc & WL_TIMEOUT)
+					wakened = true;
+			}
+			else
 				wakened = true;
 		}
 
@@ -399,7 +428,7 @@ pgarch_MainLoop(void)
 		 * or after completing one more archiving cycle after receiving
 		 * SIGUSR2.
 		 */
-	} while (PostmasterIsAlive(true) && !time_to_stop);
+	} while (PostmasterIsAlive() && !time_to_stop);
 }
 
 /*
@@ -426,12 +455,12 @@ pgarch_ArchiverCopyLoop(void)
 		{
 			/*
 			 * Do not initiate any more archive commands after receiving
-			 * SIGTERM, nor after the postmaster has died unexpectedly.
-			 * The first condition is to try to keep from having init
-			 * SIGKILL the command, and the second is to avoid conflicts
-			 * with another archiver spawned by a newer postmaster.
+			 * SIGTERM, nor after the postmaster has died unexpectedly. The
+			 * first condition is to try to keep from having init SIGKILL the
+			 * command, and the second is to avoid conflicts with another
+			 * archiver spawned by a newer postmaster.
 			 */
-			if (got_SIGTERM || !PostmasterIsAlive(true))
+			if (got_SIGTERM || !PostmasterIsAlive())
 				return;
 
 			/*
@@ -457,14 +486,27 @@ pgarch_ArchiverCopyLoop(void)
 			{
 				/* successful */
 				pgarch_archiveDone(xlog);
+
+				/*
+				 * Tell the collector about the WAL file that we successfully
+				 * archived
+				 */
+				pgstat_send_archiver(xlog, false);
+
 				break;			/* out of inner retry loop */
 			}
 			else
 			{
+				/*
+				 * Tell the collector about the WAL file that we failed to
+				 * archive
+				 */
+				pgstat_send_archiver(xlog, true);
+
 				if (++failures >= NUM_ARCHIVE_RETRIES)
 				{
 					ereport(WARNING,
-							(errmsg("transaction log file \"%s\" could not be archived: too many failures",
+							(errmsg("archiving transaction log file \"%s\" failed too many times, will try again later",
 									xlog)));
 					return;		/* give up archiving for now */
 				}
@@ -491,13 +533,8 @@ pgarch_archiveXlog(char *xlog)
 	char	   *endp;
 	const char *sp;
 	int			rc;
-	char		*xlogDir = makeRelativeToTxnFilespace(XLOGDIR);
 
-	if (snprintf(pathname, MAXPGPATH, "%s/%s", xlogDir, xlog) > MAXPGPATH)
-	{
-		ereport(ERROR, (errmsg("cannot generate path %s/%s", xlogDir, xlog)));
-	}
-	pfree(xlogDir);
+	snprintf(pathname, MAXPGPATH, XLOGDIR "/%s", xlog);
 
 	/*
 	 * construct the command to be executed
@@ -559,15 +596,15 @@ pgarch_archiveXlog(char *xlog)
 	{
 		/*
 		 * If either the shell itself, or a called command, died on a signal,
-		 * abort the archiver.	We do this because system() ignores SIGINT and
+		 * abort the archiver.  We do this because system() ignores SIGINT and
 		 * SIGQUIT while waiting; so a signal is very likely something that
-		 * should have interrupted us too.	If we overreact it's no big deal,
+		 * should have interrupted us too.  If we overreact it's no big deal,
 		 * the postmaster will just start the archiver again.
 		 *
 		 * Per the Single Unix Spec, shells report exit status > 128 when a
 		 * called command died on a signal.
 		 */
-		int		lev = (WIFSIGNALED(rc) || WEXITSTATUS(rc) > 128) ? FATAL : LOG;
+		int			lev = (WIFSIGNALED(rc) || WEXITSTATUS(rc) > 128) ? FATAL : LOG;
 
 		if (WIFEXITED(rc))
 		{
@@ -581,16 +618,16 @@ pgarch_archiveXlog(char *xlog)
 		{
 #if defined(WIN32)
 			ereport(lev,
-					(errmsg("archive command was terminated by exception 0x%X",
-							WTERMSIG(rc)),
-					 errhint("See C include file \"ntstatus.h\" for a description of the hexadecimal value."),
-					 errdetail("The failed archive command was: %s",
-							   xlogarchcmd)));
+				  (errmsg("archive command was terminated by exception 0x%X",
+						  WTERMSIG(rc)),
+				   errhint("See C include file \"ntstatus.h\" for a description of the hexadecimal value."),
+				   errdetail("The failed archive command was: %s",
+							 xlogarchcmd)));
 #elif defined(HAVE_DECL_SYS_SIGLIST) && HAVE_DECL_SYS_SIGLIST
 			ereport(lev,
 					(errmsg("archive command was terminated by signal %d: %s",
 							WTERMSIG(rc),
-							WTERMSIG(rc) < NSIG ? sys_siglist[WTERMSIG(rc)] : "(unknown)"),
+			  WTERMSIG(rc) < NSIG ? sys_siglist[WTERMSIG(rc)] : "(unknown)"),
 					 errdetail("The failed archive command was: %s",
 							   xlogarchcmd)));
 #else
@@ -604,10 +641,10 @@ pgarch_archiveXlog(char *xlog)
 		else
 		{
 			ereport(lev,
-					(errmsg("archive command exited with unrecognized status %d",
-							rc),
-					 errdetail("The failed archive command was: %s",
-							   xlogarchcmd)));
+				(errmsg("archive command exited with unrecognized status %d",
+						rc),
+				 errdetail("The failed archive command was: %s",
+						   xlogarchcmd)));
 		}
 
 		snprintf(activitymsg, sizeof(activitymsg), "failed on %s", xlog);
@@ -659,15 +696,8 @@ pgarch_readyXlog(char *xlog)
 	DIR		   *rldir;
 	struct dirent *rlde;
 	bool		found = false;
-	char		*xlogDir = NULL;
 
-	xlogDir = makeRelativeToTxnFilespace(XLOGDIR);
-	if (snprintf(XLogArchiveStatusDir, MAXPGPATH, "%s/archive_status", xlogDir) > MAXPGPATH)
-	{
-		ereport(ERROR, (errmsg("cannot generate path %s/archive_status", xlogDir)));
-	}
-	pfree(xlogDir);
-
+	snprintf(XLogArchiveStatusDir, MAXPGPATH, XLOGDIR "/archive_status");
 	rldir = AllocateDir(XLogArchiveStatusDir);
 	if (rldir == NULL)
 		ereport(ERROR,
@@ -723,9 +753,5 @@ pgarch_archiveDone(char *xlog)
 
 	StatusFilePath(rlogready, xlog, ".ready");
 	StatusFilePath(rlogdone, xlog, ".done");
-	if (rename(rlogready, rlogdone) < 0)
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not rename file \"%s\" to \"%s\": %m",
-						rlogready, rlogdone)));
+	(void) durable_rename(rlogready, rlogdone, WARNING);
 }

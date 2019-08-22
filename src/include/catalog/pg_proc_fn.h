@@ -1,13 +1,13 @@
 /*-------------------------------------------------------------------------
  *
  * pg_proc_fn.h
- * 	 prototypes for functions in catalog/pg_proc.c
+ *	 prototypes for functions in catalog/pg_proc.c
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/catalog/pg_proc_fn.h,v 1.4 2008/12/18 18:20:35 tgl Exp $
+ * src/include/catalog/pg_proc_fn.h
  *
  *-------------------------------------------------------------------------
  */
@@ -21,17 +21,19 @@ extern Oid ProcedureCreate(const char *procedureName,
 				bool replace,
 				bool returnsSet,
 				Oid returnType,
+				Oid proowner,
 				Oid languageObjectId,
 				Oid languageValidator,
 				Oid describeFuncOid,
 				const char *prosrc,
 				const char *probin,
 				bool isAgg,
-				bool isWin,
+				bool isWindowFunc,
 				bool security_definer,
+				bool isLeakProof,
 				bool isStrict,
 				char volatility,
-				const oidvector *parameterTypes,
+				oidvector *parameterTypes,
 				Datum allParameterTypes,
 				Datum parameterModes,
 				Datum parameterNames,

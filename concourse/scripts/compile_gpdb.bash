@@ -2,13 +2,13 @@
 set -exo pipefail
 
 GREENPLUM_INSTALL_DIR=/usr/local/greenplum-db-devel
-export GPDB_ARTIFACTS_DIR
-GPDB_ARTIFACTS_DIR=$(pwd)/$OUTPUT_ARTIFACT_DIR
-
+export GPDB_ARTIFACTS_DIR=$(pwd)/${OUTPUT_ARTIFACT_DIR}
 CWDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-
 GPDB_SRC_PATH=${GPDB_SRC_PATH:=gpdb_src}
+
 GPDB_BIN_FILENAME=${GPDB_BIN_FILENAME:="bin_gpdb.tar.gz"}
+GREENPLUM_CL_INSTALL_DIR=/usr/local/greenplum-clients-devel
+GPDB_CL_FILENAME=${GPDB_CL_FILENAME:="gpdb-clients-${TARGET_OS}${TARGET_OS_VERSION}.tar.gz"}
 
 function expand_glob_ensure_exists() {
   local -a glob=($*)
@@ -16,49 +16,54 @@ function expand_glob_ensure_exists() {
   echo "${glob[0]}"
 }
 
-function prep_env_for_centos() {
-  case "$TARGET_OS_VERSION" in
-    5)
-      BLDARCH=rhel5_x86_64
-      export JAVA_HOME=/usr/lib/jvm/java-1.6.0-openjdk-1.6.0.39.x86_64
-      source /opt/gcc_env.sh
-      ;;
-
-    6)
-      BLDARCH=rhel6_x86_64
-      export JAVA_HOME=/usr/lib/jvm/java-1.7.0-openjdk.x86_64
-      source /opt/gcc_env.sh
-      ;;
-
-    7)
-      BLDARCH=rhel7_x86_64
-      echo "Detecting java7 path ..."
-      java7_packages=$(rpm -qa | grep -F java-1.7)
-      java7_bin="$(rpm -ql $java7_packages | grep /jre/bin/java$)"
-      alternatives --set java "$java7_bin"
-      export JAVA_HOME="${java7_bin/jre\/bin\/java/}"
-      ln -sf /usr/bin/xsubpp /usr/share/perl5/ExtUtils/xsubpp
-      source /opt/gcc_env.sh
-      ;;
-
+function prep_env() {
+  case "${TARGET_OS}" in
+  centos)
+    case "${TARGET_OS_VERSION}" in
+    6 | 7) BLD_ARCH=rhel${TARGET_OS_VERSION}_x86_64 ;;
     *)
-    echo "TARGET_OS_VERSION not set or recognized for Centos/RHEL"
-    exit 1
+      echo "TARGET_OS_VERSION not set or recognized for Centos/RHEL"
+      exit 1
+      ;;
+    esac
+    ;;
+  ubuntu)
+    case "${TARGET_OS_VERSION}" in
+    18.04) BLD_ARCH=ubuntu18.04_x86_64 ;;
+    *)
+      echo "TARGET_OS_VERSION not set or recognized for Ubuntu"
+      exit 1
+      ;;
+    esac
     ;;
   esac
-
-  ln -sf $(pwd)/$GPDB_SRC_PATH/gpAux/ext/${BLDARCH}/python-2.7.12 /opt/python-2.7.12
-  export PATH=${JAVA_HOME}/bin:${PATH}
 }
 
-function prep_env_for_sles() {
-  export JAVA_HOME=$(expand_glob_ensure_exists /usr/java/jdk1.7*)
-  export PATH=${JAVA_HOME}/bin:${PATH}
-  source /opt/gcc_env.sh
+function install_deps_for_centos() {
+  rpm -i libquicklz-installer/libquicklz-*.rpm
+  rpm -i libquicklz-devel-installer/libquicklz-*.rpm
+  # install libsigar from tar.gz
+  tar zxf libsigar-installer/sigar-*.targz -C gpdb_src/gpAux/ext
+}
+
+function install_deps_for_ubuntu() {
+  dpkg --install libquicklz-installer/libquicklz-*.deb
+}
+
+function install_deps() {
+  case "${TARGET_OS}" in
+    centos) install_deps_for_centos;;
+    ubuntu) install_deps_for_ubuntu;;
+  esac
+}
+
+function link_python() {
+  tar xf python-tarball/python-*.tar.gz -C $(pwd)/${GPDB_SRC_PATH}/gpAux/ext
+  ln -sf $(pwd)/${GPDB_SRC_PATH}/gpAux/ext/${BLD_ARCH}/python-2.7.12 /opt/python-2.7.12
 }
 
 function generate_build_number() {
-  pushd $GPDB_SRC_PATH
+  pushd ${GPDB_SRC_PATH}
     #Only if its git repro, add commit SHA as build number
     # BUILD_NUMBER file is used by getversion file in GPDB to append to version
     if [ -d .git ] ; then
@@ -67,142 +72,203 @@ function generate_build_number() {
   popd
 }
 
-function make_sync_tools() {
-  pushd $GPDB_SRC_PATH/gpAux
-    # Requires these variables in the env:
-    # IVYREPO_HOST IVYREPO_REALM IVYREPO_USER IVYREPO_PASSWD
-    make sync_tools
-  popd
-}
-
-function link_tools_for_sles() {
-  ln -sf "$(expand_glob_ensure_exists "$(pwd)"/${GPDB_SRC_PATH}/gpAux/ext/*/python-2.7.12 )" /opt
-}
-
 function build_gpdb() {
-  pushd $GPDB_SRC_PATH/gpAux
+  pushd ${GPDB_SRC_PATH}/gpAux
     # Use -j4 to speed up the build. (Doesn't seem worth trying to guess a better
     # value based on number of CPUs or anything like that. Going above -j4 wouldn't
     # make it much faster, and -j4 is small enough to not hurt too badly even on
     # a single-CPU system
     if [ -n "$1" ]; then
-      make "$1" GPROOT=/usr/local PARALLEL_MAKE_OPTS=-j4 dist
+      make "$1" GPROOT=/usr/local PARALLEL_MAKE_OPTS=-j4 -s dist
     else
-      make GPROOT=/usr/local PARALLEL_MAKE_OPTS=-j4 dist
+      make GPROOT=/usr/local PARALLEL_MAKE_OPTS=-j4 -s dist
     fi
   popd
 }
 
-function build_gppkg() {
-  pushd $GPDB_SRC_PATH/gpAux
-    make gppkg BLD_TARGETS="gppkg" INSTLOC="$GREENPLUM_INSTALL_DIR" GPPKGINSTLOC="$GPDB_ARTIFACTS_DIR" RELENGTOOLS=/opt/releng/tools
+function git_info() {
+  pushd ${GPDB_SRC_PATH}
+
+  "${CWDIR}/git_info.bash" | tee ${GREENPLUM_INSTALL_DIR}/etc/git-info.json
+
+  PREV_TAG=$(git describe --tags --abbrev=0 HEAD^)
+
+  cat > ${GREENPLUM_INSTALL_DIR}/etc/git-current-changelog.txt <<-EOF
+	======================================================================
+	Git log since previous release tag (${PREV_TAG})
+	----------------------------------------------------------------------
+
+	EOF
+
+  git log --abbrev-commit --date=relative "${PREV_TAG}..HEAD" >> ${GREENPLUM_INSTALL_DIR}/etc/git-current-changelog.txt
+
   popd
 }
 
 function unittest_check_gpdb() {
-  pushd $GPDB_SRC_PATH
-    source $GREENPLUM_INSTALL_DIR/greenplum_path.sh
-    make GPROOT=/usr/local unittest-check
+  pushd ${GPDB_SRC_PATH}
+    source ${GREENPLUM_INSTALL_DIR}/greenplum_path.sh
+    make GPROOT=/usr/local -s unittest-check
   popd
 }
 
-function build_pxf() {
-  pushd pxf_src/pxf
-  export TERM=xterm
-  export BUILD_NUMBER="${TARGET_OS}"
-  export PXF_HOME="${GREENPLUM_INSTALL_DIR}/pxf"
-  export JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF8
-  make install DATABASE=gpdb
+function include_zstd() {
+  local libdir
+  case "${TARGET_OS}" in
+    centos) libdir=/usr/lib64 ;;
+    ubuntu) libdir=/usr/lib ;;
+    *) return ;;
+  esac
+  pushd ${GREENPLUM_INSTALL_DIR}
+    cp ${libdir}/pkgconfig/libzstd.pc lib/pkgconfig
+    cp -d ${libdir}/libzstd.so* lib
+    cp /usr/include/zstd*.h include
   popd
+}
+
+function include_quicklz() {
+  local libdir
+  case "${TARGET_OS}" in
+    centos) libdir=/usr/lib64 ;;
+    ubuntu) libdir=/usr/local/lib ;;
+    *) return ;;
+  esac
+  pushd ${GREENPLUM_INSTALL_DIR}
+    cp -d ${libdir}/libquicklz.so* lib
+  popd
+}
+
+function include_libstdcxx() {
+  if [ "${TARGET_OS}" == "centos" ] ; then
+    pushd /opt/gcc-6*/lib64
+      for libfile in libstdc++.so.*; do
+        case $libfile in
+          *.py)
+            ;; # we don't vendor libstdc++.so.*-gdb.py
+          *)
+            cp -d "$libfile" ${GREENPLUM_INSTALL_DIR}/lib
+            ;; # vendor everything else
+        esac
+      done
+    popd
+  fi
+
 }
 
 function export_gpdb() {
-  TARBALL="$GPDB_ARTIFACTS_DIR"/$GPDB_BIN_FILENAME
-  pushd $GREENPLUM_INSTALL_DIR
+  TARBALL="${GPDB_ARTIFACTS_DIR}/${GPDB_BIN_FILENAME}"
+  pushd ${GREENPLUM_INSTALL_DIR}
     source greenplum_path.sh
-    python -m compileall -x test .
+    python -m compileall -q -x test .
     chmod -R 755 .
     tar -czf "${TARBALL}" ./*
   popd
 }
 
 function export_gpdb_extensions() {
-  pushd $GPDB_SRC_PATH/gpAux
+  pushd ${GPDB_SRC_PATH}/gpAux
     if ls greenplum-*zip* 1>/dev/null 2>&1; then
       chmod 755 greenplum-*zip*
-      cp greenplum-*zip* "$GPDB_ARTIFACTS_DIR"/
-    fi
-    if ls "$GPDB_ARTIFACTS_DIR"/*.gppkg 1>/dev/null 2>&1; then
-      chmod 755 "$GPDB_ARTIFACTS_DIR"/*.gppkg
+      cp greenplum-*zip* "${GPDB_ARTIFACTS_DIR}/"
     fi
   popd
 }
 
 function export_gpdb_win32_ccl() {
-    pushd $GPDB_SRC_PATH/gpAux
+    pushd ${GPDB_SRC_PATH}/gpAux
     if [ -f "$(find . -maxdepth 1 -name 'greenplum-*.msi' -print -quit)" ] ; then
-        cp greenplum-*.msi "$GPDB_ARTIFACTS_DIR"/
+        cp greenplum-*.msi "${GPDB_ARTIFACTS_DIR}/"
     fi
     popd
 }
 
+function export_gpdb_clients() {
+  TARBALL="${GPDB_ARTIFACTS_DIR}/${GPDB_CL_FILENAME}"
+  pushd ${GREENPLUM_CL_INSTALL_DIR}
+    source ./greenplum_clients_path.sh
+    chmod -R 755 .
+    tar -czf "${TARBALL}" ./*
+  popd
+}
+
+function fetch_orca_src {
+  local orca_tag="${1}"
+
+  mkdir orca_src
+  wget --quiet --output-document=- "https://github.com/greenplum-db/gporca/archive/${orca_tag}.tar.gz" \
+    | tar xzf - --strip-components=1 --directory=orca_src
+}
+
+function build_xerces()
+{
+    OUTPUT_DIR="gpdb_src/gpAux/ext/${BLD_ARCH}"
+    mkdir -p xerces_patch/concourse
+    cp -r orca_src/concourse/xerces-c xerces_patch/concourse
+    cp -r orca_src/patches/ xerces_patch
+    /usr/bin/python xerces_patch/concourse/xerces-c/build_xerces.py --output_dir=${OUTPUT_DIR}
+    rm -rf build
+}
+
+function build_and_test_orca()
+{
+    OUTPUT_DIR="gpdb_src/gpAux/ext/${BLD_ARCH}"
+    orca_src/concourse/build_and_test.py --build_type=RelWithDebInfo --output_dir=${OUTPUT_DIR}
+}
+
 function _main() {
-  case "$TARGET_OS" in
-   centos)
-      prep_env_for_centos
-      ;;
-    sles)
-      prep_env_for_sles
+  mkdir gpdb_src/gpAux/ext
+
+  case "${TARGET_OS}" in
+    centos|ubuntu)
+      prep_env
+      fetch_orca_src "${ORCA_TAG}"
+      build_xerces
+      build_and_test_orca
+      install_deps
+      link_python
       ;;
     win32)
         export BLD_ARCH=win32
         CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --disable-pxf"
         ;;
     *)
-        echo "only centos, sles and win32 are supported TARGET_OS'es"
+        echo "only centos, ubuntu, and win32 are supported TARGET_OS'es"
         false
         ;;
   esac
 
   generate_build_number
-  make_sync_tools
-  case "$TARGET_OS" in
-    sles) link_tools_for_sles ;;
-  esac
 
   # By default, only GPDB Server binary is build.
   # Use BLD_TARGETS flag with appropriate value string to generate client, loaders
   # connectors binaries
-  if [ -n "$BLD_TARGETS" ]; then
+  if [ -n "${BLD_TARGETS}" ]; then
     BLD_TARGET_OPTION=("BLD_TARGETS=\"$BLD_TARGETS\"")
   else
     BLD_TARGET_OPTION=("")
   fi
 
-  # Copy gpaddon_src into gpAux/addon directory and set the ADDON_DIR
-  # environment variable, so that quicklz support is available in enterprise
-  # builds.
-  export ADDON_DIR=addon
   export CONFIGURE_FLAGS=${CONFIGURE_FLAGS}
-  # We cannot symlink the addon directory here because `make -C` resolves the
-  # symlink and `cd`s to the actual directory. Currently the Makefile in the
-  # addon directory assumes that it is located in a particular location under
-  # the source tree and hence needs to be copied over.
-  rsync -auv gpaddon_src/ $GPDB_SRC_PATH/gpAux/$ADDON_DIR
+
   build_gpdb "${BLD_TARGET_OPTION[@]}"
-  build_gppkg
-  if [ "$TARGET_OS" != "win32" ] ; then
+  git_info
+
+  if [ "${TARGET_OS}" != "win32" ] ; then
       # Don't unit test when cross compiling. Tests don't build because they
       # require `./configure --with-zlib`.
       unittest_check_gpdb
   fi
-  if [ "$TARGET_OS" == "centos" ]; then
-      # Build pxf(server) only for centos
-      build_pxf
-  fi
+  include_zstd
+  include_quicklz
+  include_libstdcxx
   export_gpdb
   export_gpdb_extensions
   export_gpdb_win32_ccl
+
+  if echo "${BLD_TARGETS}" | grep -qwi "clients"
+  then
+      export_gpdb_clients
+  fi
 }
 
 _main "$@"

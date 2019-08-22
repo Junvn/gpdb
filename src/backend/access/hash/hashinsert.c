@@ -3,12 +3,12 @@
  * hashinsert.c
  *	  Item insertion in hash tables for Postgres.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/hash/hashinsert.c,v 1.51 2008/09/15 18:43:41 tgl Exp $
+ *	  src/backend/access/hash/hashinsert.c
  *
  *-------------------------------------------------------------------------
  */
@@ -16,12 +16,7 @@
 #include "postgres.h"
 
 #include "access/hash.h"
-#include "storage/bufmgr.h"
 #include "utils/rel.h"
-
-
-static OffsetNumber _hash_pgaddtup(Relation rel, Buffer buf,
-			   Size itemsize, IndexTuple itup);
 
 
 /*
@@ -33,12 +28,13 @@ static OffsetNumber _hash_pgaddtup(Relation rel, Buffer buf,
 void
 _hash_doinsert(Relation rel, IndexTuple itup)
 {
-	MIRROREDLOCK_BUFMGR_DECLARE;
-
 	Buffer		buf;
 	Buffer		metabuf;
 	HashMetaPage metap;
 	BlockNumber blkno;
+	BlockNumber oldblkno = InvalidBlockNumber;
+	bool		retry = false;
+	Page		metapage;
 	Page		page;
 	HashPageOpaque pageopaque;
 	Size		itemsz;
@@ -56,19 +52,10 @@ _hash_doinsert(Relation rel, IndexTuple itup)
 	itemsz = MAXALIGN(itemsz);	/* be safe, PageAddItem will do this but we
 								 * need to be consistent */
 
-	/*
-	 * Acquire shared split lock so we can compute the target bucket safely
-	 * (see README).
-	 */
-
-	 // -------- MirroredLock ----------
-	 MIRROREDLOCK_BUFMGR_LOCK;
-
-	_hash_getlock(rel, 0, HASH_SHARE);
-
 	/* Read the metapage */
 	metabuf = _hash_getbuf(rel, HASH_METAPAGE, HASH_READ, LH_META_PAGE);
-	metap = HashPageGetMeta(BufferGetPage(metabuf));
+	metapage = BufferGetPage(metabuf);
+	metap = HashPageGetMeta(metapage);
 
 	/*
 	 * Check whether the item can fit on a hash page at all. (Eventually, we
@@ -77,33 +64,52 @@ _hash_doinsert(Relation rel, IndexTuple itup)
 	 *
 	 * XXX this is useless code if we are only storing hash keys.
 	 */
-	if (itemsz > HashMaxItemSize((Page) metap))
+	if (itemsz > HashMaxItemSize(metapage))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("index row size %lu exceeds hash maximum %lu",
-						(unsigned long) itemsz,
-						(unsigned long) HashMaxItemSize((Page) metap)),
+				 errmsg("index row size %zu exceeds hash maximum %zu",
+						itemsz, HashMaxItemSize(metapage)),
 			errhint("Values larger than a buffer page cannot be indexed.")));
 
 	/*
-	 * Compute the target bucket number, and convert to block number.
+	 * Loop until we get a lock on the correct target bucket.
 	 */
-	bucket = _hash_hashkey2bucket(hashkey,
-								  metap->hashm_maxbucket,
-								  metap->hashm_highmask,
-								  metap->hashm_lowmask);
+	for (;;)
+	{
+		/*
+		 * Compute the target bucket number, and convert to block number.
+		 */
+		bucket = _hash_hashkey2bucket(hashkey,
+									  metap->hashm_maxbucket,
+									  metap->hashm_highmask,
+									  metap->hashm_lowmask);
 
-	blkno = BUCKET_TO_BLKNO(metap, bucket);
+		blkno = BUCKET_TO_BLKNO(metap, bucket);
 
-	/* release lock on metapage, but keep pin since we'll need it again */
-	_hash_chgbufaccess(rel, metabuf, HASH_READ, HASH_NOLOCK);
+		/* Release metapage lock, but keep pin. */
+		_hash_chgbufaccess(rel, metabuf, HASH_READ, HASH_NOLOCK);
 
-	/*
-	 * Acquire share lock on target bucket; then we can release split lock.
-	 */
-	_hash_getlock(rel, blkno, HASH_SHARE);
+		/*
+		 * If the previous iteration of this loop locked what is still the
+		 * correct target bucket, we are done.  Otherwise, drop any old lock
+		 * and lock what now appears to be the correct bucket.
+		 */
+		if (retry)
+		{
+			if (oldblkno == blkno)
+				break;
+			_hash_droplock(rel, oldblkno, HASH_SHARE);
+		}
+		_hash_getlock(rel, blkno, HASH_SHARE);
 
-	_hash_droplock(rel, 0, HASH_SHARE);
+		/*
+		 * Reacquire metapage lock and check that no bucket split has taken
+		 * place while we were awaiting the bucket lock.
+		 */
+		_hash_chgbufaccess(rel, metabuf, HASH_NOLOCK, HASH_READ);
+		oldblkno = blkno;
+		retry = true;
+	}
 
 	/* Fetch the primary bucket page for the bucket */
 	buf = _hash_getbuf(rel, blkno, HASH_WRITE, LH_BUCKET_PAGE);
@@ -175,9 +181,6 @@ _hash_doinsert(Relation rel, IndexTuple itup)
 	/* Write out the metapage and drop lock, but keep pin */
 	_hash_chgbufaccess(rel, metabuf, HASH_WRITE, HASH_NOLOCK);
 
-	MIRROREDLOCK_BUFMGR_UNLOCK;
-	// -------- MirroredLock ----------
-
 	/* Attempt to split if a split is needed */
 	if (do_expand)
 		_hash_expandtable(rel, metabuf);
@@ -189,15 +192,16 @@ _hash_doinsert(Relation rel, IndexTuple itup)
 /*
  *	_hash_pgaddtup() -- add a tuple to a particular page in the index.
  *
- *		This routine adds the tuple to the page as requested; it does
- *		not write out the page.  It is an error to call pgaddtup() without
- *		a write lock and pin.
+ * This routine adds the tuple to the page as requested; it does not write out
+ * the page.  It is an error to call pgaddtup() without pin and write lock on
+ * the target buffer.
+ *
+ * Returns the offset number at which the tuple was inserted.  This function
+ * is responsible for preserving the condition that tuples in a hash index
+ * page are sorted by hashkey value.
  */
-static OffsetNumber
-_hash_pgaddtup(Relation rel,
-			   Buffer buf,
-			   Size itemsize,
-			   IndexTuple itup)
+OffsetNumber
+_hash_pgaddtup(Relation rel, Buffer buf, Size itemsize, IndexTuple itup)
 {
 	OffsetNumber itup_off;
 	Page		page;

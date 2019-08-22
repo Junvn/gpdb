@@ -3,12 +3,12 @@
  * pg_shdepend.c
  *	  routines to support manipulation of the pg_shdepend relation
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/catalog/pg_shdepend.c,v 1.29 2008/11/02 01:45:27 tgl Exp $
+ *	  src/backend/catalog/pg_shdepend.c
  *
  *-------------------------------------------------------------------------
  */
@@ -16,14 +16,23 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_default_acl.h"
+#include "catalog/pg_event_trigger.h"
+#include "catalog/pg_extension.h"
+#include "catalog/pg_foreign_data_wrapper.h"
+#include "catalog/pg_foreign_server.h"
 #include "catalog/pg_language.h"
+#include "catalog/pg_largeobject.h"
+#include "catalog/pg_largeobject_metadata.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opclass.h"
@@ -31,9 +40,17 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/pg_ts_config.h"
+#include "catalog/pg_ts_dict.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_user_mapping.h"
+#include "commands/alter.h"
+#include "commands/dbcommands.h"
+#include "commands/collationcmds.h"
 #include "commands/conversioncmds.h"
 #include "commands/defrem.h"
+#include "commands/event_trigger.h"
+#include "commands/extension.h"
 #include "commands/proclang.h"
 #include "commands/schemacmds.h"
 #include "commands/tablecmds.h"
@@ -51,22 +68,25 @@ typedef enum
 	LOCAL_OBJECT,
 	SHARED_OBJECT,
 	REMOTE_OBJECT
-} objectType;
+} SharedDependencyObjectType;
 
-static int getOidListDiff(Oid *list1, int nlist1, Oid *list2, int nlist2,
-			   Oid **diff);
+static void getOidListDiff(Oid *list1, int *nlist1, Oid *list2, int *nlist2);
 static Oid	classIdGetDbId(Oid classId);
-static void shdepLockAndCheckObject(Oid classId, Oid objectId);
-static void shdepChangeDep(Relation sdepRel, Oid classid, Oid objid,
+static void shdepChangeDep(Relation sdepRel,
+			   Oid classid, Oid objid, int32 objsubid,
 			   Oid refclassid, Oid refobjid,
 			   SharedDependencyType deptype);
-static void shdepAddDependency(Relation sdepRel, Oid classId, Oid objectId,
+static void shdepAddDependency(Relation sdepRel,
+				   Oid classId, Oid objectId, int32 objsubId,
 				   Oid refclassId, Oid refobjId,
 				   SharedDependencyType deptype);
-static void shdepDropDependency(Relation sdepRel, Oid classId, Oid objectId,
+static void shdepDropDependency(Relation sdepRel,
+					Oid classId, Oid objectId, int32 objsubId,
+					bool drop_subobjects,
 					Oid refclassId, Oid refobjId,
 					SharedDependencyType deptype);
-static void storeObjectDescription(StringInfo descs, objectType type,
+static void storeObjectDescription(StringInfo descs,
+					   SharedDependencyObjectType type,
 					   ObjectAddress *object,
 					   SharedDependencyType deptype,
 					   int count);
@@ -113,6 +133,7 @@ recordSharedDependencyOn(ObjectAddress *depender,
 							  sdepRel))
 	{
 		shdepAddDependency(sdepRel, depender->classId, depender->objectId,
+						   depender->objectSubId,
 						   referenced->classId, referenced->objectId,
 						   deptype);
 	}
@@ -150,7 +171,7 @@ recordDependencyOnOwner(Oid classId, Oid objectId, Oid owner)
  * shdepChangeDep
  *
  * Update shared dependency records to account for an updated referenced
- * object.	This is an internal workhorse for operations such as changing
+ * object.  This is an internal workhorse for operations such as changing
  * an object's owner.
  *
  * There must be no more than one existing entry for the given dependent
@@ -165,14 +186,15 @@ recordDependencyOnOwner(Oid classId, Oid objectId, Oid owner)
  * locked.
  */
 static void
-shdepChangeDep(Relation sdepRel, Oid classid, Oid objid,
+shdepChangeDep(Relation sdepRel,
+			   Oid classid, Oid objid, int32 objsubid,
 			   Oid refclassid, Oid refobjid,
 			   SharedDependencyType deptype)
 {
 	Oid			dbid = classIdGetDbId(classid);
 	HeapTuple	oldtup = NULL;
 	HeapTuple	scantup;
-	ScanKeyData key[3];
+	ScanKeyData key[4];
 	SysScanDesc scan;
 
 	/*
@@ -196,9 +218,13 @@ shdepChangeDep(Relation sdepRel, Oid classid, Oid objid,
 				Anum_pg_shdepend_objid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(objid));
+	ScanKeyInit(&key[3],
+				Anum_pg_shdepend_objsubid,
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum(objsubid));
 
 	scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true,
-							  SnapshotNow, 3, key);
+							  NULL, 4, key);
 
 	while ((scantup = systable_getnext(scan)) != NULL)
 	{
@@ -208,8 +234,8 @@ shdepChangeDep(Relation sdepRel, Oid classid, Oid objid,
 		/* Caller screwed up if multiple matches */
 		if (oldtup)
 			elog(ERROR,
-				 "multiple pg_shdepend entries for object %u/%u deptype %c",
-				 classid, objid, deptype);
+			   "multiple pg_shdepend entries for object %u/%u/%d deptype %c",
+				 classid, objid, objsubid, deptype);
 		oldtup = heap_copytuple(scantup);
 	}
 
@@ -246,6 +272,7 @@ shdepChangeDep(Relation sdepRel, Oid classid, Oid objid,
 		values[Anum_pg_shdepend_dbid - 1] = ObjectIdGetDatum(dbid);
 		values[Anum_pg_shdepend_classid - 1] = ObjectIdGetDatum(classid);
 		values[Anum_pg_shdepend_objid - 1] = ObjectIdGetDatum(objid);
+		values[Anum_pg_shdepend_objsubid - 1] = Int32GetDatum(objsubid);
 
 		values[Anum_pg_shdepend_refclassid - 1] = ObjectIdGetDatum(refclassid);
 		values[Anum_pg_shdepend_refobjid - 1] = ObjectIdGetDatum(refobjid);
@@ -270,6 +297,9 @@ shdepChangeDep(Relation sdepRel, Oid classid, Oid objid,
  * changeDependencyOnOwner
  *
  * Update the shared dependencies to account for the new owner.
+ *
+ * Note: we don't need an objsubid argument because only whole objects
+ * have owners.
  */
 void
 changeDependencyOnOwner(Oid classId, Oid objectId, Oid newOwnerId)
@@ -279,7 +309,8 @@ changeDependencyOnOwner(Oid classId, Oid objectId, Oid newOwnerId)
 	sdepRel = heap_open(SharedDependRelationId, RowExclusiveLock);
 
 	/* Adjust the SHARED_DEPENDENCY_OWNER entry */
-	shdepChangeDep(sdepRel, classId, objectId,
+	shdepChangeDep(sdepRel,
+				   classId, objectId, 0,
 				   AuthIdRelationId, newOwnerId,
 				   SHARED_DEPENDENCY_OWNER);
 
@@ -289,7 +320,7 @@ changeDependencyOnOwner(Oid classId, Oid objectId, Oid newOwnerId)
 	 * was previously granted some rights to the object.
 	 *
 	 * This step is analogous to aclnewowner's removal of duplicate entries
-	 * in the ACL.	We have to do it to handle this scenario:
+	 * in the ACL.  We have to do it to handle this scenario:
 	 *		A grants some rights on an object to B
 	 *		ALTER OWNER changes the object's owner to B
 	 *		ALTER OWNER changes the object's owner to C
@@ -302,7 +333,7 @@ changeDependencyOnOwner(Oid classId, Oid objectId, Oid newOwnerId)
 	 * to make the various ALTER OWNER routines each know about it.
 	 *----------
 	 */
-	shdepDropDependency(sdepRel, classId, objectId,
+	shdepDropDependency(sdepRel, classId, objectId, 0, true,
 						AuthIdRelationId, newOwnerId,
 						SHARED_DEPENDENCY_ACL);
 
@@ -313,110 +344,105 @@ changeDependencyOnOwner(Oid classId, Oid objectId, Oid newOwnerId)
  * getOidListDiff
  *		Helper for updateAclDependencies.
  *
- * Takes two Oid arrays and returns elements from the first not found in the
- * second.	We assume both arrays are sorted and de-duped, and that the
- * second array does not contain any values not found in the first.
- *
- * NOTE: Both input arrays are pfreed.
+ * Takes two Oid arrays and removes elements that are common to both arrays,
+ * leaving just those that are in one input but not the other.
+ * We assume both arrays have been sorted and de-duped.
  */
-static int
-getOidListDiff(Oid *list1, int nlist1, Oid *list2, int nlist2, Oid **diff)
+static void
+getOidListDiff(Oid *list1, int *nlist1, Oid *list2, int *nlist2)
 {
-	Oid		   *result;
-	int			i,
-				j,
-				k = 0;
+	int			in1,
+				in2,
+				out1,
+				out2;
 
-	AssertArg(nlist1 >= nlist2 && nlist2 >= 0);
-
-	result = palloc(sizeof(Oid) * (nlist1 - nlist2));
-	*diff = result;
-
-	for (i = 0, j = 0; i < nlist1 && j < nlist2;)
+	in1 = in2 = out1 = out2 = 0;
+	while (in1 < *nlist1 && in2 < *nlist2)
 	{
-		if (list1[i] == list2[j])
+		if (list1[in1] == list2[in2])
 		{
-			i++;
-			j++;
+			/* skip over duplicates */
+			in1++;
+			in2++;
 		}
-		else if (list1[i] < list2[j])
+		else if (list1[in1] < list2[in2])
 		{
-			result[k++] = list1[i];
-			i++;
+			/* list1[in1] is not in list2 */
+			list1[out1++] = list1[in1++];
 		}
 		else
 		{
-			/* can't happen */
-			elog(WARNING, "invalid element %u in shorter list", list2[j]);
-			j++;
+			/* list2[in2] is not in list1 */
+			list2[out2++] = list2[in2++];
 		}
 	}
 
-	for (; i < nlist1; i++)
-		result[k++] = list1[i];
+	/* any remaining list1 entries are not in list2 */
+	while (in1 < *nlist1)
+	{
+		list1[out1++] = list1[in1++];
+	}
 
-	/* We should have copied the exact number of elements */
-	AssertState(k == (nlist1 - nlist2));
+	/* any remaining list2 entries are not in list1 */
+	while (in2 < *nlist2)
+	{
+		list2[out2++] = list2[in2++];
+	}
 
-	if (list1)
-		pfree(list1);
-	if (list2)
-		pfree(list2);
-
-	return k;
+	*nlist1 = out1;
+	*nlist2 = out2;
 }
 
 /*
  * updateAclDependencies
  *		Update the pg_shdepend info for an object's ACL during GRANT/REVOKE.
  *
- * classId, objectId: identify the object whose ACL this is
+ * classId, objectId, objsubId: identify the object whose ACL this is
  * ownerId: role owning the object
- * isGrant: are we adding or removing ACL entries?
  * noldmembers, oldmembers: array of roleids appearing in old ACL
  * nnewmembers, newmembers: array of roleids appearing in new ACL
  *
- * We calculate the difference between the new and old lists of roles,
- * and then insert (if it's a grant) or delete (if it's a revoke) from
- * pg_shdepend as appropiate.
+ * We calculate the differences between the new and old lists of roles,
+ * and then insert or delete from pg_shdepend as appropriate.
  *
- * Note that we can't insert blindly at grant, because we would end up with
- * duplicate registered dependencies.  We could check for existence of the
- * tuple before inserting, but that seems to be more expensive than what we are
- * doing now.  On the other hand, we can't just delete the tuples blindly at
- * revoke, because the user may still have other privileges.
+ * Note that we can't just insert all referenced roles blindly during GRANT,
+ * because we would end up with duplicate registered dependencies.  We could
+ * check for existence of the tuples before inserting, but that seems to be
+ * more expensive than what we are doing here.  Likewise we can't just delete
+ * blindly during REVOKE, because the user may still have other privileges.
+ * It is also possible that REVOKE actually adds dependencies, due to
+ * instantiation of a formerly implicit default ACL (although at present,
+ * all such dependencies should be for the owning role, which we ignore here).
  *
- * NOTE: Both input arrays must be sorted and de-duped.  They are pfreed
- * before return.
+ * NOTE: Both input arrays must be sorted and de-duped.  (Typically they
+ * are extracted from an ACL array by aclmembers(), which takes care of
+ * both requirements.)	The arrays are pfreed before return.
  */
 void
-updateAclDependencies(Oid classId, Oid objectId, Oid ownerId, bool isGrant,
+updateAclDependencies(Oid classId, Oid objectId, int32 objsubId,
+					  Oid ownerId,
 					  int noldmembers, Oid *oldmembers,
 					  int nnewmembers, Oid *newmembers)
 {
 	Relation	sdepRel;
-	Oid		   *diff;
-	int			ndiff,
-				i;
+	int			i;
 
 	/*
-	 * Calculate the differences between the old and new lists.
+	 * Remove entries that are common to both lists; those represent existing
+	 * dependencies we don't need to change.
+	 *
+	 * OK to overwrite the inputs since we'll pfree them anyway.
 	 */
-	if (isGrant)
-		ndiff = getOidListDiff(newmembers, nnewmembers,
-							   oldmembers, noldmembers, &diff);
-	else
-		ndiff = getOidListDiff(oldmembers, noldmembers,
-							   newmembers, nnewmembers, &diff);
+	getOidListDiff(oldmembers, &noldmembers, newmembers, &nnewmembers);
 
-	if (ndiff > 0)
+	if (noldmembers > 0 || nnewmembers > 0)
 	{
 		sdepRel = heap_open(SharedDependRelationId, RowExclusiveLock);
 
-		/* Add or drop the respective dependency */
-		for (i = 0; i < ndiff; i++)
+		/* Add new dependencies that weren't already present */
+		for (i = 0; i < nnewmembers; i++)
 		{
-			Oid			roleid = diff[i];
+			Oid			roleid = newmembers[i];
 
 			/*
 			 * Skip the owner: he has an OWNER shdep entry instead. (This is
@@ -426,24 +452,41 @@ updateAclDependencies(Oid classId, Oid objectId, Oid ownerId, bool isGrant,
 			if (roleid == ownerId)
 				continue;
 
+			/* Skip pinned roles; they don't need dependency entries */
+			if (isSharedObjectPinned(AuthIdRelationId, roleid, sdepRel))
+				continue;
+
+			shdepAddDependency(sdepRel, classId, objectId, objsubId,
+							   AuthIdRelationId, roleid,
+							   SHARED_DEPENDENCY_ACL);
+		}
+
+		/* Drop no-longer-used old dependencies */
+		for (i = 0; i < noldmembers; i++)
+		{
+			Oid			roleid = oldmembers[i];
+
+			/* Skip the owner, same as above */
+			if (roleid == ownerId)
+				continue;
+
 			/* Skip pinned roles */
 			if (isSharedObjectPinned(AuthIdRelationId, roleid, sdepRel))
 				continue;
 
-			if (isGrant)
-				shdepAddDependency(sdepRel, classId, objectId,
-								   AuthIdRelationId, roleid,
-								   SHARED_DEPENDENCY_ACL);
-			else
-				shdepDropDependency(sdepRel, classId, objectId,
-									AuthIdRelationId, roleid,
-									SHARED_DEPENDENCY_ACL);
+			shdepDropDependency(sdepRel, classId, objectId, objsubId,
+								false,	/* exact match on objsubId */
+								AuthIdRelationId, roleid,
+								SHARED_DEPENDENCY_ACL);
 		}
 
 		heap_close(sdepRel, RowExclusiveLock);
 	}
 
-	pfree(diff);
+	if (oldmembers)
+		pfree(oldmembers);
+	if (newmembers)
+		pfree(newmembers);
 }
 
 /*
@@ -496,7 +539,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 	/*
 	 * We limit the number of dependencies reported to the client to
 	 * MAX_REPORTED_DEPS, since client software may not deal well with
-	 * enormous error strings.	The server log always gets a full report.
+	 * enormous error strings.  The server log always gets a full report.
 	 */
 #define MAX_REPORTED_DEPS 100
 
@@ -515,7 +558,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 				ObjectIdGetDatum(objectId));
 
 	scan = systable_beginscan(sdepRel, SharedDependReferenceIndexId, true,
-							  SnapshotNow, 2, key);
+							  NULL, 2, key);
 
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
@@ -535,7 +578,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 
 		object.classId = sdepForm->classid;
 		object.objectId = sdepForm->objid;
-		object.objectSubId = 0;
+		object.objectSubId = sdepForm->objsubid;
 
 		/*
 		 * If it's a dependency local to this database or it's a shared
@@ -577,7 +620,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 			bool		stored = false;
 
 			/*
-			 * XXX this info is kept on a simple List.	Maybe it's not good
+			 * XXX this info is kept on a simple List.  Maybe it's not good
 			 * for performance, but using a hash table seems needlessly
 			 * complex.  The expected number of databases is not high anyway,
 			 * I suppose.
@@ -640,12 +683,18 @@ checkSharedDependencies(Oid classId, Oid objectId,
 	}
 
 	if (numNotReportedDeps > 0)
-		appendStringInfo(&descs, _("\nand %d other objects "
-								   "(see server log for list)"),
+		appendStringInfo(&descs, ngettext("\nand %d other object "
+										  "(see server log for list)",
+										  "\nand %d other objects "
+										  "(see server log for list)",
+										  numNotReportedDeps),
 						 numNotReportedDeps);
 	if (numNotReportedDbs > 0)
-		appendStringInfo(&descs, _("\nand objects in %d other databases "
-								   "(see server log for list)"),
+		appendStringInfo(&descs, ngettext("\nand objects in %d other database "
+										  "(see server log for list)",
+									   "\nand objects in %d other databases "
+										  "(see server log for list)",
+										  numNotReportedDbs),
 						 numNotReportedDbs);
 
 	*detail_msg = descs.data;
@@ -684,7 +733,7 @@ copyTemplateDependencies(Oid templateDbId, Oid newDbId)
 				ObjectIdGetDatum(templateDbId));
 
 	scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true,
-							  SnapshotNow, 1, key);
+							  NULL, 1, key);
 
 	/* Set up to copy the tuples except for inserting newDbId */
 	memset(values, 0, sizeof(values));
@@ -747,7 +796,7 @@ dropDatabaseDependencies(Oid databaseId)
 	/* We leave the other index fields unspecified */
 
 	scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true,
-							  SnapshotNow, 1, key);
+							  NULL, 1, key);
 
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
@@ -757,7 +806,7 @@ dropDatabaseDependencies(Oid databaseId)
 	systable_endscan(scan);
 
 	/* Now delete all entries corresponding to the database itself */
-	shdepDropDependency(sdepRel, DatabaseRelationId, databaseId,
+	shdepDropDependency(sdepRel, DatabaseRelationId, databaseId, 0, true,
 						InvalidOid, InvalidOid,
 						SHARED_DEPENDENCY_INVALID);
 
@@ -770,15 +819,19 @@ dropDatabaseDependencies(Oid databaseId)
  * Delete all pg_shdepend entries corresponding to an object that's being
  * dropped or modified.  The object is assumed to be either a shared object
  * or local to the current database (the classId tells us which).
+ *
+ * If objectSubId is zero, we are deleting a whole object, so get rid of
+ * pg_shdepend entries for subobjects as well.
  */
 void
-deleteSharedDependencyRecordsFor(Oid classId, Oid objectId)
+deleteSharedDependencyRecordsFor(Oid classId, Oid objectId, int32 objectSubId)
 {
 	Relation	sdepRel;
 
 	sdepRel = heap_open(SharedDependRelationId, RowExclusiveLock);
 
-	shdepDropDependency(sdepRel, classId, objectId,
+	shdepDropDependency(sdepRel, classId, objectId, objectSubId,
+						(objectSubId == 0),
 						InvalidOid, InvalidOid,
 						SHARED_DEPENDENCY_INVALID);
 
@@ -793,7 +846,8 @@ deleteSharedDependencyRecordsFor(Oid classId, Oid objectId)
  * locked.
  */
 static void
-shdepAddDependency(Relation sdepRel, Oid classId, Oid objectId,
+shdepAddDependency(Relation sdepRel,
+				   Oid classId, Oid objectId, int32 objsubId,
 				   Oid refclassId, Oid refobjId,
 				   SharedDependencyType deptype)
 {
@@ -803,7 +857,7 @@ shdepAddDependency(Relation sdepRel, Oid classId, Oid objectId,
 
 	/*
 	 * Make sure the object doesn't go away while we record the dependency on
-	 * it.	DROP routines should lock the object exclusively before they check
+	 * it.  DROP routines should lock the object exclusively before they check
 	 * shared dependencies.
 	 */
 	shdepLockAndCheckObject(refclassId, refobjId);
@@ -816,6 +870,7 @@ shdepAddDependency(Relation sdepRel, Oid classId, Oid objectId,
 	values[Anum_pg_shdepend_dbid - 1] = ObjectIdGetDatum(classIdGetDbId(classId));
 	values[Anum_pg_shdepend_classid - 1] = ObjectIdGetDatum(classId);
 	values[Anum_pg_shdepend_objid - 1] = ObjectIdGetDatum(objectId);
+	values[Anum_pg_shdepend_objsubid - 1] = Int32GetDatum(objsubId);
 
 	values[Anum_pg_shdepend_refclassid - 1] = ObjectIdGetDatum(refclassId);
 	values[Anum_pg_shdepend_refobjid - 1] = ObjectIdGetDatum(refobjId);
@@ -837,20 +892,26 @@ shdepAddDependency(Relation sdepRel, Oid classId, Oid objectId,
  *		Internal workhorse for deleting entries from pg_shdepend.
  *
  * We drop entries having the following properties:
- *	dependent object is the one identified by classId/objectId
+ *	dependent object is the one identified by classId/objectId/objsubId
  *	if refclassId isn't InvalidOid, it must match the entry's refclassid
  *	if refobjId isn't InvalidOid, it must match the entry's refobjid
  *	if deptype isn't SHARED_DEPENDENCY_INVALID, it must match entry's deptype
+ *
+ * If drop_subobjects is true, we ignore objsubId and consider all entries
+ * matching classId/objectId.
  *
  * sdepRel must be the pg_shdepend relation, already opened and suitably
  * locked.
  */
 static void
-shdepDropDependency(Relation sdepRel, Oid classId, Oid objectId,
+shdepDropDependency(Relation sdepRel,
+					Oid classId, Oid objectId, int32 objsubId,
+					bool drop_subobjects,
 					Oid refclassId, Oid refobjId,
 					SharedDependencyType deptype)
 {
-	ScanKeyData key[3];
+	ScanKeyData key[4];
+	int			nkeys;
 	SysScanDesc scan;
 	HeapTuple	tup;
 
@@ -867,9 +928,19 @@ shdepDropDependency(Relation sdepRel, Oid classId, Oid objectId,
 				Anum_pg_shdepend_objid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(objectId));
+	if (drop_subobjects)
+		nkeys = 3;
+	else
+	{
+		ScanKeyInit(&key[3],
+					Anum_pg_shdepend_objsubid,
+					BTEqualStrategyNumber, F_INT4EQ,
+					Int32GetDatum(objsubId));
+		nkeys = 4;
+	}
 
 	scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true,
-							  SnapshotNow, 3, key);
+							  NULL, nkeys, key);
 
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
@@ -919,7 +990,7 @@ classIdGetDbId(Oid classId)
  * weren't looking.  If the object has been dropped, this function
  * does not return!
  */
-static void
+void
 shdepLockAndCheckObject(Oid classId, Oid objectId)
 {
 	/* AccessShareLock should be OK, since we are not modifying the object */
@@ -928,9 +999,7 @@ shdepLockAndCheckObject(Oid classId, Oid objectId)
 	switch (classId)
 	{
 		case AuthIdRelationId:
-			if (!SearchSysCacheExists(AUTHOID,
-									  ObjectIdGetDatum(objectId),
-									  0, 0, 0))
+			if (!SearchSysCacheExists1(AUTHOID, ObjectIdGetDatum(objectId)))
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_OBJECT),
 						 errmsg("role %u was concurrently dropped",
@@ -939,7 +1008,7 @@ shdepLockAndCheckObject(Oid classId, Oid objectId)
 
 			/*
 			 * Currently, this routine need not support any other shared
-			 * object types besides roles.	If we wanted to record explicit
+			 * object types besides roles.  If we wanted to record explicit
 			 * dependencies on databases or tablespaces, we'd need code along
 			 * these lines:
 			 */
@@ -958,6 +1027,21 @@ shdepLockAndCheckObject(Oid classId, Oid objectId)
 				break;
 			}
 #endif
+
+		case DatabaseRelationId:
+			{
+				/* For lack of a syscache on pg_database, do this: */
+				char	   *database = get_database_name(objectId);
+
+				if (database == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_OBJECT),
+							 errmsg("database %u was concurrently dropped",
+									objectId)));
+				pfree(database);
+				break;
+			}
+
 
 		default:
 			elog(ERROR, "unrecognized shared classId: %u", classId);
@@ -980,7 +1064,8 @@ shdepLockAndCheckObject(Oid classId, Oid objectId)
  * and count to be nonzero; deptype is not used in this case.
  */
 static void
-storeObjectDescription(StringInfo descs, objectType type,
+storeObjectDescription(StringInfo descs,
+					   SharedDependencyObjectType type,
 					   ObjectAddress *object,
 					   SharedDependencyType deptype,
 					   int count)
@@ -998,7 +1083,7 @@ storeObjectDescription(StringInfo descs, objectType type,
 			if (deptype == SHARED_DEPENDENCY_OWNER)
 				appendStringInfo(descs, _("owner of %s"), objdesc);
 			else if (deptype == SHARED_DEPENDENCY_ACL)
-				appendStringInfo(descs, _("access to %s"), objdesc);
+				appendStringInfo(descs, _("privileges for %s"), objdesc);
 			else
 				elog(ERROR, "unrecognized dependency type: %d",
 					 (int) deptype);
@@ -1006,7 +1091,10 @@ storeObjectDescription(StringInfo descs, objectType type,
 
 		case REMOTE_OBJECT:
 			/* translator: %s will always be "database %s" */
-			appendStringInfo(descs, _("%d objects in %s"), count, objdesc);
+			appendStringInfo(descs, ngettext("%d object in %s",
+											 "%d objects in %s",
+											 count),
+							 count, objdesc);
 			break;
 
 		default:
@@ -1042,7 +1130,7 @@ isSharedObjectPinned(Oid classId, Oid objectId, Relation sdepRel)
 				ObjectIdGetDatum(objectId));
 
 	scan = systable_beginscan(sdepRel, SharedDependReferenceIndexId, true,
-							  SnapshotNow, 2, key);
+							  NULL, 2, key);
 
 	/*
 	 * Since we won't generate additional pg_shdepend entries for pinned
@@ -1067,9 +1155,9 @@ isSharedObjectPinned(Oid classId, Oid objectId, Relation sdepRel)
 /*
  * shdepDropOwned
  *
- * Drop the objects owned by any one of the given RoleIds.	If a role has
+ * Drop the objects owned by any one of the given RoleIds.  If a role has
  * access to an object, the grant will be removed as well (but the object
- * will not, of course.)
+ * will not, of course).
  *
  * We can revoke grants immediately while doing the scan, but drops are
  * saved up and done all at once with performMultipleDeletions.  This
@@ -1129,14 +1217,12 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 					ObjectIdGetDatum(roleid));
 
 		scan = systable_beginscan(sdepRel, SharedDependReferenceIndexId, true,
-								  SnapshotNow, 2, key);
+								  NULL, 2, key);
 
 		while ((tuple = systable_getnext(scan)) != NULL)
 		{
-			ObjectAddress obj;
-			GrantObjectType objtype;
-			InternalGrant istmt;
 			Form_pg_shdepend sdepForm = (Form_pg_shdepend) GETSTRUCT(tuple);
+			ObjectAddress obj;
 
 			/*
 			 * We only operate on shared objects and objects in the current
@@ -1154,44 +1240,9 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 					elog(ERROR, "unexpected dependency type");
 					break;
 				case SHARED_DEPENDENCY_ACL:
-					switch (sdepForm->classid)
-					{
-						case RelationRelationId:
-							/* it's OK to use RELATION for a sequence */
-							istmt.objtype = ACL_OBJECT_RELATION;
-							break;
-						case DatabaseRelationId:
-							istmt.objtype = ACL_OBJECT_DATABASE;
-							break;
-						case ProcedureRelationId:
-							istmt.objtype = ACL_OBJECT_FUNCTION;
-							break;
-						case LanguageRelationId:
-							istmt.objtype = ACL_OBJECT_LANGUAGE;
-							break;
-						case NamespaceRelationId:
-							istmt.objtype = ACL_OBJECT_NAMESPACE;
-							break;
-						case TableSpaceRelationId:
-							istmt.objtype = ACL_OBJECT_TABLESPACE;
-							break;
-						default:
-							elog(ERROR, "unexpected object type %d",
-								 sdepForm->classid);
-							/* keep compiler quiet */
-							objtype = (GrantObjectType) 0;
-							break;
-					}
-					istmt.is_grant = false;
-					istmt.objects = list_make1_oid(sdepForm->objid);
-					istmt.all_privs = true;
-					istmt.privileges = ACL_NO_RIGHTS;
-					istmt.grantees = list_make1_oid(roleid);
-					istmt.grant_option = false;
-					istmt.behavior = DROP_CASCADE;
-					istmt.cooked_privs = NIL;
-
-					ExecGrantStmt_oids(&istmt);
+					RemoveRoleFromObjectACL(roleid,
+											sdepForm->classid,
+											sdepForm->objid);
 					break;
 				case SHARED_DEPENDENCY_OWNER:
 					/* If a local object, save it for deletion below */
@@ -1199,7 +1250,7 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 					{
 						obj.classId = sdepForm->classid;
 						obj.objectId = sdepForm->objid;
-						obj.objectSubId = 0;
+						obj.objectSubId = sdepForm->objsubid;
 						add_exact_object_address(&obj, deleteobjs);
 					}
 					break;
@@ -1210,7 +1261,7 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 	}
 
 	/* the dependency mechanism does the actual work */
-	performMultipleDeletions(deleteobjs, behavior);
+	performMultipleDeletions(deleteobjs, behavior, 0);
 
 	heap_close(sdepRel, RowExclusiveLock);
 
@@ -1255,7 +1306,7 @@ shdepReassignOwned(List *roleids, Oid newrole)
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("cannot reassign ownership of objects owned by %s because they are required by the database system",
-						  getObjectDescription(&obj))));
+							getObjectDescription(&obj))));
 
 			/*
 			 * There's no need to tell the whole truth, which is that we
@@ -1273,14 +1324,18 @@ shdepReassignOwned(List *roleids, Oid newrole)
 					ObjectIdGetDatum(roleid));
 
 		scan = systable_beginscan(sdepRel, SharedDependReferenceIndexId, true,
-								  SnapshotNow, 2, key);
+								  NULL, 2, key);
 
 		while ((tuple = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_shdepend sdepForm = (Form_pg_shdepend) GETSTRUCT(tuple);
 
-			/* We only operate on objects in the current database */
-			if (sdepForm->dbid != MyDatabaseId)
+			/*
+			 * We only operate on shared objects and objects in the current
+			 * database
+			 */
+			if (sdepForm->dbid != MyDatabaseId &&
+				sdepForm->dbid != InvalidOid)
 				continue;
 
 			/* Unexpected because we checked for pins above */
@@ -1294,16 +1349,8 @@ shdepReassignOwned(List *roleids, Oid newrole)
 			/* Issue the appropriate ALTER OWNER call */
 			switch (sdepForm->classid)
 			{
-				case ConversionRelationId:
-					AlterConversionOwner_oid(sdepForm->objid, newrole);
-					break;
-
 				case TypeRelationId:
-					AlterTypeOwnerInternal(sdepForm->objid, newrole, true);
-					break;
-
-				case OperatorRelationId:
-					AlterOperatorOwner_oid(sdepForm->objid, newrole);
+					AlterTypeOwner_oid(sdepForm->objid, newrole, true);
 					break;
 
 				case NamespaceRelationId:
@@ -1317,27 +1364,65 @@ shdepReassignOwned(List *roleids, Oid newrole)
 					 * owned sequences, etc when we happen to visit them
 					 * before their parent table.
 					 */
-					ATExecChangeOwner(sdepForm->objid, newrole, true);
+					ATExecChangeOwner(sdepForm->objid, newrole, true, AccessExclusiveLock);
 					break;
 
+				case DefaultAclRelationId:
+
+					/*
+					 * Ignore default ACLs; they should be handled by DROP
+					 * OWNED, not REASSIGN OWNED.
+					 */
+					break;
+
+				case UserMappingRelationId:
+					/* ditto */
+					break;
+
+				case ForeignServerRelationId:
+					AlterForeignServerOwner_oid(sdepForm->objid, newrole);
+					break;
+
+				case ForeignDataWrapperRelationId:
+					AlterForeignDataWrapperOwner_oid(sdepForm->objid, newrole);
+					break;
+
+				case EventTriggerRelationId:
+					AlterEventTriggerOwner_oid(sdepForm->objid, newrole);
+					break;
+
+					/* Generic alter owner cases */
+				case CollationRelationId:
+				case ConversionRelationId:
+				case OperatorRelationId:
 				case ProcedureRelationId:
-					AlterFunctionOwner_oid(sdepForm->objid, newrole);
-					break;
-
 				case LanguageRelationId:
-					AlterLanguageOwner_oid(sdepForm->objid, newrole);
-					break;
-
-				case OperatorClassRelationId:
-					AlterOpClassOwner_oid(sdepForm->objid, newrole);
-					break;
-
+				case LargeObjectRelationId:
 				case OperatorFamilyRelationId:
-					AlterOpFamilyOwner_oid(sdepForm->objid, newrole);
+				case OperatorClassRelationId:
+				case ExtensionRelationId:
+				case TableSpaceRelationId:
+				case DatabaseRelationId:
+				case TSConfigRelationId:
+				case TSDictionaryRelationId:
+					{
+						Oid			classId = sdepForm->classid;
+						Relation	catalog;
+
+						if (classId == LargeObjectRelationId)
+							classId = LargeObjectMetadataRelationId;
+
+						catalog = heap_open(classId, RowExclusiveLock);
+
+						AlterObjectOwner_internal(catalog, sdepForm->objid,
+												  newrole);
+
+						heap_close(catalog, NoLock);
+					}
 					break;
 
 				default:
-					elog(ERROR, "unexpected classid %d", sdepForm->classid);
+					elog(ERROR, "unexpected classid %u", sdepForm->classid);
 					break;
 			}
 			/* Make sure the next iteration will see my changes */

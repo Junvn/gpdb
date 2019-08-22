@@ -17,18 +17,21 @@
  */
 
 #include "postgres.h"
+
+#include "cdb/cdbgroup.h"
+#include "cdb/cdbplan.h"
+#include "cdb/cdbsetop.h"
 #include "miscadmin.h"
-#include "optimizer/clauses.h"
 #include "nodes/primnodes.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
-#include "cdb/cdbplan.h"
+#include "optimizer/clauses.h"
+#include "parser/parsetree.h"
+#include "utils/lsyscache.h"
 
 
 static void mutate_plan_fields(Plan *newplan, Plan *oldplan, Node *(*mutator) (), void *context);
 static void mutate_join_fields(Join *newplan, Join *oldplan, Node *(*mutator) (), void *context);
-
-
 
 
 
@@ -179,6 +182,30 @@ plan_tree_mutator(Node *node,
 			}
 			break;
 
+		case T_ModifyTable:
+			{
+				ModifyTable *mt = (ModifyTable *) node;
+				ModifyTable *newmt;
+
+				FLATCOPY(newmt, mt, ModifyTable);
+				PLANMUTATE(newmt, mt);
+				MUTATE(newmt->plans, mt->plans, List *);
+				MUTATE(newmt->withCheckOptionLists, mt->withCheckOptionLists, List *);
+				return (Node *) newmt;
+			}
+			break;
+
+		case T_LockRows:
+			{
+				LockRows   *lockrows = (LockRows *) node;
+				LockRows   *newlockrows;
+
+				FLATCOPY(newlockrows, lockrows, LockRows);
+				PLANMUTATE(newlockrows, lockrows);
+				return (Node *) newlockrows;
+			}
+			break;
+
 		case T_Repeat:
 			{
 				Repeat	   *repeat = (Repeat *) node;
@@ -198,8 +225,19 @@ plan_tree_mutator(Node *node,
 				FLATCOPY(newappend, append, Append);
 				PLANMUTATE(newappend, append);
 				MUTATE(newappend->appendplans, append->appendplans, List *);
-				/* isTarget is scalar. */
 				return (Node *) newappend;
+			}
+			break;
+
+		case T_MergeAppend:
+			{
+				MergeAppend	   *merge = (MergeAppend *) node;
+				MergeAppend	   *newmerge;
+
+				FLATCOPY(newmerge, merge, MergeAppend);
+				PLANMUTATE(newmerge, merge);
+				MUTATE(newmerge->mergeplans, merge->mergeplans, List *);
+				return (Node *) newmerge;
 			}
 			break;
 
@@ -298,56 +336,14 @@ plan_tree_mutator(Node *node,
 			}
 			break;
 
-		case T_AppendOnlyScan:
+		case T_DynamicSeqScan:
 			{
-				AppendOnlyScan *appendonlyscan = (AppendOnlyScan *) node;
-				AppendOnlyScan *newappendonlyscan;
+				DynamicSeqScan *dynamicSeqScan = (DynamicSeqScan *) node;
+				DynamicSeqScan *newDynamicSeqScan = NULL;
 
-				FLATCOPY(newappendonlyscan, appendonlyscan, AppendOnlyScan);
-				SCANMUTATE(newappendonlyscan, appendonlyscan);
-
-				/*
-				 * (for now) A AppendOnlyScan is really just a Scan, so we're
-				 * done.
-				 */
-				return (Node *) newappendonlyscan;
-			}
-			break;
-
-		case T_AOCSScan:
-			{
-				AOCSScan   *aocs = (AOCSScan *) node;
-				AOCSScan   *newaocs;
-
-				FLATCOPY(newaocs, aocs, AOCSScan);
-				SCANMUTATE(newaocs, aocs);
-				/* (for now) A AOCSScan is really just a Scan, so we're done. */
-				return (Node *) newaocs;
-			}
-			break;
-
-		case T_TableScan:
-			{
-				TableScan  *tableScan = (TableScan *) node;
-				TableScan  *newTableScan = NULL;
-
-				FLATCOPY(newTableScan, tableScan, TableScan);
-				SCANMUTATE(newTableScan, tableScan);
-
-				return (Node *) newTableScan;
-			}
-			break;
-
-		case T_DynamicTableScan:
-			{
-				DynamicTableScan *tableScan = (DynamicTableScan *) node;
-				DynamicTableScan *newTableScan = NULL;
-
-				FLATCOPY(newTableScan, tableScan, DynamicTableScan);
-				SCANMUTATE(newTableScan, tableScan);
-				newTableScan->partIndex = tableScan->partIndex;
-				newTableScan->partIndexPrintable = tableScan->partIndexPrintable;
-				return (Node *) newTableScan;
+				FLATCOPY(newDynamicSeqScan, dynamicSeqScan, DynamicSeqScan);
+				SCANMUTATE(newDynamicSeqScan, dynamicSeqScan);
+				return (Node *) newDynamicSeqScan;
 			}
 			break;
 
@@ -360,7 +356,6 @@ plan_tree_mutator(Node *node,
 				SCANMUTATE(newextscan, extscan);
 
 				MUTATE(newextscan->uriList, extscan->uriList, List *);
-				MUTATE(newextscan->fmtOpts, extscan->fmtOpts, List *);
 				newextscan->fmtType = extscan->fmtType;
 				newextscan->isMasterOnly = extscan->isMasterOnly;
 
@@ -399,6 +394,22 @@ plan_tree_mutator(Node *node,
 			}
 			break;
 
+		case T_IndexOnlyScan:
+			{
+				IndexOnlyScan  *idxonlyscan = (IndexOnlyScan *) node;
+				IndexOnlyScan  *newidxonlyscan;
+
+				FLATCOPY(newidxonlyscan, idxonlyscan, IndexOnlyScan);
+				SCANMUTATE(newidxonlyscan, idxonlyscan);
+				newidxonlyscan->indexid = idxonlyscan->indexid;
+				/* MUTATE(newidxonlyscan->indexid, idxonlyscan->indexid, List *); */
+				MUTATE(newidxonlyscan->indexqual, idxonlyscan->indexqual, List *);
+				MUTATE(newidxonlyscan->indextlist, idxonlyscan->indextlist, List *);
+				/* indxorderdir  is  scalar */
+				return (Node *) newidxonlyscan;
+			}
+			break;
+
 		case T_BitmapIndexScan:
 		case T_DynamicBitmapIndexScan:
 			{
@@ -426,45 +437,26 @@ plan_tree_mutator(Node *node,
 			break;
 
 		case T_BitmapHeapScan:
+		case T_DynamicBitmapHeapScan:
 			{
 				BitmapHeapScan *bmheapscan = (BitmapHeapScan *) node;
 				BitmapHeapScan *newbmheapscan;
 
-				FLATCOPY(newbmheapscan, bmheapscan, BitmapHeapScan);
+				if (IsA(node, DynamicBitmapHeapScan))
+				{
+					/* see comment above on DynamicIndexScan */
+					DynamicBitmapHeapScan *newdbhscan;
+
+					FLATCOPY(newdbhscan, bmheapscan, DynamicBitmapHeapScan);
+					newbmheapscan = (BitmapHeapScan *) newdbhscan;
+				}
+				else
+					FLATCOPY(newbmheapscan, bmheapscan, BitmapHeapScan);
 				SCANMUTATE(newbmheapscan, bmheapscan);
 
 				MUTATE(newbmheapscan->bitmapqualorig, bmheapscan->bitmapqualorig, List *);
 
 				return (Node *) newbmheapscan;
-			}
-			break;
-
-
-		case T_BitmapAppendOnlyScan:
-			{
-				BitmapAppendOnlyScan *bmappendonlyscan = (BitmapAppendOnlyScan *) node;
-				BitmapAppendOnlyScan *newbmappendonlyscan;
-
-				FLATCOPY(newbmappendonlyscan, bmappendonlyscan, BitmapAppendOnlyScan);
-				SCANMUTATE(newbmappendonlyscan, bmappendonlyscan);
-
-				MUTATE(newbmappendonlyscan->bitmapqualorig, bmappendonlyscan->bitmapqualorig, List *);
-
-				return (Node *) newbmappendonlyscan;
-			}
-			break;
-
-		case T_BitmapTableScan:
-			{
-				BitmapTableScan *bmtablescan = (BitmapTableScan *) node;
-				BitmapTableScan *newbmtablescan = NULL;
-
-				FLATCOPY(newbmtablescan, bmtablescan, BitmapTableScan);
-				SCANMUTATE(newbmtablescan, bmtablescan);
-
-				MUTATE(newbmtablescan->bitmapqualorig, bmtablescan->bitmapqualorig, List *);
-
-				return (Node *) newbmtablescan;
 			}
 			break;
 
@@ -702,11 +694,7 @@ plan_tree_mutator(Node *node,
 
 				FLATCOPY(newmotion, motion, Motion);
 				PLANMUTATE(newmotion, motion);
-
-				MUTATE(newmotion->hashExpr, motion->hashExpr, List *);
-				MUTATE(newmotion->hashDataTypes, motion->hashDataTypes, List *);
-				COPYARRAY(newmotion, motion, numOutputSegs, outputSegIdx);
-
+				MUTATE(newmotion->hashExprs, motion->hashExprs, List *);
 				COPYARRAY(newmotion, motion, numSortCols, sortColIdx);
 				COPYARRAY(newmotion, motion, numSortCols, sortOperators);
 				COPYARRAY(newmotion, motion, numSortCols, nullsFirst);
@@ -721,7 +709,7 @@ plan_tree_mutator(Node *node,
 				Flow	   *newflow;
 
 				FLATCOPY(newflow, flow, Flow);
-				MUTATE(newflow->hashExpr, flow->hashExpr, List *);
+				MUTATE(newflow->hashExprs, flow->hashExprs, List *);
 				return (Node *) newflow;
 			}
 			break;
@@ -794,7 +782,6 @@ plan_tree_mutator(Node *node,
 				switch (rte->rtekind)
 				{
 					case RTE_RELATION:	/* ordinary relation reference */
-					case RTE_SPECIAL:	/* special rule relation (NEW or OLD) */
 					case RTE_VOID:	/* deleted entry */
 						/* No extras. */
 						break;
@@ -815,18 +802,13 @@ plan_tree_mutator(Node *node,
 						newrte->joinaliasvars = copyObject(rte->joinaliasvars);
 						break;
 
-					case RTE_FUNCTION:	/* function in FROM */
-						MUTATE(newrte->funcexpr, rte->funcexpr, Node *);
-
-						/*
-						 * TODO is this right? //newrte->coldeflist = (List *)
-						 * copyObject(rte->coldeflist);
-						 */
+					case RTE_FUNCTION:	/* functions in FROM */
+						MUTATE(newrte->functions, rte->functions, List *);
 						break;
 
 					case RTE_TABLEFUNCTION:
 						newrte->subquery = copyObject(rte->subquery);
-						MUTATE(newrte->funcexpr, rte->funcexpr, Node *);
+						MUTATE(newrte->functions, rte->functions, List *);
 						break;
 
 					case RTE_VALUES:
@@ -834,6 +816,48 @@ plan_tree_mutator(Node *node,
 						break;
 				}
 				return (Node *) newrte;
+			}
+			break;
+
+		case T_RangeTblFunction:
+			{
+				RangeTblFunction *rtfunc = (RangeTblFunction *) node;
+				RangeTblFunction *newrtfunc;
+
+				FLATCOPY(newrtfunc, rtfunc, RangeTblFunction);
+				MUTATE(newrtfunc->funcexpr, rtfunc->funcexpr, Node *);
+
+				/*
+				 * TODO is this right? //newrte->coldeflist = (List *)
+				 * copyObject(rte->coldeflist);
+				 */
+			}
+			break;
+
+		case T_ForeignScan:
+			{
+				ForeignScan *fdwscan = (ForeignScan *) node;
+				ForeignScan *newfdwscan;
+
+				FLATCOPY(newfdwscan, fdwscan, ForeignScan);
+				SCANMUTATE(newfdwscan, fdwscan);
+
+				MUTATE(newfdwscan->fdw_exprs, fdwscan->fdw_exprs, List *);
+				MUTATE(newfdwscan->fdw_private, fdwscan->fdw_private, List *);
+				newfdwscan->fsSystemCol = fdwscan->fsSystemCol;
+
+				return (Node *) newfdwscan;
+			}
+			break;
+
+		case T_SplitUpdate:
+			{
+				SplitUpdate	*splitUpdate = (SplitUpdate *) node;
+				SplitUpdate	*newSplitUpdate;
+
+				FLATCOPY(newSplitUpdate, splitUpdate, SplitUpdate);
+				PLANMUTATE(newSplitUpdate, splitUpdate);
+				return (Node *) newSplitUpdate;
 			}
 			break;
 
@@ -854,7 +878,6 @@ plan_tree_mutator(Node *node,
 		case T_SetToDefault:
 		case T_RangeTblRef:
 		case T_Aggref:
-		case T_AggOrder:
 		case T_WindowFunc:
 		case T_ArrayRef:
 		case T_FuncExpr:
@@ -902,7 +925,8 @@ plan_tree_mutator(Node *node,
  * definition.
  *
  */
-void		mutate_plan_fields(Plan *newplan, Plan *oldplan, Node *(*mutator) (), void *context)
+static void
+mutate_plan_fields(Plan *newplan, Plan *oldplan, Node *(*mutator) (), void *context)
 {
 	/*
 	 * Scalar fields startup_cost total_cost plan_rows plan_width nParamExec
@@ -928,7 +952,8 @@ void		mutate_plan_fields(Plan *newplan, Plan *oldplan, Node *(*mutator) (), void
  * definition.
  *
  */
-void		mutate_join_fields(Join *newjoin, Join *oldjoin, Node *(*mutator) (), void *context)
+static void 
+mutate_join_fields(Join *newjoin, Join *oldjoin, Node *(*mutator) (), void *context)
 {
 	/* A Join node is a Plan node. */
 	mutate_plan_fields((Plan *) newjoin, (Plan *) oldjoin, mutator, context);
@@ -937,4 +962,139 @@ void		mutate_join_fields(Join *newjoin, Join *oldjoin, Node *(*mutator) (), void
 
 	/* Node fields need mutation. */
 	MUTATE(newjoin->joinqual, oldjoin->joinqual, List *);
+}
+
+
+/*
+ * package_plan_as_rte
+ *	   Package a plan as a pre-planned subquery RTE
+ *
+ * Note that the input query is often root->parse (since that is the
+ * query from which this invocation of the planner usually takes it's
+ * context), but may be a derived query, e.g., in the case of sequential
+ * window plans or multiple-DQA pruning (in cdbgroup.c).
+ * 
+ * Note also that the supplied plan's target list must be congruent with
+ * the supplied query: its Var nodes must refer to RTEs in the range
+ * table of the Query node, it should conserve sort/group reference
+ * values, and its SubqueryScan nodes should match up with the query's
+ * Subquery RTEs.
+ *
+ * The result is a pre-planned subquery RTE which incorporates the given
+ * plan, alias, and pathkeys (if any) directly.  The input query is not
+ * modified.
+ *
+ * The caller must install the RTE in the range table of an appropriate query
+ * and the corresponding plan should reference it's results through a
+ * SubqueryScan node.
+ */
+RangeTblEntry *
+package_plan_as_rte(PlannerInfo *root, Query *query, Plan *plan, Alias *eref, List *pathkeys,
+					PlannerInfo **subroot_p)
+{
+	Query *subquery;
+	RangeTblEntry *rte;
+	PlannerInfo *subroot;
+
+	Assert( query != NULL );
+	Assert( plan != NULL );
+	Assert( eref != NULL );
+	Assert( plan->flow != NULL ); /* essential in a pre-planned RTE */
+
+	subroot = makeNode(PlannerInfo);
+	/* shallow copy from root at first. */
+	memcpy(subroot, root, sizeof(PlannerInfo));
+	/* deep copy if needed. */
+	subroot->parse = copyObject(query);
+
+	/* Make a plausible subquery for the RTE we'll produce. */
+	subquery = makeNode(Query);
+	memcpy(subquery, query, sizeof(Query));
+	
+	subquery->querySource = QSRC_PLANNER;
+	subquery->canSetTag = false;
+	subquery->resultRelation = 0;
+	
+	subquery->rtable = copyObject(subquery->rtable);
+
+	subquery->targetList = copyObject(plan->targetlist);
+	subquery->windowClause = NIL;
+	
+	subquery->distinctClause = NIL;
+	subquery->sortClause = NIL;
+	subquery->limitOffset = NULL;
+	subquery->limitCount = NULL;
+	
+	Assert( subquery->setOperations == NULL );
+	
+	/* Package up the RTE. */
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_SUBQUERY;
+	rte->subquery = subquery;
+	rte->eref = eref;
+	rte->subquery_plan = plan;
+	rte->subquery_rtable = subquery->rtable;
+	rte->subquery_pathkeys = pathkeys;
+
+	*subroot_p = subroot;
+	return rte;
+}
+
+
+/* Utility to get a name for a function to use as an eref. */
+static char *
+get_function_name(Oid proid, const char *dflt)
+{
+	char	   *result;
+
+	if (!OidIsValid(proid))
+	{
+		result = pstrdup(dflt);
+	}
+	else
+	{
+		result = get_func_name(proid);
+
+		if (result == NULL)
+			result = pstrdup(dflt);
+	}
+
+	return result;
+}
+
+/* Utility to get a name for a tle to use as an eref. */
+Value *
+get_tle_name(TargetEntry *tle, List *rtable, const char *default_name)
+{
+	char *name = NULL;
+	Node *expr = (Node*)tle->expr;
+	
+	if ( tle->resname != NULL )
+	{
+		name = pstrdup(tle->resname);
+	}
+	else if ( IsA(tle->expr, Var) && rtable != NULL )
+	{
+		Var *var = (Var*)tle->expr;
+		RangeTblEntry *rte = rt_fetch(var->varno, rtable);
+		name = pstrdup(get_rte_attribute_name(rte, var->varattno));
+	}
+	else if ( IsA(tle->expr, WindowFunc) )
+	{
+		if ( default_name == NULL ) default_name = "window_func";
+		name = get_function_name(((WindowFunc *)expr)->winfnoid, default_name);
+	}
+	else if ( IsA(tle->expr, Aggref) )
+	{
+		if ( default_name == NULL ) default_name = "aggregate_func";
+		name = get_function_name(((Aggref*)expr)->aggfnoid, default_name);
+	}
+	
+	if ( name == NULL )
+	{
+		if (default_name == NULL ) default_name = "unnamed_attr";
+		name = pstrdup(default_name);
+	}
+	
+	return makeString(name);
 }

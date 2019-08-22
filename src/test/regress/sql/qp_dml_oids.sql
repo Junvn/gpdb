@@ -43,7 +43,7 @@ WITH OIDS DISTRIBUTED BY (a);
 --
 -- DML on table with constraints and OIDS(Negative Test)
 --
-INSERT INTO dml_heap_check_r SELECT i, i ,'r', i FROM generate_series(1,2)i;
+INSERT INTO dml_heap_check_r SELECT i, i ,'r', i FROM generate_series(1,3) i where i <> 2;
 SELECT SUM(a),SUM(b) FROM dml_heap_check_r;
 SELECT COUNT(*) FROM dml_heap_check_r;
 
@@ -59,7 +59,7 @@ SELECT SUM(a) FROM dml_heap_check_r;
 DROP TABLE IF EXISTS tempoid;
 CREATE TABLE tempoid as SELECT oid,a FROM dml_heap_check_r DISTRIBUTED BY (a);
 
-UPDATE dml_heap_check_r set a = 110;
+UPDATE dml_heap_check_r SET a = 110 WHERE a = 1;
 SELECT SUM(a) FROM dml_heap_check_r;
 -- THIS SQL CONFIRMS THAT POST UPDATE THE OID OF THE TUPLE REMAINS THE SAME
 SELECT * FROM ( (SELECT COUNT(*) FROM dml_heap_check_r) UNION (SELECT COUNT(*) FROM tempoid, dml_heap_check_r WHERE tempoid.oid = dml_heap_check_r.oid AND tempoid.gp_segment_id = dml_heap_check_r.gp_segment_id))foo;

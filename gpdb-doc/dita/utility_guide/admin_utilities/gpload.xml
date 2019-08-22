@@ -50,7 +50,14 @@
                 creating an external table definition based on the source data defined, and
                 executing an <codeph>INSERT</codeph>, <codeph>UPDATE</codeph> or
                     <codeph>MERGE</codeph> operation to load the source data into the target table
-                in the database.</p>
+                in the database.<note><codeph>gpfdist</codeph> and <codeph>gpload</codeph> are
+                    compatible only with the Greenplum Database major version in which they are
+                    shipped. For example, a <codeph>gpfdist</codeph> utility that is installed with
+                    Greenplum Database 4.x cannot be used with Greenplum Database 5.x or
+                    6.x.</note><note id="gpload-limitation"><codeph>MERGE</codeph> and
+                        <codeph>UPDATE</codeph> operations are not supported if the target table
+                    column name is a reserved keyword, has capital letters, or includes any
+                    character that requires quotes (" ") to identify the column.</note></p>
             <p>The operation, including any SQL commands specified in the <codeph>SQL</codeph>
                 collection of the YAML control file (see <xref href="#topic1/section7"
                     type="section" format="dita"/>), are performed as a single transaction to
@@ -217,6 +224,8 @@
    <xref href="#topic1/cfpreload" format="dita">PRELOAD</xref>:
     - <xref href="#topic1/cftruncate" format="dita">TRUNCATE</xref>: true | false
     - <xref href="#topic1/cfreusetables" format="dita">REUSE_TABLES</xref>: true | false
+    - <xref href="#topic1/cfstagetbl" format="dita">STAGING_TABLE</xref>: <varname>external_table_name</varname>
+    - <xref href="#topic1/cffastmatch" format="dita">FAST_MATCH</xref>: true | false
    <xref href="#topic1/cfsql" format="dita">SQL</xref>:
     - <xref href="#topic1/cfbefore" format="dita">BEFORE</xref>: "<varname>sql_command</varname>"
     - <xref href="#topic1/cfafter" format="dita">AFTER</xref>: "<varname>sql_command</varname>"</codeblock>
@@ -543,7 +552,17 @@
                                                 default client encoding is used. For information
                                                 about supported character sets, see the
                                                   <cite>Greenplum Database Reference
-                                                Guide</cite>.</pd>
+                                                  Guide</cite>.<note>If you <i>change</i> the
+                                                  <codeph>ENCODING</codeph> value in an existing
+                                                  <codeph>gpload</codeph> control file, you must
+                                                  manually drop any external tables that were
+                                                  creating using the previous
+                                                  <codeph>ENCODING</codeph> configuration.
+                                                  <codeph>gpload</codeph> does not drop and recreate
+                                                  external tables to use the new
+                                                  <codeph>ENCODING</codeph> if
+                                                  <codeph>REUSE_TABLES</codeph> is set to
+                                                  <codeph>true</codeph>.</note></pd>
                                         </plentry>
                                         <plentry>
                                             <pt id="cferrorlimit">ERROR_LIMIT</pt>
@@ -653,7 +672,11 @@
                                                 table where the rows have
                                                   <codeph>MATCH_COLUMNS</codeph> attribute values
                                                 equal to those of the input data, and the optional
-                                                  <codeph>UPDATE_CONDITION</codeph> is true. </pd>
+                                                  <codeph>UPDATE_CONDITION</codeph> is true.
+                                                  <codeph>UPDATE</codeph> is not supported if the
+                                                target table column name is a reserved keyword, has
+                                                capital letters, or includes any character that
+                                                requires quotes (" ") to identify the column.</pd>
                                             <pd><option>MERGE</option> - Inserts new rows and
                                                 updates the <codeph>UPDATE_COLUMNS</codeph> of
                                                 existing rows where <codeph>FOOBAR</codeph>
@@ -671,7 +694,11 @@
                                                 that are the same, only one new row for that value
                                                 will be inserted. Use
                                                   <codeph>UPDATE_CONDITION</codeph> to filter out
-                                                the rows to discard.</pd>
+                                                the rows to discard. <codeph>MERGE</codeph> is not
+                                                supported if the target table column name is a
+                                                reserved keyword, has capital letters, or includes
+                                                any character that requires quotes (" ") to identify
+                                                the column.</pd>
                                         </plentry>
                                         <plentry>
                                             <pt id="cfmatchcolumns">MATCH_COLUMNS</pt>
@@ -731,7 +758,8 @@
                             <plentry>
                                 <pt id="cftruncate">TRUNCATE</pt>
                                 <pd>Optional. If set to true, <codeph>gpload</codeph> will remove
-                                    all rows in the target table prior to loading it.</pd>
+                                    all rows in the target table prior to loading it. Default is
+                                    false.</pd>
                             </plentry>
                             <plentry>
                                 <pt id="cfreusetables">REUSE_TABLES</pt>
@@ -747,6 +775,62 @@
                                     If <codeph>REUSE_TABLES: true</codeph> is not specified,
                                     formatting error information is deleted after the
                                         <codeph>gpload</codeph> operation.</pd>
+                                <pd>If the <varname>external_table_name</varname> exists, the
+                                    utility uses the existing table. The utility returns an error if
+                                    the table schema does not match the <codeph>OUTPUT</codeph>
+                                    table schema.</pd>
+                            </plentry>
+                            <plentry>
+                                <pt id="cfstagetbl">STAGING_TABLE</pt>
+                                <pd>Optional. Specify the name of the temporary external table that
+                                    is created during a <codeph>gpload</codeph> operation. The
+                                    external table is used by <codeph>gpfdist</codeph>.
+                                        <codeph>REUSE_TABLES: true</codeph> must also specified. If
+                                        <codeph>REUSE_TABLES</codeph> is false or not specified,
+                                        <codeph>STAGING_TABLE</codeph> is ignored. By default,
+                                        <codeph>gpload</codeph> creates a temporary external table
+                                    with a randomly generated name.</pd>
+                                <pd>If <varname>external_table_name</varname> contains a period (.),
+                                        <codeph>gpload</codeph> returns an error. If the table
+                                    exists, the utility uses the table. The utility returns an error
+                                    if the existing table schema does not match the
+                                        <codeph>OUTPUT</codeph> table schema.</pd>
+                                <pd>The utility uses the value of <codeph><xref
+                                            href="#topic1/cfschema" format="dita"
+                                        >SCHEMA</xref></codeph> in the <codeph>EXTERNAL</codeph>
+                                    section as the schema for
+                                    <varname>external_table_name</varname>. If the
+                                        <codeph>SCHEMA</codeph> value is <codeph>%</codeph>, the
+                                    schema for <varname>external_table_name</varname> is the same as
+                                    the schema of the target table, the schema of <codeph><xref
+                                            href="#topic1/cftable" format="dita"
+                                        >TABLE</xref></codeph> in the <codeph>OUTPUT</codeph>
+                                    section. </pd>
+                                <pd>If <codeph>SCHEMA</codeph> is not set, the utility searches for
+                                    the table (using the schemas in the database
+                                        <codeph>search_path</codeph>). If the table is not found,
+                                        <varname>external_table_name</varname> is created in the
+                                    default <codeph>PUBLIC</codeph> schema. </pd>
+                            </plentry>
+                            <plentry>
+                                <pt id="cffastmatch">FAST_MATCH</pt>
+                                <pd>Optional. If set to true, <codeph>gpload</codeph> only searches
+                                    the database for matching external table objects when reusing
+                                    external tables. The utility does not check the external table
+                                    column names and column types in the catalog table
+                                        <codeph>pg_attribute</codeph> to ensure that the table can
+                                    be used for a <codeph>gpload</codeph> operation. Set the value
+                                    to true to improve <codeph>gpload</codeph> performance when
+                                    reusing external table objects and the database catalog table
+                                        <codeph>pg_attribute</codeph> contains a large number of
+                                    rows. The utility returns an error and quits if the column
+                                    definitions are not compatible.</pd>
+                                <pd>The default value is false, the utility checks the external
+                                    table definition column names and column types. </pd>
+                                <pd><codeph>REUSE_TABLES: true</codeph> must also specified. If
+                                        <codeph>REUSE_TABLES</codeph> is false or not specified and
+                                        <codeph>FAST_MATCH: true</codeph> is specified,
+                                        <codeph>gpload</codeph> returns a warning message. </pd>
                             </plentry>
                         </parml></pd>
                 </plentry>
@@ -834,7 +918,7 @@ GPLOAD:
            - name: text
            - amount: float4
            - category: text
-           - desc: text
+           - descr: text
            - date: date
     - FORMAT: text
     - DELIMITER: '|'

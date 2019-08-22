@@ -3,30 +3,33 @@
  * execCurrent.c
  *	  executor support for WHERE CURRENT OF cursor
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- *	$PostgreSQL: pgsql/src/backend/executor/execCurrent.c,v 1.7 2008/05/12 00:00:48 alvherre Exp $
+ *	src/backend/executor/execCurrent.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "access/relscan.h"
 #include "access/sysattr.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/portal.h"
+#include "utils/rel.h"
 
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
 #include "cdb/cdbvars.h"
 
 
-static char *fetch_param_value(ExprContext *econtext, int paramId);
+static char *fetch_cursor_param_value(ExprContext *econtext, int paramId);
 #ifdef NOT_USED
-static ScanState *search_plan_tree(PlanState *node, Oid table_oid);
+static ScanState *search_plan_tree(PlanState *node, Oid table_oid,
+				 bool *pending_rescan);
 #endif /* NOT_USED */
 
 /*
@@ -67,7 +70,7 @@ execCurrentOf(CurrentOfExpr *cexpr,
 		if (cexpr->cursor_name)
 			cursor_name = cexpr->cursor_name;
 		else
-			cursor_name = fetch_param_value(econtext, cexpr->cursor_param);
+			cursor_name = fetch_cursor_param_value(econtext, cexpr->cursor_param);
 
 		foreach (lc, econtext->ecxt_estate->es_cursorPositions)
 		{
@@ -97,7 +100,7 @@ execCurrentOf(CurrentOfExpr *cexpr,
 	/*
 	 * Found the cursor. Does the table and segment match?
 	 */
-	if (current_gp_segment_id == Gp_segment &&
+	if (current_gp_segment_id == GpIdentity.segindex &&
 		(current_table_oid == InvalidOid || current_table_oid == table_oid))
 	{
 		return true;
@@ -151,7 +154,7 @@ getCurrentOf(CurrentOfExpr *cexpr,
 		if (!econtext->ecxt_param_list_info)
 			elog(ERROR, "no cursor name information found");
 
-		cursor_name = fetch_param_value(econtext, cexpr->cursor_param);
+		cursor_name = fetch_cursor_param_value(econtext, cexpr->cursor_param);
 	}
 
 	/* Fetch table name for possible use in error messages */
@@ -250,6 +253,9 @@ getCurrentOf(CurrentOfExpr *cexpr,
 		{
 			ExecRowMark *thiserm = (ExecRowMark *) lfirst(lc);
 
+			if (!RowMarkRequiresRowShareLock(thiserm->markType))
+				continue;		/* ignore non-FOR UPDATE/SHARE items */
+
 			if (RelationGetRelid(thiserm->relation) == table_oid)
 			{
 				if (erm)
@@ -293,18 +299,16 @@ getCurrentOf(CurrentOfExpr *cexpr,
 	}
 	else
 	{
-		ScanState  *scanstate;
-		bool		lisnull;
-		Oid			tuple_tableoid;
-		ItemPointer tuple_tid;
-
 		/*
 		 * Without FOR UPDATE, we dig through the cursor's plan to find the
 		 * scan node.  Fail if it's not there or buried underneath
 		 * aggregation.
 		 */
-		scanstate = search_plan_tree(ExecGetActivePlanTree(queryDesc),
-									 table_oid);
+		ScanState  *scanstate;
+		bool		pending_rescan = false;
+
+		scanstate = search_plan_tree(queryDesc->planstate, table_oid,
+									 &pending_rescan);
 		if (!scanstate)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_CURSOR_STATE),
@@ -324,25 +328,70 @@ getCurrentOf(CurrentOfExpr *cexpr,
 					 errmsg("cursor \"%s\" is not positioned on a row",
 							cursor_name)));
 
-		/* Now OK to return false if we found an inactive scan */
-		if (TupIsNull(scanstate->ss_ScanTupleSlot))
+		/*
+		 * Now OK to return false if we found an inactive scan.  It is
+		 * inactive either if it's not positioned on a row, or there's a
+		 * rescan pending for it.
+		 */
+		if (TupIsNull(scanstate->ss_ScanTupleSlot) || pending_rescan)
 			return false;
 
-		/* Use slot_getattr to catch any possible mistakes */
-		tuple_tableoid =
-			DatumGetObjectId(slot_getattr(scanstate->ss_ScanTupleSlot,
-										  TableOidAttributeNumber,
-										  &lisnull));
-		Assert(!lisnull);
-		tuple_tid = (ItemPointer)
-			DatumGetPointer(slot_getattr(scanstate->ss_ScanTupleSlot,
-										 SelfItemPointerAttributeNumber,
-										 &lisnull));
-		Assert(!lisnull);
+		/*
+		 * Extract TID of the scan's current row.  The mechanism for this is
+		 * in principle scan-type-dependent, but for most scan types, we can
+		 * just dig the TID out of the physical scan tuple.
+		 */
+		if (IsA(scanstate, IndexOnlyScanState))
+		{
+			/*
+			 * For IndexOnlyScan, the tuple stored in ss_ScanTupleSlot may be
+			 * a virtual tuple that does not have the ctid column, so we have
+			 * to get the TID from xs_ctup.t_self.
+			 */
+			IndexScanDesc scan = ((IndexOnlyScanState *) scanstate)->ioss_ScanDesc;
 
-		Assert(tuple_tableoid == table_oid);
+			*current_tid = scan->xs_ctup.t_self;
+		}
+		else
+		{
+			/*
+			 * Default case: try to fetch TID from the scan node's current
+			 * tuple.  As an extra cross-check, verify tableoid in the current
+			 * tuple.  If the scan hasn't provided a physical tuple, we have
+			 * to fail.
+			 */
+			Datum		ldatum;
+			bool		lisnull;
+			ItemPointer tuple_tid;
 
-		*current_tid = *tuple_tid;
+#ifdef USE_ASSERT_CHECKING
+			if (!slot_getsysattr(scanstate->ss_ScanTupleSlot,
+								 TableOidAttributeNumber,
+								 &ldatum,
+								 &lisnull))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_CURSOR_STATE),
+						 errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
+								cursor_name, table_name)));
+			Assert(!lisnull);
+			Assert(DatumGetObjectId(ldatum) == table_oid);
+#endif
+
+			if (!slot_getsysattr(scanstate->ss_ScanTupleSlot,
+								 SelfItemPointerAttributeNumber,
+								 &ldatum,
+								 &lisnull))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_CURSOR_STATE),
+						 errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
+								cursor_name, table_name)));
+			Assert(!lisnull);
+			tuple_tid = (ItemPointer) DatumGetPointer(ldatum);
+
+			*current_tid = *tuple_tid;
+		}
+
+		Assert(ItemPointerIsValid(current_tid));
 
 		return true;
 	}
@@ -412,12 +461,12 @@ getCurrentOf(CurrentOfExpr *cexpr,
 }
 
 /*
- * fetch_param_value
+ * fetch_cursor_param_value
  *
  * Fetch the string value of a param, verifying it is of type REFCURSOR.
  */
 static char *
-fetch_param_value(ExprContext *econtext, int paramId)
+fetch_cursor_param_value(ExprContext *econtext, int paramId)
 {
 	ParamListInfo paramInfo = econtext->ecxt_param_list_info;
 
@@ -426,9 +475,21 @@ fetch_param_value(ExprContext *econtext, int paramId)
 	{
 		ParamExternData *prm = &paramInfo->params[paramId - 1];
 
+		/* give hook a chance in case parameter is dynamic */
+		if (!OidIsValid(prm->ptype) && paramInfo->paramFetch != NULL)
+			(*paramInfo->paramFetch) (paramInfo, paramId);
+
 		if (OidIsValid(prm->ptype) && !prm->isnull)
 		{
-			Assert(prm->ptype == REFCURSOROID);
+			/* safety check in case hook did something unexpected */
+			if (prm->ptype != REFCURSOROID)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("type of parameter %d (%s) does not match that when preparing the plan (%s)",
+								paramId,
+								format_type_be(prm->ptype),
+								format_type_be(REFCURSOROID))));
+
 			/* We know that refcursor uses text's I/O routines */
 			return TextDatumGetCString(prm->value);
 		}
@@ -445,11 +506,21 @@ fetch_param_value(ExprContext *econtext, int paramId)
  *
  * Search through a PlanState tree for a scan node on the specified table.
  * Return NULL if not found or multiple candidates.
+ *
+ * If a candidate is found, set *pending_rescan to true if that candidate
+ * or any node above it has a pending rescan action, i.e. chgParam != NULL.
+ * That indicates that we shouldn't consider the node to be positioned on a
+ * valid tuple, even if its own state would indicate that it is.  (Caller
+ * must initialize *pending_rescan to false, and should not trust its state
+ * if multiple candidates are found.)
  */
 #ifdef NOT_USED
 static ScanState *
-search_plan_tree(PlanState *node, Oid table_oid)
+search_plan_tree(PlanState *node, Oid table_oid,
+				 bool *pending_rescan)
 {
+	ScanState  *result = NULL;
+
 	if (node == NULL)
 		return NULL;
 	switch (nodeTag(node))
@@ -458,20 +529,18 @@ search_plan_tree(PlanState *node, Oid table_oid)
 			 * scan nodes can all be treated alike
 			 */
 		case T_SeqScanState:
-		case T_AppendOnlyScanState:
-		case T_AOCSScanState:
-		case T_TableScanState:
-		case T_DynamicTableScanState:
+		case T_DynamicSeqScanState:
 		case T_IndexScanState:
+		case T_DynamicIndexScanState:
+		case T_IndexOnlyScanState:
 		case T_BitmapHeapScanState:
-		case T_BitmapAppendOnlyScanState:
-		case T_BitmapTableScanState:
+		case T_DynamicBitmapHeapScanState:
 		case T_TidScanState:
 			{
 				ScanState  *sstate = (ScanState *) node;
 
 				if (RelationGetRelid(sstate->ss_currentRelation) == table_oid)
-					return sstate;
+					result = sstate;
 				break;
 			}
 
@@ -482,13 +551,13 @@ search_plan_tree(PlanState *node, Oid table_oid)
 		case T_AppendState:
 			{
 				AppendState *astate = (AppendState *) node;
-				ScanState  *result = NULL;
 				int			i;
 
 				for (i = 0; i < astate->as_nplans; i++)
 				{
 					ScanState  *elem = search_plan_tree(astate->appendplans[i],
-														table_oid);
+														table_oid,
+														pending_rescan);
 
 					if (!elem)
 						continue;
@@ -496,7 +565,30 @@ search_plan_tree(PlanState *node, Oid table_oid)
 						return NULL;	/* multiple matches */
 					result = elem;
 				}
-				return result;
+				break;
+			}
+
+			/*
+			 * Similarly for MergeAppend
+			 */
+		case T_MergeAppendState:
+			{
+				MergeAppendState *mstate = (MergeAppendState *) node;
+				int			i;
+
+				for (i = 0; i < mstate->ms_nplans; i++)
+				{
+					ScanState  *elem = search_plan_tree(mstate->mergeplans[i],
+														table_oid,
+														pending_rescan);
+
+					if (!elem)
+						continue;
+					if (result)
+						return NULL;	/* multiple matches */
+					result = elem;
+				}
+				break;
 			}
 
 			/*
@@ -506,19 +598,32 @@ search_plan_tree(PlanState *node, Oid table_oid)
 		case T_ResultState:
 		case T_LimitState:
 		case T_MotionState:
-			return search_plan_tree(node->lefttree, table_oid);
+			result = search_plan_tree(node->lefttree,
+									  table_oid,
+									  pending_rescan);
+			break;
 
 			/*
 			 * SubqueryScan too, but it keeps the child in a different place
 			 */
 		case T_SubqueryScanState:
-			return search_plan_tree(((SubqueryScanState *) node)->subplan,
-									table_oid);
+			result = search_plan_tree(((SubqueryScanState *) node)->subplan,
+									  table_oid,
+									  pending_rescan);
+			break;
 
 		default:
 			/* Otherwise, assume we can't descend through it */
 			break;
 	}
-	return NULL;
+
+	/*
+	 * If we found a candidate at or below this node, then this node's
+	 * chgParam indicates a pending rescan that will affect the candidate.
+	 */
+	if (result && node->chgParam != NULL)
+		*pending_rescan = true;
+
+	return result;
 }
 #endif /* NOT_USED */

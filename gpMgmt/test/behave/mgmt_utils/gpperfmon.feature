@@ -15,9 +15,11 @@ Feature: gpperfmon
     Scenario: install gpperfmon
         Given the environment variable "PGDATABASE" is set to "template1"
         Given the database "gpperfmon" does not exist
-        When the user runs "gpperfmon_install --port 15432 --enable --password foo"
+        When the user installs gpperfmon
         Then gpperfmon_install should return a return code of 0
-        Then verify that the last line of the file "postgresql.conf" in the master data directory contains the string "gpperfmon_log_alert_level='warning'"
+        Then gpperfmon_install should not print "foo" to stdout
+        Then gpperfmon_install should print "\*\*\*\*\*\*\*\*" to stdout
+        Then verify that the last line of the file "postgresql.conf" in the master data directory contains the string "gpperfmon_log_alert_level=warning"
         Then verify that the last line of the file "pg_hba.conf" in the master data directory contains the string "host     all         gpmon         ::1/128    md5"
         And verify that there is a "heap" table "database_history" in "gpperfmon"
 
@@ -58,6 +60,29 @@ Feature: gpperfmon
             """
         Then validate that first column of first stored row has "3" lines of raw output
 
+    @gpperfmon_query_history
+    Scenario: gpperfmon ignore ALTER TABLE SET DISTRIBUTED BY
+        Given gpperfmon is configured and running in qamode
+        When the user truncates "queries_history" tables in "gpperfmon"
+        Given database "gptest" is dropped and recreated
+        When below sql is executed in "gptest" db
+        """
+        CREATE TABLE ignore_alter (id int, amt decimal(10,2), t text)
+        DISTRIBUTED BY (id);
+        """
+        When below sql is executed in "gptest" db
+        """
+        --alter distributed by
+        ALTER TABLE ignore_alter SET DISTRIBUTED BY (t);
+        """
+        When below sql is executed in "gptest" db
+        """
+        --end flag
+        SELECT 1 from ignore_alter;
+        """
+        Then wait until the results from boolean sql "SELECT count(*) = 0 FROM queries_history WHERE query_text like '--alter distributed by%'" is "true"
+        And wait until the results from boolean sql "SELECT count(*) = 1 FROM queries_history WHERE query_text like '--end flag%'" is "true"
+
     @gpperfmon_system_history
     Scenario: gpperfmon adds to system_history table
         Given gpperfmon is configured and running in qamode
@@ -87,12 +112,12 @@ Feature: gpperfmon
         Then wait until the results from boolean sql "SELECT count(*) > 0 FROM diskspace_history" is "true"
 
     """
-    The gpperfmon_skew_cpu_and_cpu_elapsed does not work on MacOS because of Sigar lib limitations.
+    The gpperfmon_queries_history_metrics does not work on MacOS because of Sigar lib limitations.
     To run all the other scenarios and omit this test on MacOS, use:
-    $ behave test/behave/mgmt_utils/gpperfmon.feature --tags @gpperfmon --tags ~@gpperfmon_skew_cpu_and_cpu_elapsed
+    $ behave test/behave/mgmt_utils/gpperfmon.feature --tags @gpperfmon --tags ~@gpperfmon_queries_history_metrics
     """
     @gpperfmon_queries_history_metrics
-    Scenario: gpperfmon records cpu_elapsed, skew_cpu, skew_rows and rows_out
+    Scenario: gpperfmon records cpu_elapsed and rows_out
         Given gpperfmon is configured and running in qamode
         Given the user truncates "queries_history" tables in "gpperfmon"
         Given database "gptest" is dropped and recreated
@@ -111,8 +136,6 @@ Feature: gpperfmon
         select gp_segment_id, count(*),sum(pow(amt,2)) from sales group by gp_segment_id;
         """
         Then wait until the results from boolean sql "SELECT count(*) > 0 FROM queries_history where cpu_elapsed > 1 and query_text like 'select gp_segment_id, count(*)%'" is "true"
-        Then wait until the results from boolean sql "SELECT count(*) > 0 FROM queries_history where skew_cpu > 0.05 and db = 'gptest'" is "true"
-        Then wait until the results from boolean sql "SELECT count(*) > 0 FROM queries_history where skew_rows > 0 and db = 'gptest'" is "true"
         Then wait until the results from boolean sql "SELECT rows_out = count(distinct content) from queries_history, gp_segment_configuration where query_text like 'select gp_segment_id, count(*)%' and db = 'gptest' and content != -1 group by rows_out" is "true"
 
     @gpperfmon_partition
@@ -122,7 +145,7 @@ Feature: gpperfmon
         # default history table is created with three partitions
         Then wait until the results from boolean sql "SELECT count(*) = 3 FROM pg_partitions WHERE tablename = 'diskspace_history'" is "true"
         Then wait until the results from boolean sql "SELECT count(*) = 1 from pg_partitions where tablename = 'diskspace_history' and partitionrangestart like '%' || date_part('year', CURRENT_DATE) || '-' || to_char(CURRENT_DATE, 'MM') || '%';" is "true"
-        Then wait until the results from boolean sql "SELECT count(*) = 1 from pg_partitions where tablename = 'diskspace_history' and partitionrangestart like '%' || date_part('year', CURRENT_DATE) || '-' || to_char(CURRENT_DATE  + interval '1 month' * 1, 'MM') || '%';" is "true"
+        Then wait until the results from boolean sql "SELECT count(*) = 1 from pg_partitions where tablename = 'diskspace_history' and partitionrangestart like '%' || date_part('year', CURRENT_DATE + interval '1 month') || '-' || to_char(CURRENT_DATE  + interval '1 month' * 1, 'MM') || '%';" is "true"
         When below sql is executed in "gpperfmon" db
             """
             ALTER table diskspace_history add partition
@@ -145,10 +168,10 @@ Feature: gpperfmon
         # to make sure that no partition reaping is going to happen, we could add a step like this, but it is implementation specific:
         # wait until the latest gpperfmon log file contains the line "partition_age turned off"
         Then wait until the results from boolean sql "SELECT count(*) = 7 FROM pg_partitions WHERE tablename = 'diskspace_history'" is "true"
-        When the setting "partition_age = 4" is placed in the configuration file "gpperfmon/conf/gpperfmon.conf"
-        Then verify that the last line of the file "gpperfmon/conf/gpperfmon.conf" in the master data directory contains the string "partition_age = 4"
+        When the setting "partition_age = 5" is placed in the configuration file "gpperfmon/conf/gpperfmon.conf"
+        Then verify that the last line of the file "gpperfmon/conf/gpperfmon.conf" in the master data directory contains the string "partition_age = 5"
         When the user runs command "pkill gpmmon"
         Then wait until the process "gpmmon" is up
         And wait until the process "gpsmon" is up
         # Note that the code considers partition_age + 1 as the number of partitions to keep
-        Then wait until the results from boolean sql "SELECT count(*) = 5 FROM pg_partitions WHERE tablename = 'diskspace_history'" is "true"
+        Then wait until the results from boolean sql "SELECT count(*) = 6 FROM pg_namespace n INNER JOIN pg_class cl ON cl.relnamespace = n.oid INNER JOIN pg_partition pp ON pp.parrelid = cl.oid INNER JOIN pg_partition_rule ppr ON ppr.paroid = pp.oid WHERE n.nspname = 'public' AND cl.relname = 'diskspace_history'" is "true"

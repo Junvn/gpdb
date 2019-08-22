@@ -3,7 +3,7 @@
 --
 
 --start_ignore
-set gp_cte_sharing = on;
+set gp_cte_sharing to on;
 --end_ignore
 
 -- Basic WITH
@@ -34,6 +34,21 @@ UNION ALL
     SELECT n+1 FROM t WHERE n < 5
 )
 SELECT * FROM t;
+
+-- recursive view
+CREATE RECURSIVE VIEW nums (n) AS
+    VALUES (1)
+UNION ALL
+    SELECT n+1 FROM nums WHERE n < 5;
+
+SELECT * FROM nums;
+
+CREATE OR REPLACE RECURSIVE VIEW nums (n) AS
+    VALUES (1)
+UNION ALL
+    SELECT n+1 FROM nums WHERE n < 6;
+
+SELECT * FROM nums;
 
 -- This is an infinite loop with UNION ALL, but not with UNION
 WITH RECURSIVE t(n) AS (
@@ -186,6 +201,17 @@ SELECT * FROM vsubdepartment ORDER BY name;
 SELECT pg_get_viewdef('vsubdepartment'::regclass);
 SELECT pg_get_viewdef('vsubdepartment'::regclass, true);
 
+-- Another reverse-listing example
+CREATE VIEW sums_1_100 AS
+WITH RECURSIVE t(n) AS (
+    VALUES (1)
+UNION ALL
+    SELECT n+1 FROM t WHERE n < 100
+)
+SELECT sum(n) FROM t;
+
+\d+ sums_1_100
+
 -- corner case in which sub-WITH gets initialized first
 with recursive q as (
       select * from department_oneseg
@@ -257,6 +283,16 @@ SELECT t1.id, count(t2.*) FROM t AS t1 JOIN t AS t2 ON
 	array_upper(t2.path,1) > 1)
 	GROUP BY t1.id
 	ORDER BY t1.id;
+
+-- this variant tickled a whole-row-variable bug in 8.4devel
+WITH RECURSIVE t(id, path) AS (
+    VALUES(1,ARRAY[]::integer[])
+UNION ALL
+    SELECT tree.id, t.path || tree.id
+    FROM tree JOIN t ON (tree.parent_id = t.id)
+)
+SELECT t1.id, t2.path, t2 FROM t AS t1 JOIN t AS t2 ON
+(t1.id=t2.id);
 
 --
 -- test cycle detection
@@ -337,6 +373,39 @@ WITH RECURSIVE
  SELECT * FROM z;
 
 --
+-- Test WITH attached to a data-modifying statement
+--
+
+CREATE TEMPORARY TABLE y (a INTEGER) DISTRIBUTED RANDOMLY;
+INSERT INTO y SELECT generate_series(1, 10);
+
+WITH t AS (
+	SELECT a FROM y
+)
+INSERT INTO y
+SELECT a+20 FROM t RETURNING *;
+
+SELECT * FROM y;
+
+WITH t AS (
+	SELECT a FROM y
+)
+UPDATE y SET a = y.a-10 FROM t WHERE y.a > 20 AND t.a = y.a RETURNING y.a;
+
+SELECT * FROM y;
+
+WITH RECURSIVE t(a) AS (
+	SELECT 11
+	UNION ALL
+	SELECT a+1 FROM t WHERE a < 50
+)
+DELETE FROM y USING t WHERE t.a = y.a RETURNING y.a;
+
+SELECT * FROM y;
+
+DROP TABLE y;
+
+--
 -- error cases
 --
 
@@ -403,7 +472,7 @@ WITH RECURSIVE x(n) AS (
 	SELECT level+1, row_number() over() FROM x, bar)
   SELECT * FROM x LIMIT 10;
 
-CREATE TEMPORARY TABLE y (a INTEGER);
+CREATE TEMPORARY TABLE y (a INTEGER) DISTRIBUTED RANDOMLY;
 INSERT INTO y SELECT generate_series(1, 10);
 
 -- LEFT JOIN
@@ -509,6 +578,11 @@ WITH RECURSIVE foo(i) AS
    SELECT (i+1)::numeric(10,0) FROM foo WHERE i < 10)
 SELECT * FROM foo;
 
+-- disallow OLD/NEW reference in CTE
+CREATE TEMPORARY TABLE x (n integer);
+CREATE RULE r2 AS ON UPDATE TO x DO INSTEAD
+    WITH t AS (SELECT OLD.*) UPDATE y SET a = t.n FROM t;
+
 --
 -- test for bug #4902
 --
@@ -535,3 +609,422 @@ WITH outermost(x) AS (
          UNION SELECT 3)
 )
 SELECT * FROM outermost;
+
+--
+-- test for nested-recursive-WITH bug
+--
+WITH RECURSIVE t(j) AS (
+    WITH RECURSIVE s(i) AS (
+        VALUES (1)
+        UNION ALL
+        SELECT i+1 FROM s WHERE i < 10
+    )
+    SELECT i FROM s
+    UNION ALL
+    SELECT j+1 FROM t WHERE j < 10
+)
+SELECT * FROM t;
+
+--
+-- test WITH attached to intermediate-level set operation
+--
+
+WITH outermost(x) AS (
+  SELECT 1
+  UNION (WITH innermost as (SELECT 2)
+         SELECT * FROM innermost
+         UNION SELECT 3)
+)
+SELECT * FROM outermost;
+
+WITH outermost(x) AS (
+  SELECT 1
+  UNION (WITH innermost as (SELECT 2)
+         SELECT * FROM outermost  -- fail
+         UNION SELECT * FROM innermost)
+)
+SELECT * FROM outermost;
+
+WITH RECURSIVE outermost(x) AS (
+  SELECT 1
+  UNION (WITH innermost as (SELECT 2)
+         SELECT * FROM outermost
+         UNION SELECT * FROM innermost)
+)
+SELECT * FROM outermost;
+
+WITH RECURSIVE outermost(x) AS (
+  WITH innermost as (SELECT 2 FROM outermost) -- fail
+    SELECT * FROM innermost
+    UNION SELECT * from outermost
+)
+SELECT * FROM outermost;
+
+--
+-- This test will fail with the old implementation of PARAM_EXEC parameter
+-- assignment, because the "q1" Var passed down to A's targetlist subselect
+-- looks exactly like the "A.id" Var passed down to C's subselect, causing
+-- the old code to give them the same runtime PARAM_EXEC slot.  But the
+-- lifespans of the two parameters overlap, thanks to B also reading A.
+--
+
+with
+A as ( select q2 as id, (select q1) as x from int8_tbl ),
+B as ( select id, row_number() over (partition by id) as r from A ),
+C as ( select A.id, array(select B.id from B where B.id = A.id) from A )
+select * from C;
+
+--
+-- Test CTEs read in non-initialization orders
+-- gpdb
+-- Remove window funtions from Recursive CTE's test case.
+-- Currently Recursive CTE's do not support the Window Functions,
+-- So we remove it from the test cases.
+--
+
+WITH RECURSIVE
+  tab(id_key,link) AS (VALUES (1,17), (2,17), (3,17), (4,17), (6,17), (5,17)),
+  iter (id_key, row_type, link) AS (
+      SELECT 0, 'base', 17
+    UNION ALL (
+      WITH remaining(id_key, row_type, link, min) AS (
+        SELECT tab.id_key, 'true'::text, iter.link, tab.id_key
+        FROM tab INNER JOIN iter USING (link)
+        WHERE tab.id_key > iter.id_key
+      ),
+      first_remaining AS (
+        SELECT id_key, row_type, link
+        FROM remaining
+        WHERE id_key=min
+      ),
+      effect AS (
+        SELECT tab.id_key, 'new'::text, tab.link
+        FROM first_remaining e INNER JOIN tab ON e.id_key=tab.id_key
+        WHERE e.row_type = 'false'
+      )
+      SELECT * FROM first_remaining
+      UNION ALL SELECT * FROM effect
+    )
+  )
+SELECT * FROM iter;
+
+WITH RECURSIVE
+  tab(id_key,link) AS (VALUES (1,17), (2,17), (3,17), (4,17), (6,17), (5,17)),
+  iter (id_key, row_type, link) AS (
+      SELECT 0, 'base', 17
+    UNION (
+      WITH remaining(id_key, row_type, link, min) AS (
+        SELECT tab.id_key, 'true'::text, iter.link, tab.id_key
+        FROM tab INNER JOIN iter USING (link)
+        WHERE tab.id_key > iter.id_key
+      ),
+      first_remaining AS (
+        SELECT id_key, row_type, link
+        FROM remaining
+        WHERE id_key=min
+      ),
+      effect AS (
+        SELECT tab.id_key, 'new'::text, tab.link
+        FROM first_remaining e INNER JOIN tab ON e.id_key=tab.id_key
+        WHERE e.row_type = 'false'
+      )
+      SELECT * FROM first_remaining
+      UNION ALL SELECT * FROM effect
+    )
+  )
+SELECT * FROM iter;
+
+--
+-- Data-modifying statements in WITH
+--
+
+-- INSERT ... RETURNING
+WITH t AS (
+    INSERT INTO y
+    VALUES
+        (11),
+        (12),
+        (13),
+        (14),
+        (15),
+        (16),
+        (17),
+        (18),
+        (19),
+        (20)
+    RETURNING *
+)
+SELECT * FROM t;
+
+SELECT * FROM y;
+
+-- UPDATE ... RETURNING
+WITH t AS (
+    UPDATE y
+    SET a=a+1
+    RETURNING *
+)
+SELECT * FROM t;
+
+SELECT * FROM y;
+
+-- DELETE ... RETURNING
+WITH t AS (
+    DELETE FROM y
+    WHERE a <= 10
+    RETURNING *
+)
+SELECT * FROM t;
+
+SELECT * FROM y;
+
+-- forward reference
+WITH RECURSIVE t AS (
+	INSERT INTO y
+		SELECT a+5 FROM t2 WHERE a > 5
+	RETURNING *
+), t2 AS (
+	UPDATE y SET a=a-11 RETURNING *
+)
+SELECT * FROM t
+UNION ALL
+SELECT * FROM t2;
+
+SELECT * FROM y;
+
+-- unconditional DO INSTEAD rule
+CREATE RULE y_rule AS ON DELETE TO y DO INSTEAD
+  INSERT INTO y VALUES(42) RETURNING *;
+
+WITH t AS (
+	DELETE FROM y RETURNING *
+)
+SELECT * FROM t;
+
+SELECT * FROM y;
+
+DROP RULE y_rule ON y;
+
+-- check merging of outer CTE with CTE in a rule action
+CREATE TEMP TABLE bug6051 AS
+  select i from generate_series(1,3) as t(i);
+
+SELECT * FROM bug6051;
+
+WITH t1 AS ( DELETE FROM bug6051 RETURNING * )
+INSERT INTO bug6051 SELECT * FROM t1;
+
+SELECT * FROM bug6051;
+
+CREATE TEMP TABLE bug6051_2 (i int);
+
+CREATE RULE bug6051_ins AS ON INSERT TO bug6051 DO INSTEAD
+ INSERT INTO bug6051_2
+ SELECT NEW.i;
+
+WITH t1 AS ( DELETE FROM bug6051 RETURNING * )
+INSERT INTO bug6051 SELECT * FROM t1;
+
+SELECT * FROM bug6051;
+SELECT * FROM bug6051_2;
+
+-- a truly recursive CTE in the same list
+WITH RECURSIVE t(a) AS (
+	SELECT 0
+		UNION ALL
+	SELECT a+1 FROM t WHERE a+1 < 5
+), t2 as (
+	INSERT INTO y
+		SELECT * FROM t RETURNING *
+)
+SELECT * FROM t2 JOIN y USING (a) ORDER BY a;
+
+SELECT * FROM y;
+
+-- data-modifying WITH in a modifying statement
+WITH t AS (
+    DELETE FROM y
+    WHERE a <= 10
+    RETURNING *
+)
+INSERT INTO y SELECT -a FROM t RETURNING *;
+
+SELECT * FROM y;
+
+-- check that WITH query is run to completion even if outer query isn't
+WITH t AS (
+    UPDATE y SET a = a * 100 RETURNING *
+)
+SELECT a BETWEEN 0 AND 4200 FROM t LIMIT 10;
+
+SELECT * FROM y;
+
+-- check that run to completion happens in proper ordering
+
+TRUNCATE TABLE y;
+INSERT INTO y SELECT generate_series(1, 3);
+CREATE TEMPORARY TABLE yy (a INTEGER);
+
+WITH RECURSIVE t1 AS (
+  INSERT INTO y SELECT * FROM y RETURNING *
+), t2 AS (
+  INSERT INTO yy SELECT * FROM t1 RETURNING *
+)
+SELECT 1;
+
+SELECT * FROM y;
+SELECT * FROM yy;
+
+WITH RECURSIVE t1 AS (
+  INSERT INTO yy SELECT * FROM t2 RETURNING *
+), t2 AS (
+  INSERT INTO y SELECT * FROM y RETURNING *
+)
+SELECT 1;
+
+SELECT * FROM y;
+SELECT * FROM yy;
+
+-- start_ignore
+-- These tests actually seem to work, but they have unstable return order
+-- in an MPP environment so they are ignored until atmsort can handle this 
+-- triggers
+
+TRUNCATE TABLE y;
+INSERT INTO y SELECT generate_series(1, 10);
+
+CREATE FUNCTION y_trigger() RETURNS trigger AS $$
+begin
+  raise notice 'y_trigger: a = %', new.a;
+  return new;
+end;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER y_trig BEFORE INSERT ON y FOR EACH ROW
+    EXECUTE PROCEDURE y_trigger();
+
+WITH t AS (
+    INSERT INTO y
+    VALUES
+        (21),
+        (22),
+        (23)
+    RETURNING *
+)
+SELECT * FROM t;
+
+SELECT * FROM y;
+
+DROP TRIGGER y_trig ON y;
+
+CREATE TRIGGER y_trig AFTER INSERT ON y FOR EACH ROW
+    EXECUTE PROCEDURE y_trigger();
+
+WITH t AS (
+    INSERT INTO y
+    VALUES
+        (31),
+        (32),
+        (33)
+    RETURNING *
+)
+SELECT * FROM t LIMIT 1;
+
+SELECT * FROM y;
+
+DROP TRIGGER y_trig ON y;
+
+CREATE OR REPLACE FUNCTION y_trigger() RETURNS trigger AS $$
+begin
+  raise notice 'y_trigger';
+  return null;
+end;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER y_trig AFTER INSERT ON y FOR EACH STATEMENT
+    EXECUTE PROCEDURE y_trigger();
+
+WITH t AS (
+    INSERT INTO y
+    VALUES
+        (41),
+        (42),
+        (43)
+    RETURNING *
+)
+SELECT * FROM t;
+
+SELECT * FROM y;
+
+DROP TRIGGER y_trig ON y;
+DROP FUNCTION y_trigger();
+-- end_ignore
+
+-- WITH attached to inherited UPDATE or DELETE
+
+CREATE TEMP TABLE parent ( id int, val text );
+CREATE TEMP TABLE child1 ( ) INHERITS ( parent );
+CREATE TEMP TABLE child2 ( ) INHERITS ( parent );
+
+INSERT INTO parent VALUES ( 1, 'p1' );
+INSERT INTO child1 VALUES ( 11, 'c11' ),( 12, 'c12' );
+INSERT INTO child2 VALUES ( 23, 'c21' ),( 24, 'c22' );
+
+-- start_ignore
+-- This query fails due to the 2 stage agg having issues with inherited tables:
+-- ERROR:  incompatible loci in target inheritance set (planner.c:1426)
+WITH rcte AS ( SELECT sum(id) AS totalid FROM parent )
+UPDATE parent SET id = id + totalid FROM rcte;
+
+SELECT * FROM parent;
+-- end_ignore
+
+WITH wcte AS ( INSERT INTO child1 VALUES ( 42, 'new' ) RETURNING id AS newid )
+UPDATE parent SET id = id + newid FROM wcte;
+
+SELECT * FROM parent;
+
+WITH rcte AS ( SELECT max(id) AS maxid FROM parent )
+DELETE FROM parent USING rcte WHERE id = maxid;
+
+SELECT * FROM parent;
+
+WITH wcte AS ( INSERT INTO child2 VALUES ( 42, 'new2' ) RETURNING id AS newid )
+DELETE FROM parent USING wcte WHERE id = newid;
+
+SELECT * FROM parent;
+
+-- check EXPLAIN VERBOSE for a wCTE with RETURNING
+
+EXPLAIN (VERBOSE, COSTS OFF)
+WITH wcte AS ( INSERT INTO int8_tbl VALUES ( 42, 47 ) RETURNING q2 )
+DELETE FROM a USING wcte WHERE aa = q2;
+
+-- error cases
+
+-- data-modifying WITH tries to use its own output
+WITH RECURSIVE t AS (
+	INSERT INTO y
+		SELECT * FROM t
+)
+VALUES(FALSE);
+
+-- no RETURNING in a referenced data-modifying WITH
+WITH t AS (
+	INSERT INTO y VALUES(0)
+)
+SELECT * FROM t;
+
+-- data-modifying WITH allowed only at the top level
+SELECT * FROM (
+	WITH t AS (UPDATE y SET a=a+1 RETURNING *)
+	SELECT * FROM t
+) ss;
+
+-- most variants of rules aren't allowed
+CREATE RULE y_rule AS ON INSERT TO y WHERE a=0 DO INSTEAD DELETE FROM y;
+WITH t AS (
+	INSERT INTO y VALUES(0)
+)
+VALUES(FALSE);
+DROP RULE y_rule ON y;

@@ -3,12 +3,12 @@
  * hashutil.c
  *	  Utility code for Postgres hash implementation.
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/hash/hashutil.c,v 1.57 2008/09/15 18:43:41 tgl Exp $
+ *	  src/backend/access/hash/hashutil.c
  *
  *-------------------------------------------------------------------------
  */
@@ -17,9 +17,8 @@
 #include "access/hash.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
-#include "executor/execdebug.h"
-#include "storage/bufmgr.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 
 
 /*
@@ -29,10 +28,10 @@ bool
 _hash_checkqual(IndexScanDesc scan, IndexTuple itup)
 {
 	/*
-	 * Currently, we can't check any of the scan conditions since we do
-	 * not have the original index entry value to supply to the sk_func.
-	 * Always return true; we expect that hashgettuple already set the
-	 * recheck flag to make the main indexscan code do it.
+	 * Currently, we can't check any of the scan conditions since we do not
+	 * have the original index entry value to supply to the sk_func. Always
+	 * return true; we expect that hashgettuple already set the recheck flag
+	 * to make the main indexscan code do it.
 	 */
 #ifdef NOT_USED
 	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
@@ -56,7 +55,8 @@ _hash_checkqual(IndexScanDesc scan, IndexTuple itup)
 		if (key->sk_flags & SK_ISNULL)
 			return false;
 
-		test = FunctionCall2(&key->sk_func, datum, key->sk_argument);
+		test = FunctionCall2Coll(&key->sk_func, key->sk_collation,
+								 datum, key->sk_argument);
 
 		if (!DatumGetBool(test))
 			return false;
@@ -79,11 +79,13 @@ uint32
 _hash_datum2hashkey(Relation rel, Datum key)
 {
 	FmgrInfo   *procinfo;
+	Oid			collation;
 
 	/* XXX assumes index has only one attribute */
 	procinfo = index_getprocinfo(rel, 1, HASHPROC);
+	collation = rel->rd_indcollation[0];
 
-	return DatumGetUInt32(FunctionCall1(procinfo, key));
+	return DatumGetUInt32(FunctionCall1Coll(procinfo, collation, key));
 }
 
 /*
@@ -97,6 +99,7 @@ uint32
 _hash_datum2hashkey_type(Relation rel, Datum key, Oid keytype)
 {
 	RegProcedure hash_proc;
+	Oid			collation;
 
 	/* XXX assumes index has only one attribute */
 	hash_proc = get_opfamily_proc(rel->rd_opfamily[0],
@@ -107,8 +110,9 @@ _hash_datum2hashkey_type(Relation rel, Datum key, Oid keytype)
 		elog(ERROR, "missing support function %d(%u,%u) for index \"%s\"",
 			 HASHPROC, keytype, keytype,
 			 RelationGetRelationName(rel));
+	collation = rel->rd_indcollation[0];
 
-	return DatumGetUInt32(OidFunctionCall1(hash_proc, key));
+	return DatumGetUInt32(OidFunctionCall1Coll(hash_proc, collation, key));
 }
 
 /*
@@ -156,7 +160,7 @@ _hash_checkpage(Relation rel, Buffer buf, int flags)
 	/*
 	 * ReadBuffer verifies that every newly-read page passes
 	 * PageHeaderIsValid, which means it either contains a reasonably sane
-	 * page header or is all-zero.	We have to defend against the all-zero
+	 * page header or is all-zero.  We have to defend against the all-zero
 	 * case, however.
 	 */
 	if (PageIsNew(page))
@@ -165,8 +169,7 @@ _hash_checkpage(Relation rel, Buffer buf, int flags)
 			 errmsg("index \"%s\" contains unexpected zero page at block %u",
 					RelationGetRelationName(rel),
 					BufferGetBlockNumber(buf)),
-				 errhint("Please REINDEX it."),
-				 errSendAlert(true)));
+				 errhint("Please REINDEX it.")));
 
 	/*
 	 * Additionally check that the special area looks sane.
@@ -177,8 +180,7 @@ _hash_checkpage(Relation rel, Buffer buf, int flags)
 				 errmsg("index \"%s\" contains corrupted page at block %u",
 						RelationGetRelationName(rel),
 						BufferGetBlockNumber(buf)),
-				 errhint("Please REINDEX it."),
-				 errSendAlert(true)));
+				 errhint("Please REINDEX it.")));
 
 	if (flags)
 	{
@@ -190,8 +192,7 @@ _hash_checkpage(Relation rel, Buffer buf, int flags)
 				   errmsg("index \"%s\" contains corrupted page at block %u",
 						  RelationGetRelationName(rel),
 						  BufferGetBlockNumber(buf)),
-					 errhint("Please REINDEX it."),
-					 errSendAlert(true)));
+					 errhint("Please REINDEX it.")));
 	}
 
 	/*
@@ -212,8 +213,7 @@ _hash_checkpage(Relation rel, Buffer buf, int flags)
 					(errcode(ERRCODE_INDEX_CORRUPTED),
 					 errmsg("index \"%s\" has wrong hash version",
 							RelationGetRelationName(rel)),
-					 errhint("Please REINDEX it."),
-					 errSendAlert(true)));
+					 errhint("Please REINDEX it.")));
 	}
 }
 
@@ -224,10 +224,8 @@ hashoptions(PG_FUNCTION_ARGS)
 	bool		validate = PG_GETARG_BOOL(1);
 	bytea	   *result;
 
-	result = default_reloptions(reloptions, validate,
-								RELKIND_INDEX,
-								HASH_MIN_FILLFACTOR,
-								HASH_DEFAULT_FILLFACTOR);
+	result = default_reloptions(reloptions, validate, RELOPT_KIND_HASH);
+
 	if (result)
 		PG_RETURN_BYTEA_P(result);
 	PG_RETURN_NULL();
@@ -242,8 +240,8 @@ _hash_get_indextuple_hashkey(IndexTuple itup)
 	char	   *attp;
 
 	/*
-	 * We assume the hash key is the first attribute and can't be null,
-	 * so this can be done crudely but very very cheaply ...
+	 * We assume the hash key is the first attribute and can't be null, so
+	 * this can be done crudely but very very cheaply ...
 	 */
 	attp = (char *) itup + IndexInfoFindDataOffset(itup->t_info);
 	return *((uint32 *) attp);
@@ -255,10 +253,10 @@ _hash_get_indextuple_hashkey(IndexTuple itup)
 IndexTuple
 _hash_form_tuple(Relation index, Datum *values, bool *isnull)
 {
-	IndexTuple		itup;
-	uint32			hashkey;
-	Datum			hashkeydatum;
-	TupleDesc		hashdesc;
+	IndexTuple	itup;
+	uint32		hashkey;
+	Datum		hashkeydatum;
+	TupleDesc	hashdesc;
 
 	if (isnull[0])
 		hashkeydatum = (Datum) 0;
@@ -288,8 +286,8 @@ _hash_form_tuple(Relation index, Datum *values, bool *isnull)
 OffsetNumber
 _hash_binsearch(Page page, uint32 hash_value)
 {
-	OffsetNumber	upper;
-	OffsetNumber	lower;
+	OffsetNumber upper;
+	OffsetNumber lower;
 
 	/* Loop invariant: lower <= desired place <= upper */
 	upper = PageGetMaxOffsetNumber(page) + 1;
@@ -297,9 +295,9 @@ _hash_binsearch(Page page, uint32 hash_value)
 
 	while (upper > lower)
 	{
-		OffsetNumber	off;
-		IndexTuple		itup;
-		uint32			hashkey;
+		OffsetNumber off;
+		IndexTuple	itup;
+		uint32		hashkey;
 
 		off = (upper + lower) / 2;
 		Assert(OffsetNumberIsValid(off));
@@ -326,8 +324,8 @@ _hash_binsearch(Page page, uint32 hash_value)
 OffsetNumber
 _hash_binsearch_last(Page page, uint32 hash_value)
 {
-	OffsetNumber	upper;
-	OffsetNumber	lower;
+	OffsetNumber upper;
+	OffsetNumber lower;
 
 	/* Loop invariant: lower <= desired place <= upper */
 	upper = PageGetMaxOffsetNumber(page);
@@ -335,9 +333,9 @@ _hash_binsearch_last(Page page, uint32 hash_value)
 
 	while (upper > lower)
 	{
-		IndexTuple		itup;
-		OffsetNumber	off;
-		uint32			hashkey;
+		IndexTuple	itup;
+		OffsetNumber off;
+		uint32		hashkey;
 
 		off = (upper + lower + 1) / 2;
 		Assert(OffsetNumberIsValid(off));

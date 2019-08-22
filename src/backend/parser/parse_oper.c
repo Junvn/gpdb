@@ -3,18 +3,19 @@
  * parse_oper.c
  *		handle operator things for parser
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/parser/parse_oper.c,v 1.106 2008/09/09 18:58:08 tgl Exp $
+ *	  src/backend/parser/parse_oper.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
@@ -24,7 +25,6 @@
 #include "parser/parse_oper.h"
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
-#include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -59,7 +59,7 @@ typedef struct OprCacheKey
 typedef struct OprCacheEntry
 {
 	/* the hash lookup key MUST BE FIRST */
-	OprCacheKey	key;
+	OprCacheKey key;
 
 	Oid			opr_oid;		/* OID of the resolved operator */
 } OprCacheEntry;
@@ -76,10 +76,10 @@ static void op_error(ParseState *pstate, List *op, char oprkind,
 		 Oid arg1, Oid arg2,
 		 FuncDetailCode fdresult, int location);
 static bool make_oper_cache_key(OprCacheKey *key, List *opname,
-								Oid ltypeId, Oid rtypeId);
+					Oid ltypeId, Oid rtypeId);
 static Oid	find_oper_cache_entry(OprCacheKey *key);
 static void make_oper_cache_entry(OprCacheKey *key, Oid opr_oid);
-static void InvalidateOprCacheCallBack(Datum arg, int cacheid, ItemPointer tuplePtr);
+static void InvalidateOprCacheCallBack(Datum arg, int cacheid, uint32 hashvalue);
 
 
 /*
@@ -148,12 +148,12 @@ LookupOperNameTypeNames(ParseState *pstate, List *opername,
 	if (oprleft == NULL)
 		leftoid = InvalidOid;
 	else
-		leftoid = typenameTypeId(pstate, oprleft, NULL);
+		leftoid = LookupTypeNameOid(pstate, oprleft, noError);
 
 	if (oprright == NULL)
 		rightoid = InvalidOid;
 	else
-		rightoid = typenameTypeId(pstate, oprright, NULL);
+		rightoid = LookupTypeNameOid(pstate, oprright, noError);
 
 	return LookupOperName(pstate, opername, leftoid, rightoid,
 						  noError, location);
@@ -171,6 +171,9 @@ LookupOperNameTypeNames(ParseState *pstate, List *opername,
  * If an operator is missing and the corresponding needXX flag is true,
  * throw a standard error message, else return InvalidOid.
  *
+ * In addition to the operator OIDs themselves, this function can identify
+ * whether the "=" operator is hashable.
+ *
  * Callers can pass NULL pointers for any results they don't care to get.
  *
  * Note: the results are guaranteed to be exact or binary-compatible matches,
@@ -180,70 +183,33 @@ LookupOperNameTypeNames(ParseState *pstate, List *opername,
 void
 get_sort_group_operators(Oid argtype,
 						 bool needLT, bool needEQ, bool needGT,
-						 Oid *ltOpr, Oid *eqOpr, Oid *gtOpr)
+						 Oid *ltOpr, Oid *eqOpr, Oid *gtOpr,
+						 bool *isHashable)
 {
 	TypeCacheEntry *typentry;
+	int			cache_flags;
 	Oid			lt_opr;
 	Oid			eq_opr;
 	Oid			gt_opr;
+	bool		hashable;
 
 	/*
 	 * Look up the operators using the type cache.
 	 *
 	 * Note: the search algorithm used by typcache.c ensures that the results
-	 * are consistent, ie all from the same opclass.
+	 * are consistent, ie all from matching opclasses.
 	 */
-	typentry = lookup_type_cache(argtype,
-					 TYPECACHE_LT_OPR | TYPECACHE_EQ_OPR | TYPECACHE_GT_OPR);
+	if (isHashable != NULL)
+		cache_flags = TYPECACHE_LT_OPR | TYPECACHE_EQ_OPR | TYPECACHE_GT_OPR |
+			TYPECACHE_HASH_PROC;
+	else
+		cache_flags = TYPECACHE_LT_OPR | TYPECACHE_EQ_OPR | TYPECACHE_GT_OPR;
+
+	typentry = lookup_type_cache(argtype, cache_flags);
 	lt_opr = typentry->lt_opr;
 	eq_opr = typentry->eq_opr;
 	gt_opr = typentry->gt_opr;
-
-	/*
-	 * If the datatype is an array, then we can use array_lt and friends ...
-	 * but only if there are suitable operators for the element type.  (This
-	 * check is not in the raw typcache.c code ... should it be?)  Testing all
-	 * three operator IDs here should be redundant, but let's do it anyway.
-	 */
-	if (lt_opr == ARRAY_LT_OP ||
-		eq_opr == ARRAY_EQ_OP ||
-		gt_opr == ARRAY_GT_OP)
-	{
-		Oid			elem_type = get_element_type(argtype);
-
-		if (OidIsValid(elem_type))
-		{
-			typentry = lookup_type_cache(elem_type,
-					 TYPECACHE_LT_OPR | TYPECACHE_EQ_OPR | TYPECACHE_GT_OPR);
-#ifdef NOT_USED
-			/* We should do this ... */
-			if (!OidIsValid(typentry->eq_opr))
-			{
-				/* element type is neither sortable nor hashable */
-				lt_opr = eq_opr = gt_opr = InvalidOid;
-			}
-			else if (!OidIsValid(typentry->lt_opr) ||
-					 !OidIsValid(typentry->gt_opr))
-			{
-				/* element type is hashable but not sortable */
-				lt_opr = gt_opr = InvalidOid;
-			}
-#else
-			/*
-			 * ... but for the moment we have to do this.  This is because
-			 * anyarray has sorting but not hashing support.  So, if the
-			 * element type is only hashable, there is nothing we can do
-			 * with the array type.
-			 */
-			if (!OidIsValid(typentry->lt_opr) ||
-				!OidIsValid(typentry->eq_opr) ||
-				!OidIsValid(typentry->gt_opr))
-				lt_opr = eq_opr = gt_opr = InvalidOid;	/* not sortable */
-#endif
-		}
-		else
-			lt_opr = eq_opr = gt_opr = InvalidOid;		/* bogus array type? */
-	}
+	hashable = OidIsValid(typentry->hash_proc);
 
 	/* Report errors if needed */
 	if ((needLT && !OidIsValid(lt_opr)) ||
@@ -266,6 +232,8 @@ get_sort_group_operators(Oid argtype,
 		*eqOpr = eq_opr;
 	if (gtOpr)
 		*gtOpr = gt_opr;
+	if (isHashable)
+		*isHashable = hashable;
 }
 
 
@@ -407,7 +375,7 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
 	 bool noError, int location)
 {
 	Oid			operOid;
-	OprCacheKey	key;
+	OprCacheKey key;
 	bool		key_ok;
 	FuncDetailCode fdresult = FUNCDETAIL_NOTFOUND;
 	HeapTuple	tup = NULL;
@@ -421,9 +389,7 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
 		operOid = find_oper_cache_entry(&key);
 		if (OidIsValid(operOid))
 		{
-			tup = SearchSysCache(OPEROID,
-								 ObjectIdGetDatum(operOid),
-								 0, 0, 0);
+			tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operOid));
 			if (HeapTupleIsValid(tup))
 				return (Operator) tup;
 		}
@@ -441,7 +407,7 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
 		FuncCandidateList clist;
 
 		/* Get binary operators of given name */
-		clist = OpernameGetCandidates(opname, 'b');
+		clist = OpernameGetCandidates(opname, 'b', false);
 
 		/* No operators found? Then fail... */
 		if (clist != NULL)
@@ -463,9 +429,7 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
 	}
 
 	if (OidIsValid(operOid))
-		tup = SearchSysCache(OPEROID,
-							 ObjectIdGetDatum(operOid),
-							 0, 0, 0);
+		tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operOid));
 
 	if (HeapTupleIsValid(tup))
 	{
@@ -483,7 +447,7 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
  *
  *	This is tighter than oper() because it will not return an operator that
  *	requires coercion of the input datatypes (but binary-compatible operators
- *	are accepted).	Otherwise, the semantics are the same.
+ *	are accepted).  Otherwise, the semantics are the same.
  */
 Operator
 compatible_oper(ParseState *pstate, List *op, Oid arg1, Oid arg2,
@@ -557,7 +521,7 @@ Operator
 right_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 {
 	Oid			operOid;
-	OprCacheKey	key;
+	OprCacheKey key;
 	bool		key_ok;
 	FuncDetailCode fdresult = FUNCDETAIL_NOTFOUND;
 	HeapTuple	tup = NULL;
@@ -571,9 +535,7 @@ right_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 		operOid = find_oper_cache_entry(&key);
 		if (OidIsValid(operOid))
 		{
-			tup = SearchSysCache(OPEROID,
-								 ObjectIdGetDatum(operOid),
-								 0, 0, 0);
+			tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operOid));
 			if (HeapTupleIsValid(tup))
 				return (Operator) tup;
 		}
@@ -591,7 +553,7 @@ right_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 		FuncCandidateList clist;
 
 		/* Get postfix operators of given name */
-		clist = OpernameGetCandidates(op, 'r');
+		clist = OpernameGetCandidates(op, 'r', false);
 
 		/* No operators found? Then fail... */
 		if (clist != NULL)
@@ -605,9 +567,7 @@ right_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 	}
 
 	if (OidIsValid(operOid))
-		tup = SearchSysCache(OPEROID,
-							 ObjectIdGetDatum(operOid),
-							 0, 0, 0);
+		tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operOid));
 
 	if (HeapTupleIsValid(tup))
 	{
@@ -639,7 +599,7 @@ Operator
 left_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 {
 	Oid			operOid;
-	OprCacheKey	key;
+	OprCacheKey key;
 	bool		key_ok;
 	FuncDetailCode fdresult = FUNCDETAIL_NOTFOUND;
 	HeapTuple	tup = NULL;
@@ -653,9 +613,7 @@ left_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 		operOid = find_oper_cache_entry(&key);
 		if (OidIsValid(operOid))
 		{
-			tup = SearchSysCache(OPEROID,
-								 ObjectIdGetDatum(operOid),
-								 0, 0, 0);
+			tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operOid));
 			if (HeapTupleIsValid(tup))
 				return (Operator) tup;
 		}
@@ -673,7 +631,7 @@ left_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 		FuncCandidateList clist;
 
 		/* Get prefix operators of given name */
-		clist = OpernameGetCandidates(op, 'l');
+		clist = OpernameGetCandidates(op, 'l', false);
 
 		/* No operators found? Then fail... */
 		if (clist != NULL)
@@ -699,9 +657,7 @@ left_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 	}
 
 	if (OidIsValid(operOid))
-		tup = SearchSysCache(OPEROID,
-							 ObjectIdGetDatum(operOid),
-							 0, 0, 0);
+		tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operOid));
 
 	if (HeapTupleIsValid(tup))
 	{
@@ -875,6 +831,7 @@ make_op(ParseState *pstate, List *opname, Node *ltree, Node *rtree,
 	result->opfuncid = opform->oprcode;
 	result->opresulttype = rettype;
 	result->opretset = get_func_retset(opform->oprcode);
+	/* opcollid and inputcollid will be set by parse_collate.c */
 	result->args = args;
 	result->location = location;
 
@@ -917,7 +874,7 @@ make_scalar_array_op(ParseState *pstate, List *opname,
 		rtypeId = UNKNOWNOID;
 	else
 	{
-		rtypeId = get_element_type(atypeId);
+		rtypeId = get_base_element_type(atypeId);
 		if (!OidIsValid(rtypeId))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -1003,13 +960,11 @@ make_scalar_array_op(ParseState *pstate, List *opname,
 	result->opno = oprid(tup);
 	result->opfuncid = opform->oprcode;
 	result->useOr = useOr;
+	/* inputcollid will be set by parse_collate.c */
 	result->args = args;
 	result->location = location;
 
 	ReleaseSysCache(tup);
-
-	/* Hack to protect pg_get_expr() against misuse */
-	check_pg_get_expr_args(pstate, result->opfuncid, args);
 
 	return (Expr *) result;
 }
@@ -1072,13 +1027,13 @@ make_oper_cache_key(OprCacheKey *key, List *opname, Oid ltypeId, Oid rtypeId)
 	if (schemaname)
 	{
 		/* search only in exact schema given */
-		key->search_path[0] = LookupExplicitNamespace(schemaname);
+		key->search_path[0] = LookupExplicitNamespace(schemaname, false);
 	}
 	else
 	{
 		/* get the active search path */
 		if (fetch_search_path_array(key->search_path,
-									MAX_CACHED_PATH_LEN) > MAX_CACHED_PATH_LEN)
+								  MAX_CACHED_PATH_LEN) > MAX_CACHED_PATH_LEN)
 			return false;		/* oops, didn't fit */
 	}
 
@@ -1101,15 +1056,12 @@ find_oper_cache_entry(OprCacheKey *key)
 		/* First time through: initialize the hash table */
 		HASHCTL		ctl;
 
-		if (!CacheMemoryContext)
-			CreateCacheMemoryContext();
-
 		MemSet(&ctl, 0, sizeof(ctl));
 		ctl.keysize = sizeof(OprCacheKey);
 		ctl.entrysize = sizeof(OprCacheEntry);
 		ctl.hash = tag_hash;
 		OprCacheHash = hash_create("Operator lookup cache", 256,
-									&ctl, HASH_ELEM | HASH_FUNCTION);
+								   &ctl, HASH_ELEM | HASH_FUNCTION);
 
 		/* Arrange to flush cache on pg_operator and pg_cast changes */
 		CacheRegisterSyscacheCallback(OPERNAMENSP,
@@ -1152,7 +1104,7 @@ make_oper_cache_entry(OprCacheKey *key, Oid opr_oid)
  * Callback for pg_operator and pg_cast inval events
  */
 static void
-InvalidateOprCacheCallBack(Datum arg, int cacheid, ItemPointer tuplePtr)
+InvalidateOprCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
 {
 	HASH_SEQ_STATUS status;
 	OprCacheEntry *hentry;

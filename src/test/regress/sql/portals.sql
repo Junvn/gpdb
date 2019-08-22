@@ -345,8 +345,6 @@ ROLLBACK;
 SELECT f1, f2 FROM uctest;
 
 -- Check inheritance cases
--- GPDB_84_MERGE_FIXME: This notice is being produced by our version of
--- GPDB,we assume it is correct.
 CREATE TEMP TABLE ucchild () inherits (uctest);
 INSERT INTO ucchild values(100, 'hundred');
 SELECT f1, f2 FROM uctest;
@@ -406,6 +404,9 @@ BEGIN;
 DECLARE c1 CURSOR FOR SELECT * FROM uctest;
 DELETE FROM uctest WHERE CURRENT OF c1; -- fail, no current row
 ROLLBACK;
+BEGIN;
+DECLARE c1 CURSOR FOR SELECT MIN(f1) FROM uctest FOR UPDATE;
+ROLLBACK;
 
 -- WHERE CURRENT OF may someday work with views, but today is not that day.
 -- For now, just make sure it errors out cleanly.
@@ -423,3 +424,87 @@ BEGIN;
 DECLARE c1 CURSOR FOR SELECT * FROM LOWER('TEST');
 FETCH ALL FROM c1;
 COMMIT;
+-- Check WHERE CURRENT OF with an index-only scan
+BEGIN;
+EXPLAIN (costs off)
+DECLARE c1 CURSOR FOR SELECT stringu1 FROM onek WHERE stringu1 = 'DZAAAA';
+DECLARE c1 CURSOR FOR SELECT stringu1 FROM onek WHERE stringu1 = 'DZAAAA';
+FETCH FROM c1;
+DELETE FROM onek WHERE CURRENT OF c1;
+SELECT stringu1 FROM onek WHERE stringu1 = 'DZAAAA';
+ROLLBACK;
+
+-- start_ignore
+-- ignore the block, because cursor can only scan forward
+-- Check behavior with rewinding to a previous child scan node,
+-- as per bug #15395
+BEGIN;
+CREATE TABLE current_check (currentid int, payload text);
+CREATE TABLE current_check_1 () INHERITS (current_check);
+CREATE TABLE current_check_2 () INHERITS (current_check);
+INSERT INTO current_check_1 SELECT i, 'p' || i FROM generate_series(1,9) i;
+INSERT INTO current_check_2 SELECT i, 'P' || i FROM generate_series(10,19) i;
+
+DECLARE c1 SCROLL CURSOR FOR SELECT * FROM current_check;
+
+-- This tests the fetch-backwards code path
+FETCH ABSOLUTE 12 FROM c1;
+FETCH ABSOLUTE 8 FROM c1;
+DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
+
+-- This tests the ExecutorRewind code path
+FETCH ABSOLUTE 13 FROM c1;
+FETCH ABSOLUTE 1 FROM c1;
+DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
+
+SELECT * FROM current_check;
+ROLLBACK;
+-- end_ignore
+
+-- Make sure snapshot management works okay, per bug report in
+-- 235395b90909301035v7228ce63q392931f15aa74b31@mail.gmail.com
+
+-- GPDB_90_MERGE_FIXME: This doesn't work correctly. Two issues:
+-- 1. In GPDB, an UPDATE, or FOR UPDATE, locks the whole table. Because of
+--    that, there cannot be concurrent updates, and we don't bother with
+--    LockRows nodes in FOR UPDATE plans. However, in the upstream, the
+--    LockRows node also handles fetching the latest tuple version, if it
+--    was updated in the same transaction, by a *later* command.
+--
+-- 2. Even if we had LockRows in the plan, it still wouldn't work, at least
+--    not always. In PostgreSQL, the LockRows node checks the visibility
+--    when a row is FETCHed. Not before that. So if a row is UPDATEd in
+--    the same transaction, before it's FETCHed, the FETCH is supposed to
+--    see the effects of the UPDATE. In GPDB, however, a cursor starts
+--    executing in the segments, as soon as the DECLARE CURSOR is issued,
+--    so there's a race condition.
+
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+CREATE TABLE cursor (a int, b int);
+INSERT INTO cursor VALUES (1, 1);
+DECLARE c1 NO SCROLL CURSOR FOR SELECT * FROM cursor FOR UPDATE;
+UPDATE cursor SET b = 2;
+FETCH ALL FROM c1;
+COMMIT;
+DROP TABLE cursor;
+
+-- Check rewinding a cursor containing a stable function in LIMIT,
+-- per bug report in 8336843.9833.1399385291498.JavaMail.root@quick
+
+-- GPDB: ignore the result of the FETCH, because the order the rows
+-- arrive from the segments is arbitrary in GPDB. This test isn't
+-- very useful in GPDB anyway, as the bug that this was testing
+-- happened when rewinding the cursor, and GPDB doesn't support
+-- MOVE BACKWARD at all. But doesn't hurt to keep it to the extent
+-- we can, I guess..
+begin;
+create function nochange(int) returns int
+  as 'select $1 limit 1' language sql stable;
+declare c cursor for select * from int8_tbl limit nochange(3);
+-- start_ignore
+fetch all from c;
+-- end_ignore
+move backward all in c;
+fetch all from c;
+rollback;

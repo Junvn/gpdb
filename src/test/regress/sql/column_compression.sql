@@ -139,6 +139,7 @@ drop table ccddl_co, ccddl;
 -----------------------------------------------------------------------
 
 -- only support CO tables
+create table ccddl (i int encoding (compresstype=RLE_TYPE));
 create table ccddl (i int encoding (compresstype=zlib));
 create table ccddl (i int encoding (compresstype=zlib))
 	with (appendonly = true);
@@ -556,6 +557,10 @@ execute ccddlcheck;
 
 drop table ccddl;
 
+create table ccddl (i int42) with(appendonly = true, orientation=column);
+execute ccddlcheck;
+drop table ccddl;
+
 -- Shouldn't apply type default encoding in these cases
 create table ccddl (i int42);
 execute ccddlcheck;
@@ -567,6 +572,23 @@ drop table ccddl;
 
 create table ccddl (i int42) with (appendonly = true, orientation=column,
 compresstype=none);
+alter type int42 set default encoding (compresstype=RLE_TYPE);
+alter table ccddl add column j int42 default '1'::int42;
+execute ccddlcheck;
+
+drop table ccddl;
+
+create table ccddl (i int42) with(appendonly = true, orientation=row);
+alter type int42 set default encoding (compresstype=RLE_TYPE);
+alter table ccddl add column j int42 default '1'::int42;
+-- No results are returned from the attribute encoding check, as compression with rle is not supported for row tables
+execute ccddlcheck;
+drop table ccddl;
+
+create table ccddl (i int42) with(appendonly = true);
+alter type int42 set default encoding (compresstype=RLE_TYPE);
+alter table ccddl add column j int42 default '1'::int42;
+-- No results are returned from the attribute encoding check, as compression with rle is not supported for heap tables
 execute ccddlcheck;
 drop table ccddl;
 
@@ -767,3 +789,24 @@ WHERE id=1;
 -- Lets validate above insert worked.
 SELECT count(*) from col_large_content_block;
 SET enable_seqscan TO ON;
+
+------------------------------------------------------------------------------
+-- Test to validate insert into column oriented table works when in *single
+-- insert statement* first large content block is inserted followed by bulk
+-- dense content block.
+------------------------------------------------------------------------------
+-- dummy table to help create the scenario
+CREATE TABLE ao_from_table(a INT, arr DOUBLE PRECISION[]) WITH (appendonly=true);
+-- insert data to create large content header for CO table
+INSERT INTO ao_from_table
+SELECT 1,
+       array_fill(1234567890.12, ARRAY[1100])
+       FROM generate_series(1, 1);
+-- Bulk dense content header with RLE compression, need 16k rows for the same
+INSERT INTO ao_from_table SELECT 1,'{0.1}' FROM generate_series(1, 17000)i;
+CREATE TABLE co_large_and_bulk_content(a INT,
+                     arr DOUBLE PRECISION[] ENCODING (compresstype=RLE_TYPE,compresslevel=3,blocksize=8192))
+                     WITH (appendonly=true, orientation=column, compresstype=RLE_TYPE);
+INSERT INTO co_large_and_bulk_content SELECT * FROM ao_from_table;
+-- can't do count(*) as CO optimizes to read only first column
+SELECT * FROM co_large_and_bulk_content where a > 1;

@@ -4,12 +4,12 @@
  *
  *	  Routines for tsearch manipulation commands
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/tsearchcmds.c,v 1.14 2008/11/02 01:45:28 tgl Exp $
+ *	  src/backend/commands/tsearchcmds.c
  *
  *-------------------------------------------------------------------------
  */
@@ -17,12 +17,13 @@
 
 #include <ctype.h>
 
-#include "access/heapam.h"
 #include "access/genam.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
-#include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
 #include "catalog/oid_dispatch.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
@@ -32,16 +33,14 @@
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
+#include "commands/alter.h"
 #include "commands/defrem.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_func.h"
 #include "tsearch/ts_cache.h"
-#include "tsearch/ts_public.h"
 #include "tsearch/ts_utils.h"
-#include "utils/acl.h"
 #include "utils/builtins.h"
-#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -97,6 +96,12 @@ get_ts_parser_func(DefElem *defel, int attnum)
 			break;
 		case Anum_pg_ts_parser_prslextype:
 			nargs = 1;
+
+			/*
+			 * Note: because the lextype method returns type internal, it must
+			 * have an internal-type argument for security reasons.  The
+			 * argument is not actually used, but is just passed as a zero.
+			 */
 			break;
 		default:
 			/* should not be here */
@@ -110,7 +115,7 @@ get_ts_parser_func(DefElem *defel, int attnum)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("function %s should return type %s",
-						func_signature_string(funcName, nargs, typeId),
+						func_signature_string(funcName, nargs, NIL, typeId),
 						format_type_be(retTypeId))));
 
 	return ObjectIdGetDatum(procOid);
@@ -135,6 +140,9 @@ makeParserDependencies(HeapTuple tuple)
 	referenced.objectId = prs->prsnamespace;
 	referenced.objectSubId = 0;
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+
+	/* dependency on extension */
+	recordDependencyOnCurrentExtension(&myself, false);
 
 	/* dependencies on functions */
 	referenced.classId = ProcedureRelationId;
@@ -162,7 +170,7 @@ makeParserDependencies(HeapTuple tuple)
 /*
  * CREATE TEXT SEARCH PARSER
  */
-void
+Oid
 DefineTSParser(List *names, List *parameters)
 {
 	char	   *prsname;
@@ -266,6 +274,9 @@ DefineTSParser(List *names, List *parameters)
 
 	makeParserDependencies(tup);
 
+	/* Post creation hook for new text search parser */
+	InvokeObjectPostCreateHook(TSParserRelationId, prsOid, 0);
+
 	heap_freetuple(tup);
 
 	heap_close(prsRel, RowExclusiveLock);
@@ -287,66 +298,8 @@ DefineTSParser(List *names, List *parameters)
 									GetAssignedOidsForDispatch(),
 									NULL);
 	}
-}
 
-/*
- * DROP TEXT SEARCH PARSER
- */
-void
-RemoveTSParsers(DropStmt *drop)
-{
-	ObjectAddresses *objects;
-	ListCell		*cell;
-
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to drop text search parsers")));
-
-	/*
-	 * First we identify all the objects, then we delete them in a single
-	 * performMultipleDeletions() call.  This is to avoid unwanted
-	 * DROP RESTRICT errors if one of the objects depends on another.
-	 */
-	objects = new_object_addresses();
-
-	foreach(cell, drop->objects)
-	{
-		List		*names = (List *) lfirst(cell);
-		Oid			prsOid;
-		ObjectAddress object;
-
-		prsOid = TSParserGetPrsid(names, true);
-
-		if (!OidIsValid(prsOid))
-		{
-			if (!drop->missing_ok)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("text search parser \"%s\" does not exist",
-								NameListToString(names))));
-			}
-			else
-			{
-				if (Gp_role != GP_ROLE_EXECUTE)
-					ereport(NOTICE,
-						(errmsg("text search parser \"%s\" does not exist, skipping",
-								NameListToString(names))));
-			}
-			continue;
-		}
-
-		object.classId = TSParserRelationId;
-		object.objectId = prsOid;
-		object.objectSubId = 0;
-
-		add_exact_object_address(&object, objects);
-	}
-
-	performMultipleDeletions(objects, drop->behavior);
-
-	free_object_addresses(objects);
+	return prsOid;
 }
 
 /*
@@ -360,9 +313,7 @@ RemoveTSParserById(Oid prsId)
 
 	relation = heap_open(TSParserRelationId, RowExclusiveLock);
 
-	tup = SearchSysCache(TSPARSEROID,
-						 ObjectIdGetDatum(prsId),
-						 0, 0, 0);
+	tup = SearchSysCache1(TSPARSEROID, ObjectIdGetDatum(prsId));
 
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for text search parser %u", prsId);
@@ -372,52 +323,6 @@ RemoveTSParserById(Oid prsId)
 	ReleaseSysCache(tup);
 
 	heap_close(relation, RowExclusiveLock);
-}
-
-/*
- * ALTER TEXT SEARCH PARSER RENAME
- */
-void
-RenameTSParser(List *oldname, const char *newname)
-{
-	HeapTuple	tup;
-	Relation	rel;
-	Oid			prsId;
-	Oid			namespaceOid;
-
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to rename text search parsers")));
-
-	rel = heap_open(TSParserRelationId, RowExclusiveLock);
-
-	prsId = TSParserGetPrsid(oldname, false);
-
-	tup = SearchSysCacheCopy(TSPARSEROID,
-							 ObjectIdGetDatum(prsId),
-							 0, 0, 0);
-
-	if (!HeapTupleIsValid(tup)) /* should not happen */
-		elog(ERROR, "cache lookup failed for text search parser %u", prsId);
-
-	namespaceOid = ((Form_pg_ts_parser) GETSTRUCT(tup))->prsnamespace;
-
-	if (SearchSysCacheExists(TSPARSERNAMENSP,
-							 PointerGetDatum(newname),
-							 ObjectIdGetDatum(namespaceOid),
-							 0, 0))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("text search parser \"%s\" already exists",
-						newname)));
-
-	namestrcpy(&(((Form_pg_ts_parser) GETSTRUCT(tup))->prsname), newname);
-	simple_heap_update(rel, &tup->t_self, tup);
-	CatalogUpdateIndexes(rel, tup);
-
-	heap_close(rel, NoLock);
-	heap_freetuple(tup);
 }
 
 /* ---------------------- TS Dictionary commands -----------------------*/
@@ -444,6 +349,9 @@ makeDictionaryDependencies(HeapTuple tuple)
 
 	/* dependency on owner */
 	recordDependencyOnOwner(myself.classId, myself.objectId, dict->dictowner);
+
+	/* dependency on extension */
+	recordDependencyOnCurrentExtension(&myself, false);
 
 	/* dependency on template */
 	referenced.classId = TSTemplateRelationId;
@@ -472,9 +380,7 @@ verify_dictoptions(Oid tmplId, List *dictoptions)
 	if (!IsUnderPostmaster)
 		return;
 
-	tup = SearchSysCache(TSTEMPLATEOID,
-						 ObjectIdGetDatum(tmplId),
-						 0, 0, 0);
+	tup = SearchSysCache1(TSTEMPLATEOID, ObjectIdGetDatum(tmplId));
 	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for text search template %u",
 			 tmplId);
@@ -512,7 +418,7 @@ verify_dictoptions(Oid tmplId, List *dictoptions)
 /*
  * CREATE TEXT SEARCH DICTIONARY
  */
-void
+Oid
 DefineTSDictionary(List *names, List *parameters)
 {
 	ListCell   *pl;
@@ -546,7 +452,7 @@ DefineTSDictionary(List *names, List *parameters)
 
 		if (pg_strcasecmp(defel->defname, "template") == 0)
 		{
-			templId = TSTemplateGetTmplid(defGetQualifiedName(defel), false);
+			templId = get_ts_template_oid(defGetQualifiedName(defel), false);
 		}
 		else
 		{
@@ -592,6 +498,9 @@ DefineTSDictionary(List *names, List *parameters)
 
 	makeDictionaryDependencies(tup);
 
+	/* Post creation hook for new text search dictionary */
+	InvokeObjectPostCreateHook(TSDictionaryRelationId, dictOid, 0);
+
 	heap_freetuple(tup);
 
 	heap_close(dictRel, RowExclusiveLock);
@@ -604,7 +513,6 @@ DefineTSDictionary(List *names, List *parameters)
 		stmt->defnames = names;
 		stmt->args = NIL;
 		stmt->definition = parameters;
-		stmt->ordered = false;
 		CdbDispatchUtilityStatement((Node *) stmt,
 									DF_CANCEL_ON_ERROR |
 									DF_NEED_TWO_PHASE |
@@ -612,133 +520,8 @@ DefineTSDictionary(List *names, List *parameters)
 									GetAssignedOidsForDispatch(),
 									NULL);
 	}
-}
 
-/*
- * ALTER TEXT SEARCH DICTIONARY RENAME
- */
-void
-RenameTSDictionary(List *oldname, const char *newname)
-{
-	HeapTuple	tup;
-	Relation	rel;
-	Oid			dictId;
-	Oid			namespaceOid;
-	AclResult	aclresult;
-
-	rel = heap_open(TSDictionaryRelationId, RowExclusiveLock);
-
-	dictId = TSDictionaryGetDictid(oldname, false);
-
-	tup = SearchSysCacheCopy(TSDICTOID,
-							 ObjectIdGetDatum(dictId),
-							 0, 0, 0);
-
-	if (!HeapTupleIsValid(tup)) /* should not happen */
-		elog(ERROR, "cache lookup failed for text search dictionary %u",
-			 dictId);
-
-	namespaceOid = ((Form_pg_ts_dict) GETSTRUCT(tup))->dictnamespace;
-
-	if (SearchSysCacheExists(TSDICTNAMENSP,
-							 PointerGetDatum(newname),
-							 ObjectIdGetDatum(namespaceOid),
-							 0, 0))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("text search dictionary \"%s\" already exists",
-						newname)));
-
-	/* must be owner */
-	if (!pg_ts_dict_ownercheck(dictId, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TSDICTIONARY,
-					   NameListToString(oldname));
-
-	/* must have CREATE privilege on namespace */
-	aclresult = pg_namespace_aclcheck(namespaceOid, GetUserId(), ACL_CREATE);
-	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, ACL_KIND_NAMESPACE,
-					   get_namespace_name(namespaceOid));
-
-	namestrcpy(&(((Form_pg_ts_dict) GETSTRUCT(tup))->dictname), newname);
-	simple_heap_update(rel, &tup->t_self, tup);
-	CatalogUpdateIndexes(rel, tup);
-
-	heap_close(rel, NoLock);
-	heap_freetuple(tup);
-}
-
-/*
- * DROP TEXT SEARCH DICTIONARY
- */
-void
-RemoveTSDictionaries(DropStmt *drop)
-{
-	ObjectAddresses *objects;
-	ListCell		*cell;
-
-	/*
-	 * First we identify all the objects, then we delete them in a single
-	 * performMultipleDeletions() call.  This is to avoid unwanted
-	 * DROP RESTRICT errors if one of the objects depends on another.
-	 */
-	objects = new_object_addresses();
-
-	foreach(cell, drop->objects)
-	{
-		List		*names = (List *) lfirst(cell);
-		Oid			dictOid;
-		ObjectAddress object;
-		HeapTuple	tup;
-		Oid			namespaceId;
-
-		dictOid = TSDictionaryGetDictid(names, true);
-
-		if (!OidIsValid(dictOid))
-		{
-			if (!drop->missing_ok)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("text search dictionary \"%s\" does not exist",
-								NameListToString(names))));
-			}
-			else
-			{
-				if (Gp_role != GP_ROLE_EXECUTE)
-					ereport(NOTICE,
-						(errmsg("text search dictionary \"%s\" does not exist, skipping",
-								NameListToString(names))));
-			}
-			continue;
-		}
-
-		tup = SearchSysCache(TSDICTOID,
-							 ObjectIdGetDatum(dictOid),
-							 0, 0, 0);
-		if (!HeapTupleIsValid(tup)) /* should not happen */
-			elog(ERROR, "cache lookup failed for text search dictionary %u",
-				 dictOid);
-
-		/* Permission check: must own dictionary or its namespace */
-		namespaceId = ((Form_pg_ts_dict) GETSTRUCT(tup))->dictnamespace;
-		if (!pg_ts_dict_ownercheck(dictOid, GetUserId()) &&
-			!pg_namespace_ownercheck(namespaceId, GetUserId()))
-			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TSDICTIONARY,
-						   NameListToString(names));
-
-		object.classId = TSDictionaryRelationId;
-		object.objectId = dictOid;
-		object.objectSubId = 0;
-
-		add_exact_object_address(&object, objects);
-
-		ReleaseSysCache(tup);
-	}
-
-	performMultipleDeletions(objects, drop->behavior);
-
-	free_object_addresses(objects);
+	return dictOid;
 }
 
 /*
@@ -752,9 +535,7 @@ RemoveTSDictionaryById(Oid dictId)
 
 	relation = heap_open(TSDictionaryRelationId, RowExclusiveLock);
 
-	tup = SearchSysCache(TSDICTOID,
-						 ObjectIdGetDatum(dictId),
-						 0, 0, 0);
+	tup = SearchSysCache1(TSDICTOID, ObjectIdGetDatum(dictId));
 
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for text search dictionary %u",
@@ -770,7 +551,7 @@ RemoveTSDictionaryById(Oid dictId)
 /*
  * ALTER TEXT SEARCH DICTIONARY
  */
-void
+Oid
 AlterTSDictionary(AlterTSDictionaryStmt *stmt)
 {
 	HeapTuple	tup,
@@ -785,13 +566,11 @@ AlterTSDictionary(AlterTSDictionaryStmt *stmt)
 	bool		repl_null[Natts_pg_ts_dict];
 	bool		repl_repl[Natts_pg_ts_dict];
 
-	dictId = TSDictionaryGetDictid(stmt->dictname, false);
+	dictId = get_ts_dict_oid(stmt->dictname, false);
 
 	rel = heap_open(TSDictionaryRelationId, RowExclusiveLock);
 
-	tup = SearchSysCache(TSDICTOID,
-						 ObjectIdGetDatum(dictId),
-						 0, 0, 0);
+	tup = SearchSysCache1(TSDICTOID, ObjectIdGetDatum(dictId));
 
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for text search dictionary %u",
@@ -864,11 +643,13 @@ AlterTSDictionary(AlterTSDictionaryStmt *stmt)
 	repl_repl[Anum_pg_ts_dict_dictinitoption - 1] = true;
 
 	newtup = heap_modify_tuple(tup, RelationGetDescr(rel),
-							  repl_val, repl_null, repl_repl);
+							   repl_val, repl_null, repl_repl);
 
 	simple_heap_update(rel, &newtup->t_self, newtup);
 
 	CatalogUpdateIndexes(rel, newtup);
+
+	InvokeObjectPostAlterHook(TSDictionaryRelationId, dictId, 0);
 
 	/*
 	 * NOTE: because we only support altering the options, not the template,
@@ -888,68 +669,8 @@ AlterTSDictionary(AlterTSDictionaryStmt *stmt)
 									DF_WITH_SNAPSHOT,
 									NIL,
 									NULL);
-}
 
-/*
- * ALTER TEXT SEARCH DICTIONARY OWNER
- */
-void
-AlterTSDictionaryOwner(List *name, Oid newOwnerId)
-{
-	HeapTuple	tup;
-	Relation	rel;
-	Oid			dictId;
-	Oid			namespaceOid;
-	AclResult	aclresult;
-	Form_pg_ts_dict form;
-
-	rel = heap_open(TSDictionaryRelationId, RowExclusiveLock);
-
-	dictId = TSDictionaryGetDictid(name, false);
-
-	tup = SearchSysCacheCopy(TSDICTOID,
-							 ObjectIdGetDatum(dictId),
-							 0, 0, 0);
-
-	if (!HeapTupleIsValid(tup)) /* should not happen */
-		elog(ERROR, "cache lookup failed for text search dictionary %u",
-			 dictId);
-
-	form = (Form_pg_ts_dict) GETSTRUCT(tup);
-	namespaceOid = form->dictnamespace;
-
-	if (form->dictowner != newOwnerId)
-	{
-		/* Superusers can always do it */
-		if (!superuser())
-		{
-			/* must be owner */
-			if (!pg_ts_dict_ownercheck(dictId, GetUserId()))
-				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TSDICTIONARY,
-							   NameListToString(name));
-
-			/* Must be able to become new owner */
-			check_is_member_of_role(GetUserId(), newOwnerId);
-
-			/* New owner must have CREATE privilege on namespace */
-			aclresult = pg_namespace_aclcheck(namespaceOid, newOwnerId, ACL_CREATE);
-			if (aclresult != ACLCHECK_OK)
-				aclcheck_error(aclresult, ACL_KIND_NAMESPACE,
-							   get_namespace_name(namespaceOid));
-		}
-
-		form->dictowner = newOwnerId;
-
-		simple_heap_update(rel, &tup->t_self, tup);
-		CatalogUpdateIndexes(rel, tup);
-
-		/* Update owner dependency reference */
-		changeDependencyOnOwner(TSDictionaryRelationId, HeapTupleGetOid(tup),
-								newOwnerId);
-	}
-
-	heap_close(rel, NoLock);
-	heap_freetuple(tup);
+	return dictId;
 }
 
 /* ---------------------- TS Template commands -----------------------*/
@@ -993,7 +714,7 @@ get_ts_template_func(DefElem *defel, int attnum)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("function %s should return type %s",
-						func_signature_string(funcName, nargs, typeId),
+						func_signature_string(funcName, nargs, NIL, typeId),
 						format_type_be(retTypeId))));
 
 	return ObjectIdGetDatum(procOid);
@@ -1019,6 +740,9 @@ makeTSTemplateDependencies(HeapTuple tuple)
 	referenced.objectSubId = 0;
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 
+	/* dependency on extension */
+	recordDependencyOnCurrentExtension(&myself, false);
+
 	/* dependencies on functions */
 	referenced.classId = ProcedureRelationId;
 	referenced.objectSubId = 0;
@@ -1036,7 +760,7 @@ makeTSTemplateDependencies(HeapTuple tuple)
 /*
  * CREATE TEXT SEARCH TEMPLATE
  */
-void
+Oid
 DefineTSTemplate(List *names, List *parameters)
 {
 	ListCell   *pl;
@@ -1116,6 +840,9 @@ DefineTSTemplate(List *names, List *parameters)
 
 	makeTSTemplateDependencies(tup);
 
+	/* Post creation hook for new text search template */
+	InvokeObjectPostCreateHook(TSTemplateRelationId, tmplOid, 0);
+
 	heap_freetuple(tup);
 
 	heap_close(tmplRel, RowExclusiveLock);
@@ -1135,113 +862,8 @@ DefineTSTemplate(List *names, List *parameters)
 									GetAssignedOidsForDispatch(),
 									NULL);
 	}
-}
 
-/*
- * ALTER TEXT SEARCH TEMPLATE RENAME
- */
-void
-RenameTSTemplate(List *oldname, const char *newname)
-{
-	HeapTuple	tup;
-	Relation	rel;
-	Oid			tmplId;
-	Oid			namespaceOid;
-
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			   errmsg("must be superuser to rename text search templates")));
-
-	rel = heap_open(TSTemplateRelationId, RowExclusiveLock);
-
-	tmplId = TSTemplateGetTmplid(oldname, false);
-
-	tup = SearchSysCacheCopy(TSTEMPLATEOID,
-							 ObjectIdGetDatum(tmplId),
-							 0, 0, 0);
-
-	if (!HeapTupleIsValid(tup)) /* should not happen */
-		elog(ERROR, "cache lookup failed for text search template %u",
-			 tmplId);
-
-	namespaceOid = ((Form_pg_ts_template) GETSTRUCT(tup))->tmplnamespace;
-
-	if (SearchSysCacheExists(TSTEMPLATENAMENSP,
-							 PointerGetDatum(newname),
-							 ObjectIdGetDatum(namespaceOid),
-							 0, 0))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("text search template \"%s\" already exists",
-						newname)));
-
-	namestrcpy(&(((Form_pg_ts_template) GETSTRUCT(tup))->tmplname), newname);
-	simple_heap_update(rel, &tup->t_self, tup);
-	CatalogUpdateIndexes(rel, tup);
-
-	heap_close(rel, NoLock);
-	heap_freetuple(tup);
-}
-
-/*
- * DROP TEXT SEARCH TEMPLATE
- */
-void
-RemoveTSTemplates(DropStmt *drop)
-{
-	ObjectAddresses *objects;
-	ListCell		*cell;
-
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to drop text search templates")));
-
-	/*
-	 * First we identify all the objects, then we delete them in a single
-	 * performMultipleDeletions() call.  This is to avoid unwanted
-	 * DROP RESTRICT errors if one of the objects depends on another.
-	 */
-	objects = new_object_addresses();
-
-	foreach(cell, drop->objects)
-	{
-		List		*names = (List *) lfirst(cell);
-		Oid			tmplOid;
-		ObjectAddress object;
-
-		tmplOid = TSTemplateGetTmplid(names, true);
-
-		if (!OidIsValid(tmplOid))
-		{
-			if (!drop->missing_ok)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("text search template \"%s\" does not exist",
-								NameListToString(names))));
-			}
-			else
-			{
-				if (Gp_role != GP_ROLE_EXECUTE)
-					ereport(NOTICE,
-							(errmsg("text search template \"%s\" does not exist, skipping",
-									NameListToString(names))));
-			}
-			continue;
-		}
-
-		object.classId = TSTemplateRelationId;
-		object.objectId = tmplOid;
-		object.objectSubId = 0;
-
-		add_exact_object_address(&object, objects);
-	}
-
-	performMultipleDeletions(objects, drop->behavior);
-
-	free_object_addresses(objects);
+	return tmplOid;
 }
 
 /*
@@ -1255,9 +877,7 @@ RemoveTSTemplateById(Oid tmplId)
 
 	relation = heap_open(TSTemplateRelationId, RowExclusiveLock);
 
-	tup = SearchSysCache(TSTEMPLATEOID,
-						 ObjectIdGetDatum(tmplId),
-						 0, 0, 0);
+	tup = SearchSysCache1(TSTEMPLATEOID, ObjectIdGetDatum(tmplId));
 
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for text search template %u",
@@ -1282,13 +902,11 @@ GetTSConfigTuple(List *names)
 	HeapTuple	tup;
 	Oid			cfgId;
 
-	cfgId = TSConfigGetCfgid(names, true);
+	cfgId = get_ts_config_oid(names, true);
 	if (!OidIsValid(cfgId))
 		return NULL;
 
-	tup = SearchSysCache(TSCONFIGOID,
-						 ObjectIdGetDatum(cfgId),
-						 0, 0, 0);
+	tup = SearchSysCache1(TSCONFIGOID, ObjectIdGetDatum(cfgId));
 
 	if (!HeapTupleIsValid(tup)) /* should not happen */
 		elog(ERROR, "cache lookup failed for text search configuration %u",
@@ -1320,7 +938,7 @@ makeConfigurationDependencies(HeapTuple tuple, bool removeOld,
 	if (removeOld)
 	{
 		deleteDependencyRecordsFor(myself.classId, myself.objectId, true);
-		deleteSharedDependencyRecordsFor(myself.classId, myself.objectId);
+		deleteSharedDependencyRecordsFor(myself.classId, myself.objectId, 0);
 	}
 
 	/*
@@ -1338,6 +956,9 @@ makeConfigurationDependencies(HeapTuple tuple, bool removeOld,
 
 	/* dependency on owner */
 	recordDependencyOnOwner(myself.classId, myself.objectId, cfg->cfgowner);
+
+	/* dependency on extension */
+	recordDependencyOnCurrentExtension(&myself, removeOld);
 
 	/* dependency on parser */
 	referenced.classId = TSParserRelationId;
@@ -1361,7 +982,7 @@ makeConfigurationDependencies(HeapTuple tuple, bool removeOld,
 					ObjectIdGetDatum(myself.objectId));
 
 		scan = systable_beginscan(mapRel, TSConfigMapIndexId, true,
-								  SnapshotNow, 1, &skey);
+								  NULL, 1, &skey);
 
 		while (HeapTupleIsValid((maptup = systable_getnext(scan))))
 		{
@@ -1385,7 +1006,7 @@ makeConfigurationDependencies(HeapTuple tuple, bool removeOld,
 /*
  * CREATE TEXT SEARCH CONFIGURATION
  */
-void
+Oid
 DefineTSConfiguration(List *names, List *parameters)
 {
 	Relation	cfgRel;
@@ -1419,9 +1040,9 @@ DefineTSConfiguration(List *names, List *parameters)
 		DefElem    *defel = (DefElem *) lfirst(pl);
 
 		if (pg_strcasecmp(defel->defname, "parser") == 0)
-			prsOid = TSParserGetPrsid(defGetQualifiedName(defel), false);
+			prsOid = get_ts_parser_oid(defGetQualifiedName(defel), false);
 		else if (pg_strcasecmp(defel->defname, "copy") == 0)
-			sourceOid = TSConfigGetCfgid(defGetQualifiedName(defel), false);
+			sourceOid = get_ts_config_oid(defGetQualifiedName(defel), false);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -1441,9 +1062,7 @@ DefineTSConfiguration(List *names, List *parameters)
 	{
 		Form_pg_ts_config cfg;
 
-		tup = SearchSysCache(TSCONFIGOID,
-							 ObjectIdGetDatum(sourceOid),
-							 0, 0, 0);
+		tup = SearchSysCache1(TSCONFIGOID, ObjectIdGetDatum(sourceOid));
 		if (!HeapTupleIsValid(tup))
 			elog(ERROR, "cache lookup failed for text search configuration %u",
 				 sourceOid);
@@ -1501,7 +1120,7 @@ DefineTSConfiguration(List *names, List *parameters)
 					ObjectIdGetDatum(sourceOid));
 
 		scan = systable_beginscan(mapRel, TSConfigMapIndexId, true,
-								  SnapshotNow, 1, &skey);
+								  NULL, 1, &skey);
 
 		while (HeapTupleIsValid((maptup = systable_getnext(scan))))
 		{
@@ -1532,6 +1151,9 @@ DefineTSConfiguration(List *names, List *parameters)
 
 	makeConfigurationDependencies(tup, false, mapRel);
 
+	/* Post creation hook for new text search configuration */
+	InvokeObjectPostCreateHook(TSConfigRelationId, cfgOid, 0);
+
 	heap_freetuple(tup);
 
 	if (mapRel)
@@ -1553,126 +1175,8 @@ DefineTSConfiguration(List *names, List *parameters)
 									GetAssignedOidsForDispatch(),
 									NULL);
 	}
-}
 
-/*
- * ALTER TEXT SEARCH CONFIGURATION RENAME
- */
-void
-RenameTSConfiguration(List *oldname, const char *newname)
-{
-	HeapTuple	tup;
-	Relation	rel;
-	Oid			cfgId;
-	AclResult	aclresult;
-	Oid			namespaceOid;
-
-	rel = heap_open(TSConfigRelationId, RowExclusiveLock);
-
-	cfgId = TSConfigGetCfgid(oldname, false);
-
-	tup = SearchSysCacheCopy(TSCONFIGOID,
-							 ObjectIdGetDatum(cfgId),
-							 0, 0, 0);
-
-	if (!HeapTupleIsValid(tup)) /* should not happen */
-		elog(ERROR, "cache lookup failed for text search configuration %u",
-			 cfgId);
-
-	namespaceOid = ((Form_pg_ts_config) GETSTRUCT(tup))->cfgnamespace;
-
-	if (SearchSysCacheExists(TSCONFIGNAMENSP,
-							 PointerGetDatum(newname),
-							 ObjectIdGetDatum(namespaceOid),
-							 0, 0))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("text search configuration \"%s\" already exists",
-						newname)));
-
-	/* must be owner */
-	if (!pg_ts_config_ownercheck(cfgId, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TSCONFIGURATION,
-					   NameListToString(oldname));
-
-	/* must have CREATE privilege on namespace */
-	aclresult = pg_namespace_aclcheck(namespaceOid, GetUserId(), ACL_CREATE);
-	aclcheck_error(aclresult, ACL_KIND_NAMESPACE,
-				   get_namespace_name(namespaceOid));
-
-	namestrcpy(&(((Form_pg_ts_config) GETSTRUCT(tup))->cfgname), newname);
-	simple_heap_update(rel, &tup->t_self, tup);
-	CatalogUpdateIndexes(rel, tup);
-
-	heap_close(rel, NoLock);
-	heap_freetuple(tup);
-}
-
-/*
- * DROP TEXT SEARCH CONFIGURATION
- */
-void
-RemoveTSConfigurations(DropStmt *drop)
-{
-	ObjectAddresses *objects;
-	ListCell		*cell;
-
-	/*
-	 * First we identify all the objects, then we delete them in a single
-	 * performMultipleDeletions() call.  This is to avoid unwanted
-	 * DROP RESTRICT errors if one of the objects depends on another.
-	 */
-	objects = new_object_addresses();
-
-	foreach(cell, drop->objects)
-	{
-		List		*names = (List *) lfirst(cell);
-		Oid			cfgOid;
-		Oid			namespaceId;
-		ObjectAddress object;
-		HeapTuple	tup;
-
-		tup = GetTSConfigTuple(names);
-
-		if (!HeapTupleIsValid(tup))
-		{
-			if (!drop->missing_ok)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("text search configuration \"%s\" does not exist",
-								NameListToString(names))));
-			}
-			else
-			{
-				if (Gp_role != GP_ROLE_EXECUTE)
-					ereport(NOTICE,
-							(errmsg("text search configuration \"%s\" does not exist, skipping",
-									NameListToString(names))));
-			}
-			continue;
-		}
-
-		/* Permission check: must own configuration or its namespace */
-		cfgOid = HeapTupleGetOid(tup);
-		namespaceId = ((Form_pg_ts_config) GETSTRUCT(tup))->cfgnamespace;
-		if (!pg_ts_config_ownercheck(cfgOid, GetUserId()) &&
-			!pg_namespace_ownercheck(namespaceId, GetUserId()))
-			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TSCONFIGURATION,
-						   NameListToString(names));
-
-		object.classId = TSConfigRelationId;
-		object.objectId = cfgOid;
-		object.objectSubId = 0;
-
-		add_exact_object_address(&object, objects);
-
-		ReleaseSysCache(tup);
-	}
-
-	performMultipleDeletions(objects, drop->behavior);
-
-	free_object_addresses(objects);
+	return cfgOid;
 }
 
 /*
@@ -1690,9 +1194,7 @@ RemoveTSConfigurationById(Oid cfgId)
 	/* Remove the pg_ts_config entry */
 	relCfg = heap_open(TSConfigRelationId, RowExclusiveLock);
 
-	tup = SearchSysCache(TSCONFIGOID,
-						 ObjectIdGetDatum(cfgId),
-						 0, 0, 0);
+	tup = SearchSysCache1(TSCONFIGOID, ObjectIdGetDatum(cfgId));
 
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for text search dictionary %u",
@@ -1713,7 +1215,7 @@ RemoveTSConfigurationById(Oid cfgId)
 				ObjectIdGetDatum(cfgId));
 
 	scan = systable_beginscan(relMap, TSConfigMapIndexId, true,
-							  SnapshotNow, 1, &skey);
+							  NULL, 1, &skey);
 
 	while (HeapTupleIsValid((tup = systable_getnext(scan))))
 	{
@@ -1726,74 +1228,13 @@ RemoveTSConfigurationById(Oid cfgId)
 }
 
 /*
- * ALTER TEXT SEARCH CONFIGURATION OWNER
- */
-void
-AlterTSConfigurationOwner(List *name, Oid newOwnerId)
-{
-	HeapTuple	tup;
-	Relation	rel;
-	Oid			cfgId;
-	AclResult	aclresult;
-	Oid			namespaceOid;
-	Form_pg_ts_config form;
-
-	rel = heap_open(TSConfigRelationId, RowExclusiveLock);
-
-	cfgId = TSConfigGetCfgid(name, false);
-
-	tup = SearchSysCacheCopy(TSCONFIGOID,
-							 ObjectIdGetDatum(cfgId),
-							 0, 0, 0);
-
-	if (!HeapTupleIsValid(tup)) /* should not happen */
-		elog(ERROR, "cache lookup failed for text search configuration %u",
-			 cfgId);
-
-	form = (Form_pg_ts_config) GETSTRUCT(tup);
-	namespaceOid = form->cfgnamespace;
-
-	if (form->cfgowner != newOwnerId)
-	{
-		/* Superusers can always do it */
-		if (!superuser())
-		{
-			/* must be owner */
-			if (!pg_ts_config_ownercheck(cfgId, GetUserId()))
-				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TSCONFIGURATION,
-							   NameListToString(name));
-
-			/* Must be able to become new owner */
-			check_is_member_of_role(GetUserId(), newOwnerId);
-
-			/* New owner must have CREATE privilege on namespace */
-			aclresult = pg_namespace_aclcheck(namespaceOid, newOwnerId, ACL_CREATE);
-			if (aclresult != ACLCHECK_OK)
-				aclcheck_error(aclresult, ACL_KIND_NAMESPACE,
-							   get_namespace_name(namespaceOid));
-		}
-
-		form->cfgowner = newOwnerId;
-
-		simple_heap_update(rel, &tup->t_self, tup);
-		CatalogUpdateIndexes(rel, tup);
-
-		/* Update owner dependency reference */
-		changeDependencyOnOwner(TSConfigRelationId, HeapTupleGetOid(tup),
-								newOwnerId);
-	}
-
-	heap_close(rel, NoLock);
-	heap_freetuple(tup);
-}
-
-/*
  * ALTER TEXT SEARCH CONFIGURATION - main entry point
  */
-void
+Oid
 AlterTSConfiguration(AlterTSConfigurationStmt *stmt)
 {
 	HeapTuple	tup;
+	Oid			cfgId;
 	Relation	relMap;
 
 	/* Find the configuration */
@@ -1803,6 +1244,8 @@ AlterTSConfiguration(AlterTSConfigurationStmt *stmt)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("text search configuration \"%s\" does not exist",
 						NameListToString(stmt->cfgname))));
+
+	cfgId = HeapTupleGetOid(tup);
 
 	/* must be owner */
 	if (!pg_ts_config_ownercheck(HeapTupleGetOid(tup), GetUserId()))
@@ -1820,6 +1263,9 @@ AlterTSConfiguration(AlterTSConfigurationStmt *stmt)
 	/* Update dependencies */
 	makeConfigurationDependencies(tup, true, relMap);
 
+	InvokeObjectPostAlterHook(TSConfigRelationId,
+							  HeapTupleGetOid(tup), 0);
+
 	heap_close(relMap, RowExclusiveLock);
 
 	ReleaseSysCache(tup);
@@ -1831,6 +1277,8 @@ AlterTSConfiguration(AlterTSConfigurationStmt *stmt)
 									DF_WITH_SNAPSHOT,
 									NIL,
 									NULL);
+
+	return cfgId;
 }
 
 /*
@@ -1855,7 +1303,7 @@ getTokenTypes(Oid prsId, List *tokennames)
 		elog(ERROR, "method lextype isn't defined for text search parser %u",
 			 prsId);
 
-	/* OidFunctionCall0 is absent */
+	/* lextype takes one dummy argument */
 	list = (LexDescr *) DatumGetPointer(OidFunctionCall1(prs->lextypeOid,
 														 (Datum) 0));
 
@@ -1931,7 +1379,7 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 						Int32GetDatum(tokens[i]));
 
 			scan = systable_beginscan(relMap, TSConfigMapIndexId, true,
-									  SnapshotNow, 2, skey);
+									  NULL, 2, skey);
 
 			while (HeapTupleIsValid((maptup = systable_getnext(scan))))
 			{
@@ -1952,7 +1400,7 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 	{
 		List	   *names = (List *) lfirst(c);
 
-		dictIds[i] = TSDictionaryGetDictid(names, false);
+		dictIds[i] = get_ts_dict_oid(names, false);
 		i++;
 	}
 
@@ -1970,7 +1418,7 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 					ObjectIdGetDatum(cfgId));
 
 		scan = systable_beginscan(relMap, TSConfigMapIndexId, true,
-								  SnapshotNow, 1, skey);
+								  NULL, 1, skey);
 
 		while (HeapTupleIsValid((maptup = systable_getnext(scan))))
 		{
@@ -2013,8 +1461,8 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 				repl_repl[Anum_pg_ts_config_map_mapdict - 1] = true;
 
 				newtup = heap_modify_tuple(maptup,
-										  RelationGetDescr(relMap),
-										  repl_val, repl_null, repl_repl);
+										   RelationGetDescr(relMap),
+										   repl_val, repl_null, repl_repl);
 				simple_heap_update(relMap, &newtup->t_self, newtup);
 
 				CatalogUpdateIndexes(relMap, newtup);
@@ -2064,14 +1512,12 @@ DropConfigurationMapping(AlterTSConfigurationStmt *stmt,
 	HeapTuple	maptup;
 	int			i;
 	Oid			prsId;
-	int		   *tokens,
-				ntoken;
+	int		   *tokens;
 	ListCell   *c;
 
 	prsId = ((Form_pg_ts_config) GETSTRUCT(tup))->cfgparser;
 
 	tokens = getTokenTypes(prsId, stmt->tokentype);
-	ntoken = list_length(stmt->tokentype);
 
 	i = 0;
 	foreach(c, stmt->tokentype)
@@ -2089,7 +1535,7 @@ DropConfigurationMapping(AlterTSConfigurationStmt *stmt,
 					Int32GetDatum(tokens[i]));
 
 		scan = systable_beginscan(relMap, TSConfigMapIndexId, true,
-								  SnapshotNow, 2, skey);
+								  NULL, 2, skey);
 
 		while (HeapTupleIsValid((maptup = systable_getnext(scan))))
 		{
@@ -2162,7 +1608,7 @@ serialize_deflist(List *deflist)
 		}
 		appendStringInfoChar(&buf, '\'');
 		if (lnext(l) != NULL)
-			appendStringInfo(&buf, ", ");
+			appendStringInfoString(&buf, ", ");
 	}
 
 	result = cstring_to_text_with_len(buf.data, buf.len);

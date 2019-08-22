@@ -3,11 +3,11 @@
  * tsrank.c
  *		rank tsvector by tsquery
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/tsrank.c,v 1.13 2008/05/16 16:31:01 tgl Exp $
+ *	  src/backend/utils/adt/tsrank.c
  *
  *-------------------------------------------------------------------------
  */
@@ -15,13 +15,12 @@
 
 #include <math.h>
 
-#include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
 #include "utils/array.h"
 #include "miscadmin.h"
 
 
-static float weights[] = {0.1f, 0.2f, 0.4f, 1.0f};
+static const float weights[] = {0.1f, 0.2f, 0.4f, 1.0f};
 
 #define wpos(wep)	( w[ WEP_GETWEIGHT(wep) ] )
 
@@ -34,14 +33,14 @@ static float weights[] = {0.1f, 0.2f, 0.4f, 1.0f};
 #define RANK_NORM_RDIVRPLUS1	0x20
 #define DEF_NORM_METHOD			RANK_NO_NORM
 
-static float calc_rank_or(float *w, TSVector t, TSQuery q);
-static float calc_rank_and(float *w, TSVector t, TSQuery q);
+static float calc_rank_or(const float *w, TSVector t, TSQuery q);
+static float calc_rank_and(const float *w, TSVector t, TSQuery q);
 
 /*
  * Returns a weight of a word collocation
  */
 static float4
-word_distance(int4 w)
+word_distance(int32 w)
 {
 	if (w > 100)
 		return 1e-30f;
@@ -72,9 +71,9 @@ cnt_length(TSVector t)
 }
 
 
-#define	WordECompareQueryItem(e,q,p,i,m) \
+#define WordECompareQueryItem(e,q,p,i,m) \
 	tsCompareString((q) + (i)->distance, (i)->length,	\
-					(e) + (p)->pos,	(p)->len, (m))
+					(e) + (p)->pos, (p)->len, (m))
 
 
 /*
@@ -90,7 +89,7 @@ find_wordentry(TSVector t, TSQuery q, QueryOperand *item, int32 *nitem)
 	WordEntry  *StopMiddle = StopHigh;
 	int			difference;
 
-	*nitem=0;
+	*nitem = 0;
 
 	/* Loop invariant: StopLow <= item < StopHigh */
 	while (StopLow < StopHigh)
@@ -100,7 +99,7 @@ find_wordentry(TSVector t, TSQuery q, QueryOperand *item, int32 *nitem)
 		if (difference == 0)
 		{
 			StopHigh = StopMiddle;
-			*nitem=1;
+			*nitem = 1;
 			break;
 		}
 		else if (difference > 0)
@@ -109,22 +108,22 @@ find_wordentry(TSVector t, TSQuery q, QueryOperand *item, int32 *nitem)
 			StopHigh = StopMiddle;
 	}
 
-	if ( item->prefix == true )
+	if (item->prefix)
 	{
-		if ( StopLow >= StopHigh )
+		if (StopLow >= StopHigh)
 			StopMiddle = StopHigh;
 
-		*nitem=0;
+		*nitem = 0;
 
-		while( StopMiddle < (WordEntry *) STRPTR(t) && 
-				WordECompareQueryItem(STRPTR(t), GETOPERAND(q), StopMiddle, item, true) == 0 )
+		while (StopMiddle < (WordEntry *) STRPTR(t) &&
+			   WordECompareQueryItem(STRPTR(t), GETOPERAND(q), StopMiddle, item, true) == 0)
 		{
 			(*nitem)++;
 			StopMiddle++;
 		}
 	}
 
-	return ( *nitem > 0 ) ? StopHigh : NULL;
+	return (*nitem > 0) ? StopHigh : NULL;
 }
 
 
@@ -135,8 +134,8 @@ static int
 compareQueryOperand(const void *a, const void *b, void *arg)
 {
 	char	   *operand = (char *) arg;
-	QueryOperand *qa = (*(QueryOperand **) a);
-	QueryOperand *qb = (*(QueryOperand **) b);
+	QueryOperand *qa = (*(QueryOperand *const *) a);
+	QueryOperand *qb = (*(QueryOperand *const *) b);
 
 	return tsCompareString(operand + qa->distance, qa->length,
 						   operand + qb->distance, qb->length,
@@ -176,7 +175,7 @@ SortAndUniqItems(TSQuery q, int *size)
 	if (*size < 2)
 		return res;
 
-	qsort_arg(res, *size, sizeof(QueryOperand **), compareQueryOperand, (void *) operand);
+	qsort_arg(res, *size, sizeof(QueryOperand *), compareQueryOperand, (void *) operand);
 
 	ptr = res + 1;
 	prevptr = res;
@@ -203,7 +202,7 @@ static WordEntryPosVector POSNULL = {
 };
 
 static float
-calc_rank_and(float *w, TSVector t, TSQuery q)
+calc_rank_and(const float *w, TSVector t, TSQuery q)
 {
 	WordEntryPosVector **pos;
 	int			i,
@@ -214,7 +213,7 @@ calc_rank_and(float *w, TSVector t, TSQuery q)
 			   *firstentry;
 	WordEntryPos *post,
 			   *ct;
-	int4		dimt,
+	int32		dimt,
 				lenct,
 				dist,
 				nitem;
@@ -237,7 +236,7 @@ calc_rank_and(float *w, TSVector t, TSQuery q)
 		if (!entry)
 			continue;
 
-		while( entry - firstentry < nitem )
+		while (entry - firstentry < nitem)
 		{
 			if (entry->haspos)
 				pos[i] = _POSVECPTR(t, entry);
@@ -260,7 +259,7 @@ calc_rank_and(float *w, TSVector t, TSQuery q)
 						if (dist || (dist == 0 && (pos[i] == &POSNULL || pos[k] == &POSNULL)))
 						{
 							float		curw;
-	
+
 							if (!dist)
 								dist = MAXENTRYPOS;
 							curw = sqrt(wpos(post[l]) * wpos(ct[p]) * word_distance(dist));
@@ -279,12 +278,12 @@ calc_rank_and(float *w, TSVector t, TSQuery q)
 }
 
 static float
-calc_rank_or(float *w, TSVector t, TSQuery q)
+calc_rank_or(const float *w, TSVector t, TSQuery q)
 {
 	WordEntry  *entry,
 			   *firstentry;
 	WordEntryPos *post;
-	int4		dimt,
+	int32		dimt,
 				j,
 				i,
 				nitem;
@@ -298,13 +297,13 @@ calc_rank_or(float *w, TSVector t, TSQuery q)
 	{
 		float		resj,
 					wjm;
-		int4		jm;
+		int32		jm;
 
 		firstentry = entry = find_wordentry(t, q, item[i], &nitem);
 		if (!entry)
 			continue;
 
-		while( entry - firstentry < nitem )
+		while (entry - firstentry < nitem)
 		{
 			if (entry->haspos)
 			{
@@ -348,7 +347,7 @@ calc_rank_or(float *w, TSVector t, TSQuery q)
 }
 
 static float
-calc_rank(float *w, TSVector t, TSQuery q, int4 method)
+calc_rank(const float *w, TSVector t, TSQuery q, int32 method)
 {
 	QueryItem  *item = GETQUERY(q);
 	float		res = 0.0;
@@ -358,7 +357,7 @@ calc_rank(float *w, TSVector t, TSQuery q, int4 method)
 		return 0.0;
 
 	/* XXX: What about NOT? */
-	res = (item->type == QI_OPR && item->operator.oper == OP_AND) ?
+	res = (item->type == QI_OPR && item->qoperator.oper == OP_AND) ?
 		calc_rank_and(w, t, q) : calc_rank_or(w, t, q);
 
 	if (res < 0)
@@ -388,14 +387,14 @@ calc_rank(float *w, TSVector t, TSQuery q, int4 method)
 	return res;
 }
 
-static float *
+static const float *
 getWeights(ArrayType *win)
 {
 	static float ws[lengthof(weights)];
 	int			i;
 	float4	   *arrdata;
 
-	if (win == 0)
+	if (win == NULL)
 		return weights;
 
 	if (ARR_NDIM(win) != 1)
@@ -408,7 +407,7 @@ getWeights(ArrayType *win)
 				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 				 errmsg("array of weight is too short")));
 
-	if (ARR_HASNULL(win))
+	if (array_contains_nulls(win))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("array of weight must not contain nulls")));
@@ -499,8 +498,8 @@ typedef struct
 static int
 compareDocR(const void *va, const void *vb)
 {
-	DocRepresentation *a = (DocRepresentation *) va;
-	DocRepresentation *b = (DocRepresentation *) vb;
+	const DocRepresentation *a = (const DocRepresentation *) va;
+	const DocRepresentation *b = (const DocRepresentation *) vb;
 
 	if (a->pos == b->pos)
 		return 0;
@@ -531,11 +530,11 @@ typedef struct
 	int			q;
 	DocRepresentation *begin;
 	DocRepresentation *end;
-} Extention;
+} CoverExt;
 
 
 static bool
-Cover(DocRepresentation *doc, int len, QueryRepresentation *qr, Extention *ext)
+Cover(DocRepresentation *doc, int len, QueryRepresentation *qr, CoverExt *ext)
 {
 	DocRepresentation *ptr;
 	int			lastpos = ext->pos;
@@ -604,7 +603,7 @@ Cover(DocRepresentation *doc, int len, QueryRepresentation *qr, Extention *ext)
 	if (ext->p <= ext->q)
 	{
 		/*
-		 * set position for next try to next lexeme after begining of founded
+		 * set position for next try to next lexeme after beginning of found
 		 * cover
 		 */
 		ext->pos = (ptr - doc) + 1;
@@ -622,7 +621,7 @@ get_docrep(TSVector txt, QueryRepresentation *qr, int *doclen)
 	WordEntry  *entry,
 			   *firstentry;
 	WordEntryPos *post;
-	int4		dimt,
+	int32		dimt,
 				j,
 				i,
 				nitem;
@@ -641,7 +640,7 @@ get_docrep(TSVector txt, QueryRepresentation *qr, int *doclen)
 		if (item[i].type != QI_VAL)
 			continue;
 
-		curoperand = &item[i].operand;
+		curoperand = &item[i].qoperand;
 
 		if (QR_GET_OPERAND_EXISTS(qr, &item[i]))
 			continue;
@@ -650,7 +649,7 @@ get_docrep(TSVector txt, QueryRepresentation *qr, int *doclen)
 		if (!entry)
 			continue;
 
-		while( entry - firstentry < nitem )
+		while (entry - firstentry < nitem)
 		{
 			if (entry->haspos)
 			{
@@ -659,8 +658,9 @@ get_docrep(TSVector txt, QueryRepresentation *qr, int *doclen)
 			}
 			else
 			{
-				dimt = POSNULL.npos;
-				post = POSNULL.pos;
+				/* ignore words without positions */
+				entry++;
+				continue;
 			}
 
 			while (cur + dimt >= len)
@@ -674,22 +674,22 @@ get_docrep(TSVector txt, QueryRepresentation *qr, int *doclen)
 				if (j == 0)
 				{
 					int			k;
-	
+
 					doc[cur].nitem = 0;
 					doc[cur].item = (QueryItem **) palloc(sizeof(QueryItem *) * qr->query->size);
-	
+
 					for (k = 0; k < qr->query->size; k++)
 					{
-						QueryOperand *kptr = &item[k].operand;
-						QueryOperand *iptr = &item[i].operand;
-	
+						QueryOperand *kptr = &item[k].qoperand;
+						QueryOperand *iptr = &item[i].qoperand;
+
 						if (k == i ||
 							(item[k].type == QI_VAL &&
 							 compareQueryOperand(&kptr, &iptr, operand) == 0))
 						{
 							/*
-							 * if k == i, we've already checked above that it's
-							 * type == Q_VAL
+							 * if k == i, we've already checked above that
+							 * it's type == Q_VAL
 							 */
 							doc[cur].item[doc[cur].nitem] = item + k;
 							doc[cur].nitem++;
@@ -724,13 +724,13 @@ get_docrep(TSVector txt, QueryRepresentation *qr, int *doclen)
 }
 
 static float4
-calc_rank_cd(float4 *arrdata, TSVector txt, TSQuery query, int method)
+calc_rank_cd(const float4 *arrdata, TSVector txt, TSQuery query, int method)
 {
 	DocRepresentation *doc;
 	int			len,
 				i,
 				doclen = 0;
-	Extention	ext;
+	CoverExt	ext;
 	double		Wdoc = 0.0;
 	double		invws[lengthof(weights)];
 	double		SumDist = 0.0,
@@ -760,7 +760,7 @@ calc_rank_cd(float4 *arrdata, TSVector txt, TSQuery query, int method)
 		return 0.0;
 	}
 
-	MemSet(&ext, 0, sizeof(Extention));
+	MemSet(&ext, 0, sizeof(CoverExt));
 	while (Cover(doc, doclen, &qr, &ext))
 	{
 		double		Cpos = 0.0;
@@ -778,7 +778,7 @@ calc_rank_cd(float4 *arrdata, TSVector txt, TSQuery query, int method)
 
 		/*
 		 * if doc are big enough then ext.q may be equal to ext.p due to limit
-		 * of posional information. In this case we approximate number of
+		 * of positional information. In this case we approximate number of
 		 * noise word as half cover's length
 		 */
 		nNoise = (ext.q - ext.p) - (ext.end - ext.begin);
@@ -787,7 +787,7 @@ calc_rank_cd(float4 *arrdata, TSVector txt, TSQuery query, int method)
 		Wdoc += Cpos / ((double) (1 + nNoise));
 
 		CurExtPos = ((double) (ext.q + ext.p)) / 2.0;
-		if (NExtent > 0 && CurExtPos > PrevExtPos		/* prevent devision by
+		if (NExtent > 0 && CurExtPos > PrevExtPos		/* prevent division by
 														 * zero in a case of
 				multiple lexize */ )
 			SumDist += 1.0 / (CurExtPos - PrevExtPos);

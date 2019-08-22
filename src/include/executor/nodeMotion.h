@@ -17,13 +17,12 @@
 
 #include "nodes/execnodes.h"
 
-extern int	ExecCountSlotsMotion(Motion *node);
 extern MotionState *ExecInitMotion(Motion *node, EState *estate, int eflags);
 extern TupleTableSlot *ExecMotion(MotionState *node);
 extern void ExecEndMotion(MotionState *node);
-extern void ExecReScanMotion(MotionState *node, ExprContext *exprCtxt);
+extern void ExecReScanMotion(MotionState *node);
 
-extern void ExecStopMotion(MotionState *node);
+extern void ExecSquelchMotion(MotionState *node);
 
 extern bool isMotionGather(const Motion *m);
 

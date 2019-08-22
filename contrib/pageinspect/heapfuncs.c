@@ -7,34 +7,28 @@
  * might cause crashes, but at the same time we try to print out as much
  * information as possible, even if it's nonsense. That's because if a
  * page is corrupt, we don't know why and how exactly it is corrupt, so we
- * let the user to judge it.
+ * let the user judge it.
  *
  * These functions are restricted to superusers for the fear of introducing
- * security holes if the input checking isn't as water-tight as it should.
+ * security holes if the input checking isn't as water-tight as it should be.
  * You'd need to be superuser to obtain a raw page image anyway, so
  * there's hardly any use case for using these without superuser-rights
  * anyway.
  *
- * Copyright (c) 2007-2008, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2014, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/contrib/pageinspect/heapfuncs.c,v 1.5 2008/03/25 22:42:41 tgl Exp $
+ *	  contrib/pageinspect/heapfuncs.c
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
-#include "fmgr.h"
+#include "access/htup_details.h"
 #include "funcapi.h"
-#include "access/heapam.h"
-#include "access/transam.h"
-#include "catalog/namespace.h"
-#include "catalog/pg_type.h"
 #include "utils/builtins.h"
 #include "miscadmin.h"
-
-Datum		heap_page_items(PG_FUNCTION_ARGS);
 
 
 /*
@@ -72,7 +66,7 @@ typedef struct heap_page_items_state
 	TupleDesc	tupd;
 	Page		page;
 	uint16		offset;
-}	heap_page_items_state;
+} heap_page_items_state;
 
 Datum
 heap_page_items(PG_FUNCTION_ARGS)
@@ -166,12 +160,12 @@ heap_page_items(PG_FUNCTION_ARGS)
 
 			tuphdr = (HeapTupleHeader) PageGetItem(page, id);
 
-			values[4] = UInt32GetDatum(HeapTupleHeaderGetXmin(tuphdr));
-			values[5] = UInt32GetDatum(HeapTupleHeaderGetXmax(tuphdr));
+			values[4] = UInt32GetDatum(HeapTupleHeaderGetRawXmin(tuphdr));
+			values[5] = UInt32GetDatum(HeapTupleHeaderGetRawXmax(tuphdr));
 			values[6] = UInt32GetDatum(HeapTupleHeaderGetRawCommandId(tuphdr)); /* shared with xvac */
 			values[7] = PointerGetDatum(&tuphdr->t_ctid);
-			values[8] = UInt16GetDatum(tuphdr->t_infomask2);
-			values[9] = UInt16GetDatum(tuphdr->t_infomask);
+			values[8] = UInt32GetDatum(tuphdr->t_infomask2);
+			values[9] = UInt32GetDatum(tuphdr->t_infomask);
 			values[10] = UInt8GetDatum(tuphdr->t_hoff);
 
 			/*
@@ -189,7 +183,7 @@ heap_page_items(PG_FUNCTION_ARGS)
 						(((char *) tuphdr->t_bits) -((char *) tuphdr));
 
 					values[11] = CStringGetTextDatum(
-						bits_to_text(tuphdr->t_bits, bits_len * 8));
+								 bits_to_text(tuphdr->t_bits, bits_len * 8));
 				}
 				else
 					nulls[11] = true;

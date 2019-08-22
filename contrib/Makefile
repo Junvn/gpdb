@@ -1,71 +1,99 @@
-# $PostgreSQL: pgsql/contrib/Makefile,v 1.85 2008/11/19 02:59:28 tgl Exp $
+# contrib/Makefile
 
 subdir = contrib
 top_builddir = ..
 include $(top_builddir)/src/Makefile.global
 
-WANTED_DIRS = \
+# Greenplum specific changes to the targetlist:
+# tsearch2 and postgres_fdw are currently disabled due to test failures.
+# cube and the related earthdistance are disabled since GPDB define CUBE
+# as a keyword. lo is disabled since large objects aren't supported.
+# adminpack is disabled since the functionality has been imported into
+# GPDB.
+
+SUBDIRS = \
+		auth_delay	\
 		auto_explain	\
+		btree_gin	\
+		btree_gist	\
+		chkpass		\
 		citext		\
 		dblink		\
 		dict_int	\
 		dict_xsyn	\
+		dummy_seclabel	\
+		file_fdw	\
 		fuzzystrmatch	\
 		hstore		\
-		intarray \
-		pageinspect \
-		pg_upgrade \
+		intagg		\
+		intarray	\
+		isn		\
+		ltree		\
+		oid2name	\
+		pageinspect	\
+		passwordcheck	\
+		pg_archivecleanup \
+		pg_buffercache	\
+		pg_freespacemap \
+		pg_prewarm	\
+		pg_standby	\
+		pg_stat_statements \
+		pg_test_fsync	\
+		pg_test_timing	\
+		pg_trgm		\
+		pg_upgrade	\
 		pg_upgrade_support \
-		test_parser \
-		pgcrypto
+		pgbench		\
+		pgcrypto	\
+		pgrowlocks	\
+		pgstattuple	\
+		pg_xlogdump	\
+		seg		\
+		spi		\
+		tablefunc	\
+		tcn		\
+		test_decoding	\
+		test_parser	\
+		test_shm_mq	\
+		unaccent	\
+		vacuumlo	\
+		worker_spi
+
 
 # Greenplum-specific additions (to ease merge pain).
-WANTED_DIRS += \
-		xlogdump \
-		pgbench \
-		changetrackingdump \
+SUBDIRS += \
 		formatter \
 		formatter_fixedwidth \
 		extprotocol \
-		gp_distribution_policy \
-		gp_internal_tools \
-		gp_inject_fault \
-		gp_cancel_query \
 		indexscan \
-    passwordcheck
 
 ifeq ($(with_openssl),yes)
-WANTED_DIRS += sslinfo
+SUBDIRS += sslinfo
+else
+ALWAYS_SUBDIRS += sslinfo
 endif
 
-ifeq ($(with_ossp_uuid),yes)
-WANTED_DIRS += uuid-ossp
+ifneq ($(with_uuid),no)
+SUBDIRS += uuid-ossp
+else
+ALWAYS_SUBDIRS += uuid-ossp
 endif
 
 ifeq ($(with_libxml),yes)
-WANTED_DIRS += xml2
+SUBDIRS += xml2
+else
+ALWAYS_SUBDIRS += xml2
 endif
 
-ifeq ($(enable_orca),yes)
-WANTED_DIRS += orca_debug
-endif
-
-ifeq ($(enable_segwalrep),yes)
-WANTED_DIRS += gp_replica_check
+ifeq ($(with_selinux),yes)
+SUBDIRS += sepgsql
+else
+ALWAYS_SUBDIRS += sepgsql
 endif
 
 # Missing:
 #		start-scripts	\ (does not have a makefile)
 
 
-all install installdirs uninstall distprep clean distclean maintainer-clean:
-	@for dir in $(WANTED_DIRS); do \
-		$(MAKE) -C $$dir $@ || exit; \
-	done
-
-# We'd like check operations to run all the subtests before failing.
-check installcheck:
-	@CHECKERR=0; for dir in $(WANTED_DIRS); do \
-		$(MAKE) -C $$dir $@ || CHECKERR=$$?; \
-	done; \
-	exit $$CHECKERR
+$(recurse)
+$(recurse_always)

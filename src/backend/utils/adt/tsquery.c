@@ -3,11 +3,11 @@
  * tsquery.c
  *	  I/O functions for tsquery
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/tsquery.c,v 1.18 2008/05/16 16:31:01 tgl Exp $
+ *	  src/backend/utils/adt/tsquery.c
  *
  *-------------------------------------------------------------------------
  */
@@ -17,11 +17,9 @@
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "tsearch/ts_locale.h"
-#include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
-#include "utils/pg_crc.h"
 
 
 struct TSQueryParserStateData
@@ -56,7 +54,7 @@ struct TSQueryParserStateData
 #define WAITSINGLEOPERAND 4
 
 /*
- * subroutine to parse the modifiers (weight and prefix flag currently) 
+ * subroutine to parse the modifiers (weight and prefix flag currently)
  * part, like ':1AB' of a query.
  */
 static char *
@@ -218,7 +216,6 @@ gettoken_query(TSQueryParserState state,
 		}
 		state->buf += pg_mblen(state->buf);
 	}
-	return PT_END;
 }
 
 /*
@@ -273,7 +270,7 @@ pushValue_internal(TSQueryParserState state, pg_crc32 valcrc, int distance, int 
  * of the string.
  */
 void
-pushValue(TSQueryParserState state, char *strval, int lenval, int2 weight, bool prefix)
+pushValue(TSQueryParserState state, char *strval, int lenval, int16 weight, bool prefix)
 {
 	pg_crc32	valcrc;
 
@@ -419,15 +416,15 @@ findoprnd_recurse(QueryItem *ptr, uint32 *pos, int nnodes)
 	{
 		Assert(ptr[*pos].type == QI_OPR);
 
-		if (ptr[*pos].operator.oper == OP_NOT)
+		if (ptr[*pos].qoperator.oper == OP_NOT)
 		{
-			ptr[*pos].operator.left = 1;
+			ptr[*pos].qoperator.left = 1;
 			(*pos)++;
 			findoprnd_recurse(ptr, pos, nnodes);
 		}
 		else
 		{
-			QueryOperator *curitem = &ptr[*pos].operator;
+			QueryOperator *curitem = &ptr[*pos].qoperator;
 			int			tmp = *pos;
 
 			Assert(curitem->oper == OP_AND || curitem->oper == OP_OR);
@@ -517,8 +514,13 @@ parse_tsquery(char *buf,
 		return query;
 	}
 
-	/* Pack the QueryItems in the final TSQuery struct to return to caller */
+	if (TSQUERY_TOO_BIG(list_length(state.polstr), state.sumlen))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("tsquery is too large")));
 	commonlen = COMPUTESIZE(list_length(state.polstr), state.sumlen);
+
+	/* Pack the QueryItems in the final TSQuery struct to return to caller */
 	query = (TSQuery) palloc0(commonlen);
 	SET_VARSIZE(query, commonlen);
 	query->size = list_length(state.polstr);
@@ -572,8 +574,6 @@ tsqueryin(PG_FUNCTION_ARGS)
 {
 	char	   *in = PG_GETARG_CSTRING(0);
 
-	pg_verifymbstr(in, strlen(in), false);
-
 	PG_RETURN_TSQUERY(parse_tsquery(in, pushval_asis, PointerGetDatum(NULL), false));
 }
 
@@ -611,7 +611,7 @@ infix(INFIX *in, bool first)
 
 	if (in->curpol->type == QI_VAL)
 	{
-		QueryOperand *curpol = &in->curpol->operand;
+		QueryOperand *curpol = &in->curpol->qoperand;
 		char	   *op = in->op + curpol->distance;
 		int			clen;
 
@@ -642,7 +642,7 @@ infix(INFIX *in, bool first)
 		{
 			*(in->cur) = ':';
 			in->cur++;
-			if ( curpol->prefix )
+			if (curpol->prefix)
 			{
 				*(in->cur) = '*';
 				in->cur++;
@@ -671,7 +671,7 @@ infix(INFIX *in, bool first)
 		*(in->cur) = '\0';
 		in->curpol++;
 	}
-	else if (in->curpol->operator.oper == OP_NOT)
+	else if (in->curpol->qoperator.oper == OP_NOT)
 	{
 		bool		isopr = false;
 
@@ -699,7 +699,7 @@ infix(INFIX *in, bool first)
 	}
 	else
 	{
-		int8		op = in->curpol->operator.oper;
+		int8		op = in->curpol->qoperator.oper;
 		INFIX		nrm;
 
 		in->curpol++;
@@ -808,12 +808,12 @@ tsquerysend(PG_FUNCTION_ARGS)
 		switch (item->type)
 		{
 			case QI_VAL:
-				pq_sendint(&buf, item->operand.weight, sizeof(uint8));
-				pq_sendint(&buf, item->operand.prefix, sizeof(uint8));
-				pq_sendstring(&buf, GETOPERAND(query) + item->operand.distance);
+				pq_sendint(&buf, item->qoperand.weight, sizeof(uint8));
+				pq_sendint(&buf, item->qoperand.prefix, sizeof(uint8));
+				pq_sendstring(&buf, GETOPERAND(query) + item->qoperand.distance);
 				break;
 			case QI_OPR:
-				pq_sendint(&buf, item->operator.oper, sizeof(item->operator.oper));
+				pq_sendint(&buf, item->qoperator.oper, sizeof(item->qoperator.oper));
 				break;
 			default:
 				elog(ERROR, "unrecognized tsquery node type: %d", item->type);
@@ -887,11 +887,11 @@ tsqueryrecv(PG_FUNCTION_ARGS)
 			COMP_LEGACY_CRC32(valcrc, val, val_len);
 			FIN_LEGACY_CRC32(valcrc);
 
-			item->operand.weight = weight;
-			item->operand.prefix = (prefix) ? true : false;
-			item->operand.valcrc = (int32) valcrc;
-			item->operand.length = val_len;
-			item->operand.distance = datalen;
+			item->qoperand.weight = weight;
+			item->qoperand.prefix = (prefix) ? true : false;
+			item->qoperand.valcrc = (int32) valcrc;
+			item->qoperand.length = val_len;
+			item->qoperand.distance = datalen;
 
 			/*
 			 * Operand strings are copied to the final struct after this loop;
@@ -912,7 +912,7 @@ tsqueryrecv(PG_FUNCTION_ARGS)
 			if (i == size - 1)
 				elog(ERROR, "invalid pointer to right operand");
 
-			item->operator.oper = oper;
+			item->qoperator.oper = oper;
 		}
 		else
 			elog(ERROR, "unrecognized tsquery node type: %d", item->type);
@@ -936,8 +936,8 @@ tsqueryrecv(PG_FUNCTION_ARGS)
 	{
 		if (item->type == QI_VAL)
 		{
-			memcpy(ptr, operands[i], item->operand.length + 1);
-			ptr += item->operand.length + 1;
+			memcpy(ptr, operands[i], item->qoperand.length + 1);
+			ptr += item->qoperand.length + 1;
 		}
 		item++;
 	}

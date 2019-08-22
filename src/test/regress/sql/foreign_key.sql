@@ -47,7 +47,7 @@ DROP TABLE PKTABLE;
 -- check set NULL and table constraint on multiple columns
 --
 CREATE TABLE PKTABLE ( ptest1 int, ptest2 int, ptest3 text, PRIMARY KEY(ptest1, ptest2) );
-CREATE TABLE FKTABLE ( ftest1 int, ftest2 int, ftest3 int, CONSTRAINT constrname FOREIGN KEY(ftest1, ftest2) 
+CREATE TABLE FKTABLE ( ftest1 int, ftest2 int, ftest3 int, CONSTRAINT constrname FOREIGN KEY(ftest1, ftest2)
                        REFERENCES PKTABLE MATCH FULL ON DELETE SET NULL ON UPDATE SET NULL);
 
 -- Test comments
@@ -110,7 +110,7 @@ DROP TABLE FKTABLE;
 -- check set default and table constraint on multiple columns
 --
 CREATE TABLE PKTABLE ( ptest1 int, ptest2 int, ptest3 text, PRIMARY KEY(ptest1, ptest2) );
-CREATE TABLE FKTABLE ( ftest1 int DEFAULT -1, ftest2 int DEFAULT -2, ftest3 int, CONSTRAINT constrname2 FOREIGN KEY(ftest1, ftest2) 
+CREATE TABLE FKTABLE ( ftest1 int DEFAULT -1, ftest2 int DEFAULT -2, ftest3 int, CONSTRAINT constrname2 FOREIGN KEY(ftest1, ftest2)
                        REFERENCES PKTABLE MATCH FULL ON DELETE SET DEFAULT ON UPDATE SET DEFAULT);
 
 -- Insert a value in PKTABLE for default
@@ -214,7 +214,7 @@ DROP TABLE FKTABLE;
 DROP TABLE PKTABLE;
 
 
--- MATCH unspecified
+-- MATCH SIMPLE
 
 -- Base test restricting update/delete
 CREATE TABLE PKTABLE ( ptest1 int, ptest2 int, ptest3 int, ptest4 text, PRIMARY KEY(ptest1, ptest2, ptest3) );
@@ -228,7 +228,7 @@ INSERT INTO PKTABLE VALUES (2, 3, 4, 'test3');
 INSERT INTO PKTABLE VALUES (2, 4, 5, 'test4');
 
 -- Insert Foreign Key values
-INSERT INTO FKTABLE VALUES (1, 2, 3, 1); 
+INSERT INTO FKTABLE VALUES (1, 2, 3, 1);
 INSERT INTO FKTABLE VALUES (NULL, 2, 3, 2);
 INSERT INTO FKTABLE VALUES (2, NULL, 3, 3);
 INSERT INTO FKTABLE VALUES (NULL, 2, 7, 4);
@@ -273,7 +273,7 @@ INSERT INTO PKTABLE VALUES (2, 3, 4, 'test3');
 INSERT INTO PKTABLE VALUES (2, 4, 5, 'test4');
 
 -- Insert Foreign Key values
-INSERT INTO FKTABLE VALUES (1, 2, 3, 1); 
+INSERT INTO FKTABLE VALUES (1, 2, 3, 1);
 INSERT INTO FKTABLE VALUES (NULL, 2, 3, 2);
 INSERT INTO FKTABLE VALUES (2, NULL, 3, 3);
 INSERT INTO FKTABLE VALUES (NULL, 2, 7, 4);
@@ -325,8 +325,8 @@ INSERT INTO PKTABLE VALUES (2, 3, 4, 'test3');
 INSERT INTO PKTABLE VALUES (2, 4, 5, 'test4');
 
 -- Insert Foreign Key values
-INSERT INTO FKTABLE VALUES (1, 2, 3, 1); 
-INSERT INTO FKTABLE VALUES (2, 3, 4, 1); 
+INSERT INTO FKTABLE VALUES (1, 2, 3, 1);
+INSERT INTO FKTABLE VALUES (2, 3, 4, 1);
 INSERT INTO FKTABLE VALUES (NULL, 2, 3, 2);
 INSERT INTO FKTABLE VALUES (2, NULL, 3, 3);
 INSERT INTO FKTABLE VALUES (NULL, 2, 7, 4);
@@ -367,7 +367,7 @@ DROP TABLE PKTABLE;
 
 -- set default update / set null delete
 CREATE TABLE PKTABLE ( ptest1 int, ptest2 int, ptest3 int, ptest4 text, PRIMARY KEY(ptest1, ptest2, ptest3) );
-CREATE TABLE FKTABLE ( ftest1 int DEFAULT 0, ftest2 int DEFAULT -1, ftest3 int, ftest4 int,  CONSTRAINT constrname3
+CREATE TABLE FKTABLE ( ftest1 int DEFAULT 0, ftest2 int DEFAULT -1, ftest3 int DEFAULT -2, ftest4 int, CONSTRAINT constrname3
 			FOREIGN KEY(ftest1, ftest2, ftest3) REFERENCES PKTABLE
 			ON DELETE SET NULL ON UPDATE SET DEFAULT);
 
@@ -379,8 +379,8 @@ INSERT INTO PKTABLE VALUES (2, 4, 5, 'test4');
 INSERT INTO PKTABLE VALUES (2, -1, 5, 'test5');
 
 -- Insert Foreign Key values
-INSERT INTO FKTABLE VALUES (1, 2, 3, 1); 
-INSERT INTO FKTABLE VALUES (2, 3, 4, 1); 
+INSERT INTO FKTABLE VALUES (1, 2, 3, 1);
+INSERT INTO FKTABLE VALUES (2, 3, 4, 1);
 INSERT INTO FKTABLE VALUES (2, 4, 5, 1);
 INSERT INTO FKTABLE VALUES (NULL, 2, 3, 2);
 INSERT INTO FKTABLE VALUES (2, NULL, 3, 3);
@@ -397,7 +397,7 @@ SELECT * from FKTABLE;
 UPDATE PKTABLE set ptest2=5 where ptest2=2;
 
 -- Try to update something that will set default
-UPDATE PKTABLE set ptest1=0, ptest2=5, ptest3=10 where ptest2=2;
+UPDATE PKTABLE set ptest1=0, ptest2=-1, ptest3=-2 where ptest2=2;
 UPDATE PKTABLE set ptest2=10 where ptest2=4;
 
 -- Try to update something that should not set default
@@ -415,7 +415,7 @@ SELECT * from PKTABLE;
 SELECT * from FKTABLE;
 
 -- Try to delete something that should not set null
-DELETE FROM PKTABLE where ptest2=5;
+DELETE FROM PKTABLE where ptest2=-1 and ptest3=5;
 
 -- Show PKTABLE and FKTABLE
 SELECT * from PKTABLE;
@@ -442,7 +442,7 @@ DROP TABLE PKTABLE;
 --
 -- Tests for mismatched types
 --
--- Basic one column, two table setup 
+-- Basic one column, two table setup
 CREATE TABLE PKTABLE (ptest1 int PRIMARY KEY);
 INSERT INTO PKTABLE VALUES(42);
 -- This next should fail, because int=inet does not exist
@@ -502,7 +502,7 @@ DROP TABLE PKTABLE;
 CREATE TABLE PKTABLE (ptest1 int, ptest2 inet, ptest3 int, ptest4 inet, PRIMARY KEY(ptest1, ptest2), FOREIGN KEY(ptest3,
 ptest4) REFERENCES pktable(ptest1, ptest2));
 DROP TABLE PKTABLE;
--- And this, 
+-- And this,
 CREATE TABLE PKTABLE (ptest1 int, ptest2 inet, ptest3 int, ptest4 inet, PRIMARY KEY(ptest1, ptest2), FOREIGN KEY(ptest3,
 ptest4) REFERENCES pktable);
 DROP TABLE PKTABLE;
@@ -525,7 +525,7 @@ create table fktable (ftest1 int references pktable(base1));
 -- now some ins, upd, del
 insert into pktable(base1) values (1);
 insert into pktable(base1) values (2);
---  let's insert a non-existant fktable value
+--  let's insert a non-existent fktable value
 insert into fktable(ftest1) values (3);
 --  let's make a valid row for that
 insert into pktable(base1) values (3);
@@ -548,7 +548,7 @@ create table fktable (ftest1 int, ftest2 int, foreign key(ftest1, ftest2) refere
 -- now some ins, upd, del
 insert into pktable(base1, ptest1) values (1, 1);
 insert into pktable(base1, ptest1) values (2, 2);
---  let's insert a non-existant fktable value
+--  let's insert a non-existent fktable value
 insert into fktable(ftest1, ftest2) values (3, 1);
 --  let's make a valid row for that
 insert into pktable(base1,ptest1) values (3, 1);
@@ -880,6 +880,33 @@ ROLLBACK TO savept1;
 -- should catch error from initial INSERT
 COMMIT;
 
+--
+-- check ALTER CONSTRAINT
+--
+
+INSERT INTO fktable VALUES (1, 5);
+
+ALTER TABLE fktable ALTER CONSTRAINT fktable_fk_fkey DEFERRABLE INITIALLY IMMEDIATE;
+
+BEGIN;
+
+-- doesn't match FK, should throw error now
+UPDATE pktable SET id = 10 WHERE id = 5;
+
+COMMIT;
+
+BEGIN;
+
+-- doesn't match PK, should throw error now
+INSERT INTO fktable VALUES (0, 20);
+
+COMMIT;
+
+-- try additional syntax
+ALTER TABLE fktable ALTER CONSTRAINT fktable_fk_fkey NOT DEFERRABLE;
+-- illegal option
+ALTER TABLE fktable ALTER CONSTRAINT fktable_fk_fkey NOT DEFERRABLE INITIALLY DEFERRED;
+
 -- test order of firing of FK triggers when several RI-induced changes need to
 -- be made to the same row.  This was broken by subtransaction-related
 -- changes in 8.0.
@@ -943,3 +970,78 @@ begin;
     update selfref set a = 456 where a = 123;
     select a, b from selfref;
 commit;
+
+--
+-- Test that SET DEFAULT actions recognize updates to default values
+--
+create temp table defp (f1 int primary key);
+create temp table defc (f1 int default 0
+                        references defp on delete set default);
+insert into defp values (0), (1), (2);
+insert into defc values (2);
+select * from defc;
+delete from defp where f1 = 2;
+select * from defc;
+delete from defp where f1 = 0; -- fail
+alter table defc alter column f1 set default 1;
+delete from defp where f1 = 0;
+select * from defc;
+delete from defp where f1 = 1; -- fail
+
+--
+-- Test the difference between NO ACTION and RESTRICT
+--
+create temp table pp (f1 int primary key);
+create temp table cc (f1 int references pp on update no action);
+insert into pp values(12);
+insert into pp values(11);
+update pp set f1=f1+1;
+insert into cc values(13);
+update pp set f1=f1+1;
+update pp set f1=f1+1; -- fail
+drop table pp, cc;
+
+create temp table pp (f1 int primary key);
+create temp table cc (f1 int references pp on update restrict);
+insert into pp values(12);
+insert into pp values(11);
+update pp set f1=f1+1;
+insert into cc values(13);
+update pp set f1=f1+1; -- fail
+drop table pp, cc;
+
+--
+-- Test deferred FK check on a tuple deleted by a rolled-back subtransaction
+--
+create table pktable2(f1 int primary key);
+create table fktable2(f1 int references pktable2 deferrable initially deferred);
+insert into pktable2 values(1);
+
+begin;
+insert into fktable2 values(1);
+savepoint x;
+delete from fktable2;
+rollback to x;
+commit;
+
+begin;
+insert into fktable2 values(2);
+savepoint x;
+delete from fktable2;
+rollback to x;
+commit; -- fail
+
+--
+-- Test that we prevent dropping FK constraint with pending trigger events
+--
+begin;
+insert into fktable2 values(2);
+alter table fktable2 drop constraint fktable2_f1_fkey;
+commit;
+
+begin;
+delete from pktable2 where f1 = 1;
+alter table fktable2 drop constraint fktable2_f1_fkey;
+commit;
+
+drop table pktable2, fktable2;

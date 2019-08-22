@@ -1,4 +1,4 @@
-# $PostgreSQL: pgsql/config/general.m4,v 1.10 2008/10/29 09:27:24 petere Exp $
+# config/general.m4
 
 # This file defines new macros to process configure command line
 # arguments, to replace the brain-dead AC_ARG_WITH and AC_ARG_ENABLE.
@@ -33,7 +33,6 @@ m4_define([pgac_arg_to_variable],
 
 AC_DEFUN([PGAC_ARG],
 [
-pgac_args="$pgac_args pgac_arg_to_variable([$1],[$2])"
 m4_case([$1],
 
 enable, [
@@ -91,7 +90,7 @@ dnl values.  But we only want it to appear once in the help.  We achieve
 dnl that by making the help string look the same, which is why we need to
 dnl save the default that was passed in previously.
 m4_define([_pgac_helpdefault], m4_ifdef([pgac_defined_$1_$2_bool], [m4_defn([pgac_defined_$1_$2_bool])], [$3]))dnl
-PGAC_ARG([$1], [$2], [m4_if(_pgac_helpdefault, yes, -)], [$4], [$5], [$6], 
+PGAC_ARG([$1], [$2], [m4_if(_pgac_helpdefault, yes, -)], [$4], [$5], [$6],
           [AC_MSG_ERROR([no argument expected for --$1-$2 option])],
           [m4_case([$3],
                    yes, [pgac_arg_to_variable([$1], [$2])=yes

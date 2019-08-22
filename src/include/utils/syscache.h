@@ -6,17 +6,19 @@
  * See also lsyscache.h, which provides convenience routines for
  * common cache-lookup operations.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/utils/syscache.h,v 1.73 2008/12/19 16:25:19 petere Exp $
+ * src/include/utils/syscache.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef SYSCACHE_H
 #define SYSCACHE_H
 
-#include "utils/catcache.h"
+#include "access/attnum.h"
+#include "access/htup.h"
+/* we intentionally do not include utils/catcache.h here */
 
 /*
  *		SysCache identifiers.
@@ -44,17 +46,26 @@ enum SysCacheIdentifier
 	CASTSOURCETARGET,
 	CLAAMNAMENSP,
 	CLAOID,
+	COLLNAMEENCNSP,
+	COLLOID,
 	CONDEFAULT,
 	CONNAMENSP,
 	CONSTROID,
 	CONVOID,
 	DATABASEOID,
+	DEFACLROLENSPOBJ,
 	ENUMOID,
 	ENUMTYPOIDNAME,
+	EVENTTRIGGERNAME,
+	EVENTTRIGGEROID,
+	EXTPROTOCOLOID,
+	EXTPROTOCOLNAME,
 	FOREIGNDATAWRAPPERNAME,
 	FOREIGNDATAWRAPPEROID,
 	FOREIGNSERVERNAME,
 	FOREIGNSERVEROID,
+	FOREIGNTABLEREL,
+	GPPOLICYID,
 	INDEXRELID,
 	LANGNAME,
 	LANGOID,
@@ -68,10 +79,14 @@ enum SysCacheIdentifier
 	PARTRULEOID,
 	PROCNAMEARGSNSP,
 	PROCOID,
+	RANGETYPE,
 	RELNAMENSP,
 	RELOID,
+	RESGROUPOID,
+	RESGROUPNAME,
 	RULERELNAME,
-	STATRELATT,
+	STATRELATTINH,
+	TABLESPACEOID,
 	TSCONFIGMAP,
 	TSCONFIGNAMENSP,
 	TSCONFIGOID,
@@ -86,6 +101,8 @@ enum SysCacheIdentifier
 	USERMAPPINGOID,
 	USERMAPPINGUSERSERVER,
 	WINFNOID
+
+#define SysCacheSize (USERMAPPINGUSERSERVER + 1)
 };
 
 extern void InitCatalogCache(void);
@@ -110,9 +127,19 @@ extern bool SearchSysCacheExistsAttName(Oid relid, const char *attname);
 extern Datum SysCacheGetAttr(int cacheId, HeapTuple tup,
 				AttrNumber attributeNumber, bool *isNull);
 
+extern uint32 GetSysCacheHashValue(int cacheId,
+					 Datum key1, Datum key2, Datum key3, Datum key4);
+
 /* list-search interface.  Users of this must import catcache.h too */
+struct catclist;
 extern struct catclist *SearchSysCacheList(int cacheId, int nkeys,
 				   Datum key1, Datum key2, Datum key3, Datum key4);
+
+extern void SysCacheInvalidate(int cacheId, uint32 hashValue);
+
+extern bool RelationInvalidatesSnapshotsOnly(Oid relid);
+extern bool RelationHasSysCache(Oid relid);
+extern bool RelationSupportsSysCache(Oid relid);
 
 /*
  * The use of the macros below rather than direct calls to the corresponding
@@ -154,6 +181,15 @@ extern struct catclist *SearchSysCacheList(int cacheId, int nkeys,
 	GetSysCacheOid(cacheId, key1, key2, key3, 0)
 #define GetSysCacheOid4(cacheId, key1, key2, key3, key4) \
 	GetSysCacheOid(cacheId, key1, key2, key3, key4)
+
+#define GetSysCacheHashValue1(cacheId, key1) \
+	GetSysCacheHashValue(cacheId, key1, 0, 0, 0)
+#define GetSysCacheHashValue2(cacheId, key1, key2) \
+	GetSysCacheHashValue(cacheId, key1, key2, 0, 0)
+#define GetSysCacheHashValue3(cacheId, key1, key2, key3) \
+	GetSysCacheHashValue(cacheId, key1, key2, key3, 0)
+#define GetSysCacheHashValue4(cacheId, key1, key2, key3, key4) \
+	GetSysCacheHashValue(cacheId, key1, key2, key3, key4)
 
 #define SearchSysCacheList1(cacheId, key1) \
 	SearchSysCacheList(cacheId, 1, key1, 0, 0, 0)

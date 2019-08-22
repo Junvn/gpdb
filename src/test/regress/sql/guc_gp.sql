@@ -73,3 +73,34 @@ DROP FUNCTION if exists test_call_set_command();
 -- another way to detect that the GUC's assign-hook is called only once.
 set work_mem='1MB';
 reset work_mem;
+
+--
+-- Test if RESET timezone is dispatched to all slices
+--
+CREATE TABLE timezone_table AS SELECT * FROM (VALUES (123,1513123564),(123,1512140765),(123,1512173164),(123,1512396441)) foo(a, b) DISTRIBUTED RANDOMLY;
+
+SELECT DISTINCT to_timestamp(b)::date FROM timezone_table;
+SET timezone= 'America/New_York';
+SHOW timezone;
+SELECT DISTINCT to_timestamp(b)::date FROM timezone_table;
+RESET timezone;
+SHOW timezone;
+SELECT DISTINCT to_timestamp(b)::date FROM timezone_table;
+
+-- Test default_transaction_isolation and transaction_isolation fallback from serializable to repeatable read
+CREATE TABLE test_serializable(a int);
+insert into test_serializable values(1);
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL serializable;
+show default_transaction_isolation;
+SELECT * FROM test_serializable;
+SET default_transaction_isolation = 'read committed';
+SET default_transaction_isolation = 'serializable';
+show default_transaction_isolation;
+SELECT * FROM test_serializable;
+SET default_transaction_isolation = 'read committed';
+
+BEGIN TRANSACTION ISOLATION LEVEL serializable;
+	show transaction_isolation;
+	SELECT * FROM test_serializable;
+COMMIT;
+DROP TABLE test_serializable;

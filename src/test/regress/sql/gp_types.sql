@@ -56,6 +56,7 @@ SELECT * FROM dml_numeric ORDER BY 1;
 INSERT INTO dml_numeric VALUES (1e-1000);
 SELECT * FROM dml_numeric ORDER BY 1;
 
+-- GPDB_94_MERGE_FIXME: after 94_stable, these are not out of range
 -- out of range values
 INSERT INTO dml_numeric VALUES (1e+10000);
 SELECT * FROM dml_numeric ORDER BY 1;
@@ -99,6 +100,10 @@ INSERT INTO dml_timestamp VALUES ('294277-01-27 AD'::timestamp);
 SELECT * FROM dml_timestamp ORDER BY 1;
 UPDATE dml_timestamp SET a = '294277-01-27 AD'::timestamp;
 SELECT * FROM dml_timestamp ORDER BY 1;
+
+-- Greenplum 4.3 and 5 had support for YYYYMMDDHH24MISS, which was removed in
+-- v6 since it cannot be parsed without ambiguity. This test should fail.
+SELECT '13081205132018'::timestamp;
 
 --
 -- Timestamp with timezone

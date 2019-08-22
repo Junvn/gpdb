@@ -1,4 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+# ======================================================================
+# Configuration Variables
+# ======================================================================
+
+# Set to zero to force cluster to be created without data checksums
+DATACHECKSUMS=1
 
 # ======================================================================
 # Data Directories
@@ -13,12 +20,13 @@ fi
 QDDIR=$DATADIRS/qddir
 SEG_PREFIX=demoDataDir
 
+STANDBYDIR=$DATADIRS/standby
+
 # ======================================================================
 # Database Ports
 # ======================================================================
 
-# Note there are 2 ports per segment (postmaster port + replication_port)
-for (( i=0; i<`expr 4 \* $NUM_PRIMARY_MIRROR_PAIRS`; i++ )); do
+for (( i=0; i<`expr 2 \* $NUM_PRIMARY_MIRROR_PAIRS`; i++ )); do
   PORT_NUM=`expr $DEMO_PORT_BASE + $i`
   DEMO_SEG_PORTS_LIST="$DEMO_SEG_PORTS_LIST $PORT_NUM"
 done
@@ -42,7 +50,23 @@ checkDemoConfig(){
         echo " This port is needed by the Master Database instance. "
         echo ">>> Edit Makefile to correct the port number (MASTER_PORT). <<<" 
         echo -n " Check to see if the port is free by using : "
-        echo " 'netstat -an | grep ${MASTER_DEMO_PORT}"
+        echo " 'netstat -an | grep ${MASTER_DEMO_PORT}'"
+        echo " If the port is not used please make sure files ${PORT_FILE}* are deleted"
+        echo ""
+        return 1
+    fi
+
+    # Check if Standby_DEMO_Port is free
+    echo "  Standby port check ... : ${STANDBY_DEMO_PORT}"
+    PORT_FILE="/tmp/.s.PGSQL.${STANDBY_DEMO_PORT}"
+    if [ -f ${PORT_FILE} -o  -S ${PORT_FILE} ] ; then
+        echo ""
+        echo -n " Port ${STANDBY_DEMO_PORT} appears to be in use. "
+        echo " This port is needed by the Standby Database instance. "
+        echo ">>> Edit Makefile to correct the port number (STANDBY_PORT). <<<"
+        echo -n " Check to see if the port is free by using : "
+        echo " 'netstat -an | grep ${STANDBY_DEMO_PORT}'."
+        echo " If the port is not used please make sure files ${PORT_FILE}* are deleted"
         echo ""
         return 1
     fi
@@ -58,7 +82,8 @@ checkDemoConfig(){
             echo " This port is needed for segment database instance."
             echo ">>> Edit Makefile to correct the base ports (PORT_BASE). <<<"
             echo -n " Check to see if the port is free by using : "
-            echo " 'netstat -an | grep ${PORT_NUM}"
+            echo " 'netstat -an | grep ${PORT_NUM}'"
+            echo " If the port is not used please make sure files ${PORT_FILE}* are deleted"
             echo ""
             return 1
         fi
@@ -68,9 +93,10 @@ checkDemoConfig(){
 
 USAGE(){
     echo ""
-    echo " `basename $0` -c -d -u"
-    echo " -c : check if demo is possible."
+    echo " `basename $0` {-c | -d | -u} <-K>"
+    echo " -c : Check if demo is possible."
     echo " -d : Delete the demo."
+    echo " -K : Create cluster without data checksums."
     echo " -u : Usage, prints this message."
     echo ""
 }
@@ -118,7 +144,7 @@ cleanDemo(){
 # Main Section
 #*****************************************************************************
 
-while getopts ":cd'?'" opt
+while getopts ":cdK'?'" opt
 do
 	case $opt in 
 		'?' ) USAGE ;;
@@ -133,6 +159,9 @@ do
         d) cleanDemo
            exit 0
            ;;
+        K) DATACHECKSUMS=0
+           shift
+           ;;
         *) USAGE
            exit 0
            ;;
@@ -140,7 +169,7 @@ do
 done
 
 if [ -z "${GPHOME}" ]; then
-    echo "FATAL: The GPHOME enviroment variable is not set."
+    echo "FATAL: The GPHOME environment variable is not set."
     echo ""
     echo "  You can set it by sourcing the greenplum_path.sh"
     echo "  file in your Greenplum installation directory."
@@ -166,6 +195,7 @@ cat <<-EOF
 	    MASTER_DATA_DIRECTORY .. : ${QDDIR}/${SEG_PREFIX}-1
 
 	    MASTER PORT (PGPORT) ... : ${MASTER_DEMO_PORT}
+	    STANDBY PORT ........... : ${STANDBY_DEMO_PORT}
 	    SEGMENT PORTS .......... : ${DEMO_SEG_PORTS_LIST}
 
 	  NOTE(s):
@@ -177,7 +207,7 @@ cat <<-EOF
 
 EOF
 
-GPPATH=`find $GPSEARCH -name gp_dump| tail -1`
+GPPATH=`find $GPSEARCH -name gpstart| tail -1`
 RETVAL=$?
 
 if [ "$RETVAL" -ne 0 ]; then
@@ -278,6 +308,13 @@ cat >> $CLUSTER_CONFIG <<-EOF
 	ENCODING=UNICODE
 EOF
 
+if [ "${DATACHECKSUMS}" == "0" ]; then
+    cat >> $CLUSTER_CONFIG <<-EOF
+	# Turn off data checksums
+	HEAP_CHECKSUM=off
+EOF
+fi
+
 if [ "${WITH_MIRRORS}" == "true" ]; then
     cat >> $CLUSTER_CONFIG <<-EOF
 
@@ -290,6 +327,12 @@ if [ "${WITH_MIRRORS}" == "true" ]; then
 		REPLICATION_PORT_BASE=`expr $DEMO_PORT_BASE + 2 \* $NUM_PRIMARY_MIRROR_PAIRS`
 		MIRROR_REPLICATION_PORT_BASE=`expr $DEMO_PORT_BASE + 3 \* $NUM_PRIMARY_MIRROR_PAIRS`
 	EOF
+fi
+
+
+STANDBY_INIT_OPTS=""
+if [ "${WITH_STANDBY}" == "true" ]; then
+	STANDBY_INIT_OPTS="-s ${LOCALHOST} -P ${STANDBY_DEMO_PORT} -S ${STANDBYDIR}"
 fi
 
 if [ ! -z "${EXTRA_CONFIG}" ]; then
@@ -350,6 +393,9 @@ if [ "${BLDWRAP_POSTGRES_CONF_ADDONS}" != "__none__" ]  && \
     for addon in $( echo ${BLDWRAP_POSTGRES_CONF_ADDONS} | sed -e "s/|/ /g" ); do
         echo "" >> ${CLUSTER_CONFIG_POSTGRES_ADDONS}
         echo $addon >> ${CLUSTER_CONFIG_POSTGRES_ADDONS}
+	if [ "$addon" == "fsync=off" ]; then
+		echo "WARNING: fsync is off, database consistency is not guaranteed."
+	fi
         echo "" >> ${CLUSTER_CONFIG_POSTGRES_ADDONS}
     done
 
@@ -365,17 +411,17 @@ fi
 if [ -f "${CLUSTER_CONFIG_POSTGRES_ADDONS}" ]; then
     echo "=========================================================================================="
     echo "executing:"
-    echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} \"$@\""
+    echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} ${STANDBY_INIT_OPTS} \"$@\""
     echo "=========================================================================================="
     echo ""
-    $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} "$@"
+    $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} ${STANDBY_INIT_OPTS} "$@"
 else
     echo "=========================================================================================="
     echo "executing:"
-    echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs \"$@\""
+    echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs ${STANDBY_INIT_OPTS} \"$@\""
     echo "=========================================================================================="
     echo ""
-    $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs "$@"
+    $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs ${STANDBY_INIT_OPTS} "$@"
 fi
 RETURN=$?
 

@@ -7,10 +7,10 @@
  *
  * Portions Copyright (c) 2005-2009, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/executor/execdesc.h,v 1.38 2008/11/19 01:10:23 tgl Exp $
+ * src/include/executor/execdesc.h
  *
  *-------------------------------------------------------------------------
  */
@@ -18,7 +18,6 @@
 #define EXECDESC_H
 
 #include "nodes/execnodes.h"
-#include "nodes/plannodes.h"
 #include "tcop/dest.h"
 #include "gpmon/gpmon.h"
 
@@ -88,12 +87,6 @@ typedef struct Slice
 	int			gangSize;
 
 	/*
-	 * How many of the gang members will actually be used? This takes into
-	 * account directDispatch information.
-	 */
-	int			numGangMembersToBeActive;
-
-	/*
 	 * directDispatch->isDirectDispatch should ONLY be set for a slice
 	 * when it requires an n-gang.
 	 */
@@ -108,7 +101,11 @@ typedef struct Slice
 	 * The number of processes must agree with the the plan slice to be
 	 * implemented.
 	 */
-	List	   *primaryProcesses;
+	List		*primaryProcesses;
+	/* A bitmap to identify which QE should execute this slice */
+	Bitmapset	*processesMap;
+	/* A list of segment ids who will execute this slice */
+	List		*segments;
 } Slice;
 
 /*
@@ -132,7 +129,7 @@ typedef struct SliceTable
 	int			nInitPlans;		/* The number of initplan slices allocated */
 	int			localSlice;		/* Index of the slice to execute. */
 	List	   *slices;			/* List of slices */
-	bool		doInstrument;	/* true => collect stats for EXPLAIN ANALYZE */
+	int			instrument_options;	/* OR of InstrumentOption flags */
 	uint32		ic_instance_id;
 } SliceTable;
 
@@ -195,7 +192,7 @@ typedef struct QueryDispatchDesc
 	 * queryDesc->dest, use the original table's reloptions. If DestRemote is
 	 * set, use default reloptions + gp_default_storage_options.
 	 */
-	bool validate_reloptions;
+	bool useChangedAOOpts;
 } QueryDispatchDesc;
 
 /*
@@ -242,7 +239,7 @@ typedef struct QueryDesc
 	Snapshot	crosscheck_snapshot;	/* crosscheck for RI update/delete */
 	DestReceiver *dest;			/* the destination for tuple output */
 	ParamListInfo params;		/* param values being passed in */
-	bool		doInstrument;	/* TRUE requests runtime instrumentation */
+	int			instrument_options;		/* OR of InstrumentOption flags */
 
 	/* These fields are set by ExecutorStart */
 	TupleDesc	tupDesc;		/* descriptor for result tuples */
@@ -265,19 +262,22 @@ typedef struct QueryDesc
 
 	/* This is always set NULL by the core system, but plugins can change it */
 	struct Instrumentation *totaltime;	/* total time spent in ExecutorRun */
+
+	/* The overall memory consumption account (i.e., outside of an operator) */
+	MemoryAccountIdType memoryAccountId;
 } QueryDesc;
 
 /* in pquery.c */
 extern QueryDesc *CreateQueryDesc(PlannedStmt *plannedstmt,
-								  const char *sourceText,
+				const char *sourceText,
 				Snapshot snapshot,
 				Snapshot crosscheck_snapshot,
 				DestReceiver *dest,
 				ParamListInfo params,
-				bool doInstrument);
+				int instrument_options);
 
 extern QueryDesc *CreateUtilityQueryDesc(Node *utilitystmt,
-										 const char *sourceText,
+					   const char *sourceText,
 					   Snapshot snapshot,
 					   DestReceiver *dest,
 					   ParamListInfo params);

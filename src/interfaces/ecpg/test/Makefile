@@ -1,12 +1,12 @@
-# $PostgreSQL: pgsql/src/interfaces/ecpg/test/Makefile,v 1.77 2009/01/15 09:30:20 petere Exp $
+# src/interfaces/ecpg/test/Makefile
 
 subdir = src/interfaces/ecpg/test
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 override CPPFLAGS := \
-	-I$(top_builddir)/src/port \
-	-I$(top_srcdir)/src/test/regress \
+	'-I$(top_builddir)/src/port' \
+	'-I$(top_srcdir)/src/test/regress' \
 	-Wno-error \
 	'-DHOST_TUPLE="$(host_tuple)"' \
 	'-DMAKEPROG="$(MAKE)"' \
@@ -17,19 +17,13 @@ override CPPFLAGS := \
 # where to find psql for testing an existing installation
 PSQLDIR = $(bindir)
 
-# default encoding
-MULTIBYTE = SQL_ASCII
-
-# locale
-NOLOCALE =
-ifdef NO_LOCALE
-NOLOCALE += --no-locale
-endif
+# default encoding for regression tests
+ENCODING = SQL_ASCII
 
 ifneq ($(build_os),mingw32)
 abs_builddir := $(shell pwd)
 else
-abs_builddir := $(shell pwd -W)
+abs_builddir := $(shell sh -c "pwd -W")
 endif
 
 all install installdirs uninstall distprep:
@@ -55,7 +49,7 @@ clean distclean maintainer-clean:
 all: pg_regress$(X)
 
 pg_regress$(X): pg_regress_ecpg.o $(top_builddir)/src/test/regress/pg_regress.o
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LIBS) -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) $^ $(LIBS) -o $@
 
 $(top_builddir)/src/test/regress/pg_regress.o:
 	$(MAKE) -C $(dir $@) $(notdir $@)
@@ -74,7 +68,7 @@ $(top_builddir)/src/port/pg_config_paths.h: $(top_builddir)/src/Makefile.global
 # $(srcdir) to the build directory.
 
 ifdef VPATH
-remaining_files_src := $(wildcard $(srcdir)/*/*.pgc) $(wildcard $(srcdir)/expected/*.c) $(wildcard $(srcdir)/expected/*.stdout) $(wildcard $(srcdir)/expected/*.stderr)
+remaining_files_src := $(wildcard $(srcdir)/*/*.pgc) $(wildcard $(srcdir)/expected/*.c) $(wildcard $(srcdir)/expected/*.stdout) $(wildcard $(srcdir)/expected/*.stderr) $(srcdir)/resultmap
 remaining_files_build := $(patsubst $(srcdir)/%, $(abs_builddir)/%, $(remaining_files_src))
 
 all: $(remaining_files_build)
@@ -82,13 +76,15 @@ $(remaining_files_build): $(abs_builddir)/%: $(srcdir)/%
 	ln -s $< $@
 endif
 
+# Common options for tests. Also pick up anything passed in EXTRA_REGRESS_OPTS
+REGRESS_OPTS = --dbname=regress1,connectdb --create-role=connectuser,connectdb $(EXTRA_REGRESS_OPTS)
 
 check: all
-	./pg_regress  --dbname=regress1,connectdb --top-builddir=$(top_builddir) --temp-install=./tmp_check --multibyte=$(MULTIBYTE) --load-language=plpgsql $(NOLOCALE) $(THREAD) --schedule=$(srcdir)/ecpg_schedule --create-role=connectuser,connectdb
+	./pg_regress $(REGRESS_OPTS) --top-builddir=$(top_builddir) --temp-install=./tmp_check $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule
 
-# the same options, but with --listen-on-tcp
+# Connect to the server using TCP, and add a TCP-specific test.
 checktcp: all
-	./pg_regress  --dbname=regress1,connectdb --top-builddir=$(top_builddir) --temp-install=./tmp_check --multibyte=$(MULTIBYTE) --load-language=plpgsql $(NOLOCALE) $(THREAD) --schedule=$(srcdir)/ecpg_schedule_tcp --create-role=connectuser,connectdb --host=localhost
+	./pg_regress $(REGRESS_OPTS) --top-builddir=$(top_builddir) --temp-install=./tmp_check $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule --host=localhost connect/test1
 
 installcheck: all
-	./pg_regress  --psqldir=$(PSQLDIR) --dbname=regress1,connectdb --top-builddir=$(top_builddir) --multibyte=$(MULTIBYTE) --load-language=plpgsql $(NOLOCALE) $(THREAD) --schedule=$(srcdir)/ecpg_schedule --create-role=connectuser,connectdb
+	./pg_regress $(REGRESS_OPTS) --psqldir='$(PSQLDIR)' --top-builddir=$(top_builddir) $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule

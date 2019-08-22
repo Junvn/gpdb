@@ -2,11 +2,11 @@
  *
  *	  LATIN2 and WIN1250
  *
- * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/mb/conversion_procs/latin2_and_win1250/latin2_and_win1250.c,v 1.18 2009/02/28 18:49:42 tgl Exp $
+ *	  src/backend/utils/mb/conversion_procs/latin2_and_win1250/latin2_and_win1250.c
  *
  *-------------------------------------------------------------------------
  */

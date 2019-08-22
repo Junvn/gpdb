@@ -1,16 +1,20 @@
 /* ----------
  *	DTrace probes for PostgreSQL backend
  *
- *	Copyright (c) 2006-2008, PostgreSQL Global Development Group
+ *	Copyright (c) 2006-2014, PostgreSQL Global Development Group
  *
- *	$PostgreSQL: pgsql/src/backend/utils/probes.d,v 1.5 2008/12/24 20:41:29 momjian Exp $
+ *	src/backend/utils/probes.d
  * ----------
  */
 
 
-/* typedefs used in PostgreSQL */
+/*
+ * Typedefs used in PostgreSQL.
+ *
+ * NOTE: Do not use system-provided typedefs (e.g. uintptr_t, uint32_t, etc)
+ * in probe definitions, as they cause compilation errors on Mac OS X 10.5.
+ */
 #define LocalTransactionId unsigned int
-#define LWLockId int
 #define LWLockMode int
 #define LOCKMODE int
 #define BlockNumber unsigned int
@@ -20,10 +24,6 @@
 
 provider postgresql {
 
-	/* 
-	 * Note: Do not use built-in typedefs (e.g. uintptr_t, uint32_t, etc)		 *       as they cause compilation errors in Mac OS X 10.5.  
-	 */
-	  
 	probe transaction__start(LocalTransactionId);
 	probe transaction__commit(LocalTransactionId);
 	probe transaction__abort(LocalTransactionId);
@@ -41,15 +41,17 @@ provider postgresql {
 	probe backoff__localcheck(int);
 	probe backoff__globalcheck();
 
-	probe lwlock__acquire(LWLockId, LWLockMode);
-	probe lwlock__release(LWLockId);
-	probe lwlock__wait__start(LWLockId, LWLockMode);
-	probe lwlock__wait__done(LWLockId, LWLockMode);
-	probe lwlock__condacquire(LWLockId, LWLockMode);
-	probe lwlock__condacquire__fail(LWLockId, LWLockMode);
+	probe lwlock__acquire(const char *, int, LWLockMode);
+	probe lwlock__release(const char *, int);
+	probe lwlock__wait__start(const char *, int, LWLockMode);
+	probe lwlock__wait__done(const char *, int, LWLockMode);
+	probe lwlock__condacquire(const char *, int, LWLockMode);
+	probe lwlock__condacquire__fail(const char *, int, LWLockMode);
+	probe lwlock__acquire__or__wait(const char *, int, LWLockMode);
+	probe lwlock__acquire__or__wait__fail(const char *, int, LWLockMode);
 
-	probe lock__wait__start(unsigned int, LOCKMODE);
-	probe lock__wait__done(unsigned int, LOCKMODE);
+	probe lock__wait__start(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, LOCKMODE);
+	probe lock__wait__done(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, LOCKMODE);
 
 	probe query__parse__start(const char *);
 	probe query__parse__done(const char *);
@@ -64,15 +66,13 @@ provider postgresql {
 	probe statement__status(const char *);
 
 	probe sort__start(int, bool, int, int, bool);
-	probe sort__done(unsigned long, long);
+	probe sort__done(bool, long);
 
-	probe buffer__read__start(ForkNumber, BlockNumber, Oid, Oid, Oid, bool);
-	probe buffer__read__done(ForkNumber, BlockNumber, Oid, Oid, Oid, bool, bool);
-	probe buffer__flush__start(Oid, Oid, Oid);
-	probe buffer__flush__done(Oid, Oid, Oid);
+	probe buffer__read__start(ForkNumber, BlockNumber, Oid, Oid, Oid, int, bool);
+	probe buffer__read__done(ForkNumber, BlockNumber, Oid, Oid, Oid, int, bool, bool);
+	probe buffer__flush__start(ForkNumber, BlockNumber, Oid, Oid, Oid);
+	probe buffer__flush__done(ForkNumber, BlockNumber, Oid, Oid, Oid);
 
-	probe buffer__hit(bool);
-	probe buffer__miss(bool);
 	probe buffer__checkpoint__start(int);
 	probe buffer__checkpoint__sync__start();
 	probe buffer__checkpoint__done();
@@ -95,10 +95,10 @@ provider postgresql {
 	probe twophase__checkpoint__start();
 	probe twophase__checkpoint__done();
 
-	probe smgr__md__read__start(ForkNumber, BlockNumber, Oid, Oid, Oid);
-	probe smgr__md__read__done(ForkNumber, BlockNumber, Oid, Oid, Oid, const char *, int, int);
-	probe smgr__md__write__start(ForkNumber, BlockNumber, Oid, Oid, Oid);
-	probe smgr__md__write__done(ForkNumber, BlockNumber, Oid, Oid, Oid, const char *, int, int);
+	probe smgr__md__read__start(ForkNumber, BlockNumber, Oid, Oid, Oid, int);
+	probe smgr__md__read__done(ForkNumber, BlockNumber, Oid, Oid, Oid, int, int, int);
+	probe smgr__md__write__start(ForkNumber, BlockNumber, Oid, Oid, Oid, int);
+	probe smgr__md__write__done(ForkNumber, BlockNumber, Oid, Oid, Oid, int, int, int);
 
 	probe xlog__insert(unsigned char, unsigned char);
 	probe xlog__switch();

@@ -16,7 +16,6 @@
 #ifndef MEMACCOUNTING_H
 #define MEMACCOUNTING_H
 
-#include "nodes/nodes.h"
 #include "lib/stringinfo.h"             /* StringInfo */
 
 struct MemoryContextData;
@@ -25,6 +24,20 @@ struct MemoryContextData;
 #define EXPLAIN_MEMORY_VERBOSITY_SUPPRESS  0 /* Suppress memory reporting in explain analyze */
 #define EXPLAIN_MEMORY_VERBOSITY_SUMMARY  1 /* Summary of memory usage for each owner in explain analyze */
 #define EXPLAIN_MEMORY_VERBOSITY_DETAIL  2 /* Detail memory accounting tree for each slice in explain analyze */
+#define EXPLAIN_MEMORY_VERBOSITY_DEBUG  3 /* Detail memory accounting tree with every executor having its own account
+										   * for each slice in explain analyze */
+
+/*
+ * MemoryAccount is a private data structure for recording memory usage by
+ * memory managers, MemoryAccountExplain is a publicly exposed structure used
+ * for copying out the interesting parts of a MemoryAccount for usage in
+ * EXPLAIN {ANALYZE} commands.
+ */
+typedef struct MemoryAccountExplain {
+	double allocated;
+	double freed;
+	double peak;
+} MemoryAccountExplain;
 
 /*
  * What level of details of the memory accounting information to show during EXPLAIN ANALYZE?
@@ -51,10 +64,6 @@ extern char* memory_profiler_query_id;
  */
 extern int memory_profiler_dataset_size;
 
-/*
- * Should we save the memory usage information before resetting the memory accounting?
- */
-extern bool gp_dump_memory_usage;
 
 /*
  * Each memory account can assume one of the following memory
@@ -97,20 +106,19 @@ typedef enum MemoryOwnerType
 	MEMORY_OWNER_TYPE_Exec_Result,
 	MEMORY_OWNER_TYPE_Exec_Append,
 	MEMORY_OWNER_TYPE_Exec_Sequence,
+	MEMORY_OWNER_TYPE_Exec_MergeAppend,
 	MEMORY_OWNER_TYPE_Exec_BitmapAnd,
 	MEMORY_OWNER_TYPE_Exec_BitmapOr,
 	MEMORY_OWNER_TYPE_Exec_SeqScan,
+	MEMORY_OWNER_TYPE_Exec_DynamicSeqScan,
 	MEMORY_OWNER_TYPE_Exec_ExternalScan,
-	MEMORY_OWNER_TYPE_Exec_AppendOnlyScan,
-	MEMORY_OWNER_TYPE_Exec_AOCSScan,
-	MEMORY_OWNER_TYPE_Exec_TableScan,
-	MEMORY_OWNER_TYPE_Exec_DynamicTableScan,
 	MEMORY_OWNER_TYPE_Exec_IndexScan,
+	MEMORY_OWNER_TYPE_Exec_IndexOnlyScan,
 	MEMORY_OWNER_TYPE_Exec_DynamicIndexScan,
 	MEMORY_OWNER_TYPE_Exec_BitmapIndexScan,
 	MEMORY_OWNER_TYPE_Exec_DynamicBitmapIndexScan,
 	MEMORY_OWNER_TYPE_Exec_BitmapHeapScan,
-	MEMORY_OWNER_TYPE_Exec_BitmapAppendOnlyScan,
+	MEMORY_OWNER_TYPE_Exec_DynamicBitmapHeapScan,
 	MEMORY_OWNER_TYPE_Exec_TidScan,
 	MEMORY_OWNER_TYPE_Exec_SubqueryScan,
 	MEMORY_OWNER_TYPE_Exec_FunctionScan,
@@ -130,16 +138,19 @@ typedef enum MemoryOwnerType
 	MEMORY_OWNER_TYPE_Exec_ShareInputScan,
 	MEMORY_OWNER_TYPE_Exec_WindowAgg,
 	MEMORY_OWNER_TYPE_Exec_Repeat,
+	MEMORY_OWNER_TYPE_Exec_ModifyTable,
+	MEMORY_OWNER_TYPE_Exec_LockRows,
 	MEMORY_OWNER_TYPE_Exec_DML,
 	MEMORY_OWNER_TYPE_Exec_SplitUpdate,
 	MEMORY_OWNER_TYPE_Exec_RowTrigger,
 	MEMORY_OWNER_TYPE_Exec_AssertOp,
-	MEMORY_OWNER_TYPE_Exec_BitmapTableScan,
 	MEMORY_OWNER_TYPE_Exec_PartitionSelector,
 	MEMORY_OWNER_TYPE_Exec_RecursiveUnion,
 	MEMORY_OWNER_TYPE_Exec_CteScan,
 	MEMORY_OWNER_TYPE_Exec_WorkTableScan,
-	MEMORY_OWNER_TYPE_EXECUTOR_END = MEMORY_OWNER_TYPE_Exec_WorkTableScan,
+	MEMORY_OWNER_TYPE_Exec_ForeignScan,
+	MEMORY_OWNER_TYPE_Exec_NestedExecutor,
+	MEMORY_OWNER_TYPE_EXECUTOR_END = MEMORY_OWNER_TYPE_Exec_NestedExecutor,
 	MEMORY_OWNER_TYPE_END_SHORT_LIVING = MEMORY_OWNER_TYPE_EXECUTOR_END
 } MemoryOwnerType;
 
@@ -174,29 +185,7 @@ extern MemoryAccountIdType ActiveMemoryAccountId;
 		ActiveMemoryAccountId = oldActiveMemoryAccountId;\
 	} while (0);
 
-/*
- * CREATE_EXECUTOR_MEMORY_ACCOUNT is a convenience macro to create a new
- * operator specific memory account *if* the operator will be executed in
- * the current slice, i.e., it is not part of some other slice (alien
- * plan node). We assign a shared AlienExecutorMemoryAccount for plan nodes
- * that will not be executed in current slice
- */
-#define CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, planNode, NodeType) \
-		(MEMORY_OWNER_TYPE_Undefined != planNode->memoryAccountId) ?\
-			planNode->memoryAccountId : \
-			(isAlienPlanNode ? MEMORY_OWNER_TYPE_Exec_AlienShared : \
-				MemoryAccounting_CreateAccount(((Plan*)node)->operatorMemKB == 0 ? \
-				work_mem : ((Plan*)node)->operatorMemKB, MEMORY_OWNER_TYPE_Exec_##NodeType));
 
-/*
- * SAVE_EXECUTOR_MEMORY_ACCOUNT saves an operator specific memory account
- * into the PlanState of that operator
- */
-#define SAVE_EXECUTOR_MEMORY_ACCOUNT(execState, curMemoryAccountId)\
-		Assert(MEMORY_OWNER_TYPE_Undefined == ((PlanState *)execState)->plan->memoryAccountId || \
-		MEMORY_OWNER_TYPE_Undefined == ((PlanState *)execState)->plan->memoryAccountId || \
-		curMemoryAccountId == ((PlanState *)execState)->plan->memoryAccountId);\
-		((PlanState *)execState)->plan->memoryAccountId = curMemoryAccountId;
 
 extern MemoryAccountIdType
 MemoryAccounting_CreateAccount(long maxLimit, enum MemoryOwnerType ownerType);
@@ -223,8 +212,9 @@ extern uint64
 MemoryAccounting_GetGlobalPeak(void);
 
 extern void
-MemoryAccounting_CombinedAccountArrayToString(void *accountArrayBytes,
-		MemoryAccountIdType accountCount, StringInfoData *str, uint32 indentation);
+MemoryAccounting_CombinedAccountArrayToExplain(void *accountArrayBytes,
+											  MemoryAccountIdType accountCount,
+											  void *es);
 
 extern void
 MemoryAccounting_SaveToFile(int currentSliceId);
@@ -241,7 +231,54 @@ MemoryAccounting_DeclareDone(void);
 extern uint64
 MemoryAccounting_RequestQuotaIncrease(void);
 
-extern void
-MemoryAccounting_ExplainAppendCurrentOptimizerAccountInfo(StringInfoData *str);
+extern MemoryAccountExplain *
+MemoryAccounting_ExplainCurrentOptimizerAccountInfo(void);
+
+extern MemoryAccountIdType
+MemoryAccounting_CreateMainExecutor(void);
+
+extern MemoryAccountIdType
+MemoryAccounting_GetOrCreateNestedExecutorAccount(void);
+
+extern MemoryAccountIdType
+MemoryAccounting_GetOrCreateOptimizerAccount(void);
+
+/*
+ * MemoryAccounting_GetOrCreatePlannerAccount creates a memory account for
+ * query planning. If the planner is a direct child of the 'X_NestedExecutor'
+ * account, the planner account will also be assigned to 'X_NestedExecutor'.
+ *
+ * The planner account will always be created if the explain_memory_verbosity
+ * guc is set to 'debug' or above.
+ */
+extern MemoryAccountIdType
+MemoryAccounting_GetOrCreatePlannerAccount(void);
+
+extern bool
+MemoryAccounting_IsUnderNestedExecutor(void);
+
+extern bool
+MemoryAccounting_IsMainExecutorCreated(void);
+
+/*
+ * MemoryAccounting_CreateExecutorMemoryAccount will create the main executor
+ * account. Any subsequent calls to this function will assign the executor to
+ * the 'X_NestedExecutor' account.
+ *
+ * If the explain_memory_verbosity guc is set to 'debug' or above, all
+ * executors will be given its own memory account.
+ */
+static inline MemoryAccountIdType
+MemoryAccounting_CreateExecutorMemoryAccount(void)
+{
+	if (explain_memory_verbosity >= EXPLAIN_MEMORY_VERBOSITY_DEBUG)
+		return MemoryAccounting_CreateAccount(0, MEMORY_OWNER_TYPE_EXECUTOR);
+	else
+		if (MemoryAccounting_IsMainExecutorCreated())
+			return MemoryAccounting_GetOrCreateNestedExecutorAccount();
+		else
+			return MemoryAccounting_CreateMainExecutor();
+}
+
 
 #endif   /* MEMACCOUNTING_H */
